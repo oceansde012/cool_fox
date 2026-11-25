@@ -178,7 +178,11 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     if !at.is_null() && !placeholder {
-        victory_gpu::title_memory_allocated(at as usize, size);
+        // Windows rounds a fixed request's address down to a page: from
+        // there, the caller's length can stop short of the 64 KiB watch
+        // block its last byte lies in. The caller's own address covers it.
+        let start = if base.is_null() { at } else { base };
+        victory_gpu::title_memory_allocated(start as usize, size);
     }
     note_protection(asked, kind, flags, at as usize, size);
     at
