@@ -238,6 +238,7 @@ pub(crate) struct HostHeap {
 pub(crate) static SPANS_QUICK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 fn spans_quick() -> bool {
+    #[cfg(feature = "diagnostics")]
     if let Some(on) = crate::ab::pick("VICTORY_SPANS_QUICK") {
         return on;
     }
