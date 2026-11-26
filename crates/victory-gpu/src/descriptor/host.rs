@@ -4001,6 +4001,34 @@ fn buffer_uav(
     Some(Some(shadow.buffer.clone()))
 }
 
+/// Whether the host stores to typed unordered views of `format` (asked once
+/// per format).
+fn typed_store(format: u32) -> bool {
+    static KNOWN: std::sync::Mutex<Vec<(u32, bool)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, ok)) = known.iter().find(|(f, _)| *f == format) {
+        return ok;
+    }
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(format as i32),
+        ..Default::default()
+    };
+    let ok = crate::host::host().is_some_and(|h| {
+        // SAFETY: a plain query into a struct of its size.
+        unsafe {
+            h.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        }
+        .is_ok()
+            && support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+    });
+    known.push((format, ok));
+    ok
+}
+
 /// Whether the host can make a shader (or unordered access) view of
 /// `texture` in `format` (none: the texture's own). The console allows any
 /// view; the host refuses (and removes the device for) views without the
@@ -4046,8 +4074,8 @@ fn fits(texture: &ID3D12Resource, mut format: Option<&mut DXGI_FORMAT>, unordere
     // (B5G5R5A1_UNORM on NVIDIA) removes the device when made, in the
     // texture's own format too: the slot stays null, its writes dropped.
     // The format checked is the one the view is made in: a typed
-    // texture's own unless the requested one is castable (below).
-    let typed = if view == 0 || (!typeless && !castable.contains(&view)) { own } else { view };
+    // texture's own (below), else the requested one.
+    let typed = if view == 0 || !typeless { own } else { view };
     if unordered && !(view == 0 && typeless) && !typed_store(typed) {
         once!(view = typed, own, "an unordered view in a format the host cannot store");
         return false;
