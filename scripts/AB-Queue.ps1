@@ -6,6 +6,7 @@
 # Output: B:\cool_fox\ab\<stamp>\summary.csv, <variant>-run<n>.csv, .png, .log
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -File B:\cool_fox\AB-Queue.ps1
+# Copy AB-Process.ps1 alongside this script when installing it outside the repo.
 #   ... -Only base,w64      (subset)   -Runs 1   (no warm-up run)   -Measure 90
 param(
     [string] $Root = 'B:\cool_fox',
@@ -16,6 +17,7 @@ param(
     [switch] $NoWarm              # skip `victory warm` between the two runs
 )
 $Warm = -not $NoWarm
+. (Join-Path $PSScriptRoot 'AB-Process.ps1')
 $ErrorActionPreference = 'Continue'   # git writes progress to stderr (PS 5.1 would stop)
 $stamp = Get-Date -f yyyyMMdd-HHmm
 $out = Join-Path $Root "ab\$stamp"
@@ -116,16 +118,17 @@ foreach ($v in $variants) {
     for ($run = 1; $run -le $Runs; $run++) {
         if (Get-Process victory -ErrorAction SilentlyContinue) { "$($v.Name),$run,,,,,,,,,,another victory.exe running: skipped" | Add-Content $summary; continue }
         $saved = @{}
-        foreach ($k in @($v.Env.Keys) + 'VICTORY_KEYS') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
+        foreach ($k in @($v.Env.Keys) + 'VICTORY_KEYS' + 'VICTORY_LOG') { $saved[$k] = [Environment]::GetEnvironmentVariable($k) }
+        if (!$v.Env.ContainsKey('VICTORY_LOG') -and !$env:VICTORY_LOG) { $env:VICTORY_LOG = 'warn' }
         foreach ($k in $v.Env.Keys) { Set-Item "Env:$k" $v.Env[$k] }
         $env:VICTORY_KEYS = $keys
         # The warm-up run writes down the pipelines it makes; `victory warm`
         # then makes them ahead for the measured run (zone-entry stutters).
-        $saved['VICTORY_PIPELINE_BOOK'] = $env:VICTORY_PIPELINE_BOOK
+        if (!$saved.ContainsKey('VICTORY_PIPELINE_BOOK')) { $saved['VICTORY_PIPELINE_BOOK'] = $env:VICTORY_PIPELINE_BOOK }
         $env:VICTORY_PIPELINE_BOOK = $(if ($run -eq 1 -and $Runs -gt 1) { '1' } else { $null })
         # The profile: 60 s of the last run, from 30 s after the scene was
         # reached in the run before (a warm run loads no slower).
-        $saved['VICTORY_PROFILE'] = $env:VICTORY_PROFILE
+        if (!$saved.ContainsKey('VICTORY_PROFILE')) { $saved['VICTORY_PROFILE'] = $env:VICTORY_PROFILE }
         $env:VICTORY_PROFILE = $null
         if ($v.Diag -and $run -eq $Runs) {
             $from = $(if ($lastLoad) { $lastLoad + 30 } else { 240 })
@@ -134,24 +137,36 @@ foreach ($v in $variants) {
         $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $Root 'CoolFox.ps1'))
         if ($v.Dir -ne 'src') { $argList += @('-Variant', $v.Dir) }
         $t0 = Get-Date
-        $runner = Start-Process powershell -ArgumentList $argList -WorkingDirectory $Root -PassThru -WindowStyle Minimized
-        foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+        try {
+            $runner = Start-Process powershell -ArgumentList $argList -WorkingDirectory $Root -PassThru -WindowStyle Minimized -ErrorAction Stop
+            [void]$runner.Handle
+        } finally {
+            foreach ($k in $saved.Keys) { [Environment]::SetEnvironmentVariable($k, $saved[$k]) }
+        }
         $game = $null
         while (!$game -and ((Get-Date) - $t0).TotalSeconds -lt 180) {
             Start-Sleep 2
             $game = Get-Process victory -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.ToLower() -eq $exePath } | Select-Object -First 1
         }
         if (!$game) {
-            if (!$runner.HasExited) { Stop-Process -Id $runner.Id -ErrorAction SilentlyContinue }
+            try { if (!$runner.HasExited) { $runner.Kill() } } catch { }
             "$($v.Name),$run,,,,,,,,,,game did not start" | Add-Content $summary; continue
+        }
+        try {
+            [void]$game.Handle  # Retain the handle before the process exits.
+            $gameStart = $game.StartTime
+        } catch {
+            try { if (!$runner.HasExited) { $runner.Kill() } } catch { }
+            "$($v.Name),$run,,,,,,,,,,process disappeared before tracking; exit-code-unavailable" | Add-Content $summary
+            continue
         }
         $csv = Join-Path $out "$($v.Name)-run$run.csv"
         't,fps,ms,draws,commit_gb' | Set-Content $csv
-        $scene = $null; $result = 'ok'; $measured = 0
+        $scene = $null; $result = 'ok'; $measured = 0; $streak = 0; $loadS = ''
         while ($true) {
             Start-Sleep 1
             $game.Refresh()
-            if ($game.HasExited) { $result = "exited $($game.ExitCode)"; break }
+            if ($game.HasExited) { break }
             $t = $game.MainWindowTitle
             if ($t -match '([\d.]+) fps ([\d.]+) ms/frame (\d+) draws') {
                 $ms = [double]$matches[2]; $draws = [int]$matches[3]
@@ -170,8 +185,16 @@ foreach ($v in $variants) {
                 break
             }
         }
-        if (!$game.HasExited) { Shot (Join-Path $out "$($v.Name)-run$run-b.png"); Stop-Process -Id $game.Id; [void]$game.WaitForExit(60000); Start-Sleep 5 }
-        if (!$runner.HasExited) { Stop-Process -Id $runner.Id -ErrorAction SilentlyContinue }
+        if (!$game.HasExited) {
+            Shot (Join-Path $out "$($v.Name)-run$run-b.png")
+            $exitStatus = Stop-ABTrackedProcess $game
+            Start-Sleep 5
+        } else {
+            $exitStatus = Get-ABProcessExit $game $false
+        }
+        $result = "$result; $exitStatus"
+        Write-Host "$($v.Name) run $run $result; started $($gameStart.ToString('o'))"
+        try { if (!$runner.HasExited) { $runner.Kill() } } catch { }
         if ($run -eq 1 -and $Runs -gt 1 -and $Warm) {
             # Same cache folder as CoolFox.ps1 gives this variant.
             $cache = "$env:LOCALAPPDATA\VIctory\" + $(if ($v.Dir -eq 'src') { 'cache-coolfox' } else { "cache-coolfox-$($v.Dir)" })
