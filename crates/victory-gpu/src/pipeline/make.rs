@@ -621,8 +621,43 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
 
         let pending = Pending::new(Vec::new(), None);
+        let started = Instant::now();
         wait_first(&pending, Duration::from_millis(10));
         assert!(pending.made.get().is_none());
+        assert!(started.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn concurrent_first_waiters_share_one_wait_and_wake_on_completion() {
+        use std::sync::atomic::AtomicUsize;
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let p = p.clone();
+            let entered = entered.clone();
+            waiters.push(std::thread::spawn(move || {
+                p.first_wait.get_or_init(|| {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    wait_first(&p, Duration::from_secs(2));
+                });
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while entered.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        // Publish under the same mutex and notify just as Pending::make does.
+        let (lock, done) = &DONE;
+        let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(p.made.set(None).is_ok());
+        done.notify_all();
+        drop(held);
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
+        assert!(matches!(p.made.get(), Some(None)));
     }
 
     #[test]
