@@ -213,7 +213,11 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let file = entry.file_name();
         let file = file.to_string_lossy();
         if file.ends_with(".new") {
-            std::fs::remove_dir_all(entry.path())?;
+            // As far as it goes (fxceless 6a42ed2): an unfinished version is
+            // never read, and one another program holds is left for later.
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::debug!(dir = %entry.path().display(), %e, "an unfinished save version stays for now");
+            }
         } else if let Some(n) = version_number(&file) {
             highest = highest.max(n);
             if entry.file_type().is_ok_and(|t| t.is_dir()) {
@@ -230,8 +234,15 @@ fn current(dir: &Path) -> std::io::Result<Option<Version>> {
         let Some((name, display, blobs)) = load(&version)? else {
             continue;
         };
+        // Older versions are removed as far as that goes (fxceless 6a42ed2):
+        // a file a virus scanner or a backup holds failed the removal, and
+        // returning that error made the container unreadable and every save
+        // of it fail for as long as the file was held.
         for old in &committed[at + 1..] {
-            std::fs::remove_dir_all(dir.join(format!("v{old}")))?;
+            let old = dir.join(format!("v{old}"));
+            if let Err(e) = std::fs::remove_dir_all(&old) {
+                tracing::debug!(dir = %old.display(), %e, "an older save version stays for now");
+            }
         }
         return Ok(Some(Version {
             dir: version,
