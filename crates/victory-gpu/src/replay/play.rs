@@ -747,8 +747,10 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed, made
+        // not resident (the host makes such memory resident itself; here
+        // nothing would, and the first copy into it faults).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -788,7 +790,10 @@ impl Player {
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
-            let desc = gpu::to_desc(&r.desc);
+            let mut desc = gpu::to_desc(&r.desc);
+            // Heaps lose their cross-adapter sharing above (a heap opened from
+            // existing memory has it), so their resources lose theirs.
+            desc.Flags &= !D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
             let mut made: Option<ID3D12Resource> = None;
             let clear: Option<D3D12_CLEAR_VALUE> = r.clear.map(|c| {
                 // SAFETY: 20 bytes that were a clear value.
