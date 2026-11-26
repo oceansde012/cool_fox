@@ -45,6 +45,8 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod land;
+#[cfg(all(test, windows))]
+mod loadprobe;
 pub mod list;
 pub mod object;
 pub mod pipeline;

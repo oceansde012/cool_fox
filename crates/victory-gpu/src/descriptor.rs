@@ -2093,4 +2093,70 @@ mod tests {
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
     }
+
+    /// Load test (`cargo test -p victory-gpu --lib --locked placed_view_shapes_load -- --ignored --nocapture`).
+    /// A million placed views whose descriptions differ only in padding words
+    /// make one shape; a million that really differ make a million. Then each
+    /// description word is varied alone, to list the words that tell shapes apart.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "load test: about a million table inserts"]
+    fn placed_view_shapes_load() {
+        use crate::loadprobe::{mix, private_bytes};
+        const N: u64 = 1_000_000;
+        let shapes = || VIEWS.read().unwrap().shapes.len();
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        // A 2D texture SRV (dimension 4): the union's words 4-7 are used; 3, 8 and 9 are padding.
+        let resource = [3, 0, 0, 0, 0x4321, 0, 0x4321, 0x10001, 28, 1, 0, 0, 0, 0];
+        let desc = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x2000, 0x6, 0, 0, 0, 0];
+        let before = (shapes(), private_bytes());
+        for n in 0..N {
+            let mut r = resource;
+            r[1] = mix(n);
+            r[13] = mix(n + N);
+            let mut d = desc;
+            (d[3], d[8], d[9]) = (mix(n + 2 * N), mix(n + 3 * N), mix(n + 4 * N));
+            let address = 0xd_0000_0000 + n * 0x1_0000;
+            (d[10], d[11]) = (address as u32, (address >> 32) as u32);
+            create_placed_srv(null, &r, &d, handle);
+        }
+        let padding = (shapes() - before.0, private_bytes().saturating_sub(before.1));
+        eprintln!("padding only: {N} views -> {} new shapes, private memory +{} KiB", padding.0, padding.1 >> 10);
+        // Control: the mip level (word 4) really differs.
+        let mid = (shapes(), private_bytes());
+        for n in 0..N / 10 {
+            let mut d = desc;
+            (d[4], d[5]) = (n as u32 + 1, 0);
+            create_placed_srv(null, &resource, &d, handle);
+        }
+        let control = (shapes() - mid.0, private_bytes().saturating_sub(mid.1));
+        eprintln!("control: {} really different views -> {} new shapes, private memory +{} KiB", N / 10, control.0, control.1 >> 10);
+        assert_eq!(control.0 as u64, N / 10, "views that differ are shapes");
+        // One word at a time, 64 values each, from a base the other tests do not use.
+        let mut identity = Vec::new();
+        for (name, count) in [("resource", 14usize), ("view", 16)] {
+            for w in 0..count {
+                if name == "view" && (w == 10 || w == 11) {
+                    continue; // the address
+                }
+                let base = shapes();
+                for v in 0..64u32 {
+                    let mut r = [3, 0, 0, 0, 0x7777, 0, 0x7777, 0x10001, 28, 1, 0, 0, 0, 0];
+                    let mut d = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x2000, 0x6, 0, 0, 0, 0];
+                    let v = 0x5000_0000 + v * 0x1111;
+                    if name == "resource" { r[w] = v } else { d[w] = v }
+                    create_placed_srv(null, &r, &d, handle);
+                }
+                let grew = shapes() - base;
+                eprintln!("{name} word {w:2}: 64 values -> {grew} shapes");
+                if grew > 2 {
+                    identity.push(format!("{name}[{w}]"));
+                }
+            }
+        }
+        eprintln!("words that tell shapes apart: {identity:?}");
+        assert!(padding.0 <= 4, "padding alone made {} shapes out of {N}", padding.0);
+    }
 }
