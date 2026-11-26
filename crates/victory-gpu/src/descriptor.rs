@@ -840,9 +840,17 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+#[cfg_attr(test, derive(Default))]
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// How many entries of [`list`](Self::list) hold a constant buffer view
+    /// and how many a view of placed memory (freed ones included, as they
+    /// still hold their view until reused), kept as entries change rather
+    /// than counted for the memory line: that walk over every entry took
+    /// up to 49 ms at 30 million entries.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    address_entries: [u64; 2],
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -863,6 +871,8 @@ struct Views {
 /// or shape) and a released resource take it alone.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
+    #[cfg(all(windows, feature = "diagnostics"))]
+    address_entries: [0, 0],
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -1050,12 +1060,26 @@ impl Views {
         self.free.push(i);
     }
 
+    /// Counts `view` in or out of [`address_entries`](Self::address_entries).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn count_address(&mut self, view: &View, added: bool) {
+        let kind = match view {
+            View::Constant(..) => 0,
+            View::Placed(..) => 1,
+            _ => return,
+        };
+        let n = &mut self.address_entries[kind];
+        *n = if added { *n + 1 } else { n.saturating_sub(1) };
+    }
+
     fn entry_made(&mut self, view: View) -> [u32; 2] {
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
                 let i = match self.free.pop() {
                     Some(i) => {
+                        #[cfg(all(windows, feature = "diagnostics"))]
+                        self.count_address(&self.list[i as usize].0.clone(), false);
                         self.list[i as usize].0 = view.clone();
                         i
                     }
@@ -1064,6 +1088,8 @@ impl Views {
                         self.list.len() as u32 - 1
                     }
                 };
+                #[cfg(all(windows, feature = "diagnostics"))]
+                self.count_address(&view, true);
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
                     self.by_resource.entry(r).or_default().push(i);
                 }
@@ -1131,14 +1157,7 @@ pub(crate) fn views_kept() -> [u64; 8] {
     let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
-    let (mut constants, mut placed) = (0, 0);
-    for (view, _) in &views.list {
-        match view {
-            View::Constant(..) => constants += 1,
-            View::Placed(..) => placed += 1,
-            _ => {}
-        }
-    }
+    let [constants, placed] = views.address_entries;
     [
         views.list.len() as u64,
         views.free.len() as u64,
@@ -1901,20 +1920,46 @@ mod tests {
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
     }
 
+    /// The counts of constant buffer and placed entries the memory line
+    /// reads follow the table as a walk over it would count: a freed entry
+    /// reused for another kind is counted out and in.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn diagnostic_counts_follow_distinct_entries_including_reused_slots() {
+        let walk = |views: &Views| {
+            let count = |f: fn(&View) -> bool| views.list.iter().filter(|(v, _)| f(v)).count() as u64;
+            [count(|v| matches!(v, View::Constant(..))), count(|v| matches!(v, View::Placed(..)))]
+        };
+        let mut views = Views::default();
+        // A slot freed by forget still holds the old resource view, with its
+        // new generation; it can be reused for a view without a resource.
+        views.list.push((View::Shader(1, None), 2));
+        views.free.push(0);
+        let constant = View::Constant(0x1234, 256);
+        assert_eq!(views.entry(constant.clone()), [0, 2]);
+        assert_eq!(views.entry(constant), [0, 2]);
+        let placed = View::Placed(false, [0; 14], [0; 16]);
+        let index = views.entry(placed.clone());
+        assert_eq!(views.entry(placed), index);
+        views.entry(View::Unordered(1, 2, None));
+        assert_eq!(views.address_entries, [1, 1]);
+        assert_eq!(views.address_entries, walk(&views));
+        // Under a cap of 2, placed views push the constant one out; its
+        // freed entry, reused, changes kind.
+        for n in 1..6u32 {
+            views.entry_kept(View::Placed(false, [n; 14], [n; 16]), 2);
+            assert_eq!(views.address_entries, walk(&views), "after placed view {n}");
+        }
+        views.entry_kept(View::Constant(0x5678, 512), 2);
+        assert_eq!(views.address_entries, walk(&views), "a constant view in a freed entry");
+    }
+
     /// Entries of views no resource releases stay under their cap: the
     /// oldest go stale, the newest still name their views, entries are
     /// reused rather than added, and views of resources are never dropped.
     #[test]
     fn ownerless_entries_are_capped() {
-        let mut views = Views {
-            list: Vec::new(),
-            index: std::collections::BTreeMap::new(),
-            by_resource: std::collections::BTreeMap::new(),
-            free: Vec::new(),
-            shapes: Vec::new(),
-            shape_index: std::collections::BTreeMap::new(),
-            ownerless: std::collections::VecDeque::new(),
-        };
+        let mut views = Views::default();
         let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
         let named = |views: &Views, words: [u32; 2], view: &View| {
             views.list.get(words[0] as usize).is_some_and(|(v, g)| *g == words[1] && v == view)
