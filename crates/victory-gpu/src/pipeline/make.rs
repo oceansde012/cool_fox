@@ -41,6 +41,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Serialize the optional first-use wait across recording threads.
+    first_wait: OnceLock<()>,
     /// A pass over the screen ([`GraphicsState::screen_pass`]) or a confirmed
     /// opening-scene / bake producer that must never sit behind cold RT shaders.
     screen: bool,
@@ -130,6 +132,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            first_wait: OnceLock::new(),
         }
     }
 
@@ -231,9 +234,32 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
+        if first_wait_enabled() {
+            p.first_wait.get_or_init(|| wait_first(p, Duration::from_secs(10)));
+        }
         wait(p, crate::frame::current());
     }
     p.made.get()?.as_ref()
+}
+
+/// Opt in to a bounded wait for each pipeline's first use, independently of
+/// the shared frame budget. A refused pipeline also ends the wait.
+fn first_wait_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_FIRST_WAIT").is_some_and(|v| v == "1"))
+}
+
+fn wait_first(p: &Pending, limit: Duration) {
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let left = limit.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        held = done.wait_timeout(held, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -584,6 +610,19 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn first_wait_ends_on_refusal_or_timeout() {
+        let refused = Pending::new(Vec::new(), None);
+        assert!(refused.made.set(None).is_ok());
+        let started = Instant::now();
+        wait_first(&refused, Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let pending = Pending::new(Vec::new(), None);
+        wait_first(&pending, Duration::from_millis(10));
+        assert!(pending.made.get().is_none());
     }
 
     #[test]
