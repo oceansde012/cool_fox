@@ -1329,7 +1329,7 @@ mod tests {
         let (zero_shape, v0_in, saved) = run(128);
         assert_eq!(
             zero_shape,
-            Some(Shape::Half(Op::AddH, v0_in, saved, 0, 31))
+            Some(Shape::Active(Op::AddH, v0_in, saved, 0))
         );
         for c in 240..=248u16 {
             let (shape, _, _) = run(c);
