@@ -62,6 +62,18 @@ enum Held {
 #[cfg(windows)]
 static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 
+/// One caller of [`release_held`] at a time, so a queue's submissions keep
+/// their order; a queue's last release also takes it, so a queue is not
+/// freed while `release_held` looks at it.
+#[cfg(windows)]
+static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(windows)]
+thread_local! {
+    /// Whether this thread is inside [`release_held`] (holds `RELEASING`).
+    static IN_RELEASE_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(windows)]
 fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -315,18 +327,30 @@ pub(crate) fn release_held(all: bool) {
         behind::wake();
         return;
     }
-    // One caller at a time, so a queue's submissions keep their order.
-    static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
     let _looking = crate::timeline::span("looking at what queues hold");
     let _one = lock(&RELEASING);
+    struct Inside;
+    impl Drop for Inside {
+        fn drop(&mut self) {
+            IN_RELEASE_HELD.with(|f| f.set(false));
+        }
+    }
+    IN_RELEASE_HELD.with(|f| f.set(true));
+    let _inside = Inside;
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
         for q in queues {
-            // SAFETY: a live queue: one released is taken off the list.
+            // A queue released since the copy (by what ran for an earlier
+            // one, on this thread) is gone: it left the list first.
+            if !lock(&WAITING).contains(&q) {
+                continue;
+            }
+            // SAFETY: a live queue: one released is taken off the list
+            // before it is freed, under `RELEASING`, which this holds.
             let held = unsafe { &(*(q as *const Queue)).held };
             let mut held = lock(held);
             loop {
@@ -555,12 +579,19 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
     )
 }
 extern "system" fn release(this: This) -> u32 {
-    let left = object::release_boxed::<Queue>(this);
+    // The last reference: the queue leaves the waiting list before its box
+    // is freed, under the lock `release_held` holds while it dereferences
+    // the queues of that list (it works from a copy of it). Taking it off
+    // only after the free left a window in which `release_held` read a
+    // freed queue, and a new queue at the same address could lose its place.
     #[cfg(windows)]
-    if left == 0 {
+    if !this.is_null() && object::refs(this) == 1 {
+        let inside = IN_RELEASE_HELD.with(|f| f.get());
+        let _one = (!inside).then(|| lock(&RELEASING));
         lock(&WAITING).retain(|&q| q != this as usize);
+        return object::release_boxed::<Queue>(this);
     }
-    left
+    object::release_boxed::<Queue>(this)
 }
 
 /// Runs the lists' host lists and waits for them (decision 0007). A queue

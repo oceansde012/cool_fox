@@ -130,6 +130,13 @@ pub(crate) fn hand_out<T>(
     answer(kind, iid, Some(Box::into_raw(object).cast()), out)
 }
 
+/// The references an object holds now (a snapshot: only meaningful to a
+/// caller that itself holds one of them, e.g. inside its own Release).
+pub(crate) fn refs(this: This) -> u32 {
+    // SAFETY: `this` is the header of a live object.
+    unsafe { &*this }.refs.load(Ordering::Acquire)
+}
+
 /// Release for objects made by [`hand_out`]: the last reference frees it.
 pub(crate) fn release_boxed<T>(this: This) -> u32 {
     // SAFETY: `this` is the header of a boxed `T`.
