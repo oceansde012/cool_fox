@@ -1221,14 +1221,10 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
 }
 
 /// Whether programs with console lanes in groups of several host waves take their console
-/// threads from a group counter (`ticket`, issue #1243). Off by default in cool_fox
-/// (`VICTORY_THREAD_TICKET=1`: on): on an RTX 5060 Ti the prison's hair rendered wrong
-/// with it and right without it (2026-11-26). Tests keep it on unless the switch says 0.
+/// threads from a group counter (`ticket`, issue #1243). `VICTORY_THREAD_TICKET=0`: the flat id
+/// of the wave's first lane rounded down, as before.
 fn ticket_on() -> bool {
-    match std::env::var_os("VICTORY_THREAD_TICKET") {
-        Some(v) => v == "1",
-        None => cfg!(test),
-    }
+    std::env::var_os("VICTORY_THREAD_TICKET").is_none_or(|v| v != "0")
 }
 
 pub(super) fn host_max_wave() -> u32 {
