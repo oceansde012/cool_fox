@@ -2739,9 +2739,10 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             list.reset();
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-            // The small record comes after the big ones spent the budget:
-            // it runs empty, in every round alike (none carries over).
-            assert_eq!(hits, 0, "round {round}: the spent budget empties the record after it");
+            // A rejected large record either takes the remaining budget, or
+            // leaves it for the small record, according to the configured mode.
+            let expected = if rest() == 1 { 0 } else { round + 1 };
+            assert_eq!(hits, expected, "round {round}: unexpected remaining budget");
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
@@ -2759,7 +2760,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         list.reset();
         // SAFETY: the list has run; a mapped buffer.
         let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
-        assert_eq!(hits, 1, "the budget starts empty at the next submission");
+        assert_eq!(hits, if rest() == 1 { 1 } else { 3 }, "the budget starts empty at the next submission");
     }
 
     /// Records the dispatch records `groups` (three words each, `step`
@@ -3192,7 +3193,9 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
             };
             assert_eq!(out.iter().filter(|&&v| v == 1 << 22).count(), filled, "{times} times {records}: {out:?}");
             assert!(out.iter().all(|&v| v == 0 || v == 1 << 22));
-            assert_eq!(spent, BUDGET.min((1 << 26) * times * records as u32));
+            let total = (1 << 26) * times * records as u32;
+            let expected = if rest() == 0 && times == 3 { 0 } else { BUDGET.min(total) };
+            assert_eq!(spent, expected);
         }
     }
 
