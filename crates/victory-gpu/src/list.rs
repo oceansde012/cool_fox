@@ -207,7 +207,7 @@ impl Detached {
     /// Releases this list's dynamic descriptor slots once its GPU submission
     /// has completed, without waiting for the full `bury_lag` allocator delay.
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        self.state.tables_done();
     }
 }
 
