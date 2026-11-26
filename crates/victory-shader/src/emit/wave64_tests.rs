@@ -742,7 +742,7 @@ fn console_thread_probe(
     threads: [u32; 3],
     wave64: bool,
     lds_blocks: u32,
-    thread_ticket: bool,
+    thread_ticket: Option<bool>,
 ) -> HostShader {
     let [x, y, z] = threads;
     let thread_count = x * y * z;
@@ -772,7 +772,7 @@ fn console_thread_probe(
         threads,
     });
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let old = lower::TEST_THREAD_TICKET.replace(Some(thread_ticket));
+    let old = lower::TEST_THREAD_TICKET.replace(thread_ticket);
     let shader = lowered(&native, &p, &HashSet::new());
     lower::TEST_THREAD_TICKET.set(old);
     shader.expect("lower")
@@ -785,7 +785,7 @@ fn check_console_thread_ids(threads: [u32; 3], wave64: bool) {
 
     let thread_count = threads.iter().product::<u32>();
     let count = thread_count as usize;
-    let shader = console_thread_probe(threads, wave64, 0, true);
+    let shader = console_thread_probe(threads, wave64, 0, Some(true));
     match validator::Validator::load(validator::Validator::default_path().as_deref()) {
         Ok(mut validator) => validator.validate(&mut shader.dxil.clone()).expect("DXIL validation"),
         Err(e) => eprintln!("DXIL validator unavailable: {e}"),
@@ -875,12 +875,24 @@ fn the_thread_counter_requires_multiple_waves_and_available_lds_in_a_multidimens
         ([64, 1, 1], 0, false),
         ([8, 4, 1], 0, false),
     ] {
-        let enabled = console_thread_probe(threads, false, lds_blocks, true);
-        let disabled = console_thread_probe(threads, false, lds_blocks, false);
+        let enabled = console_thread_probe(threads, false, lds_blocks, Some(true));
+        let disabled = console_thread_probe(threads, false, lds_blocks, Some(false));
         assert_eq!(
             enabled.dxil != disabled.dxil,
             changed,
             "group {threads:?} reserving {lds_blocks} LDS blocks"
         );
+    }
+}
+
+#[test]
+fn the_thread_counter_requires_explicit_opt_in() {
+    let enabled = std::env::var_os("VICTORY_THREAD_TICKET").is_some_and(|value| value == "1");
+    for (threads, wave64) in [([32, 2, 1], false), ([32, 3, 1], true)] {
+        let selected = console_thread_probe(threads, wave64, 0, None);
+        let expected = console_thread_probe(threads, wave64, 0, Some(enabled));
+        let alternative = console_thread_probe(threads, wave64, 0, Some(!enabled));
+        assert!(selected.dxil == expected.dxil, "opt-in setting for group {threads:?}");
+        assert!(selected.dxil != alternative.dxil, "opt-in takes effect for group {threads:?}");
     }
 }
