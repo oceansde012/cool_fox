@@ -4987,6 +4987,37 @@ mod lookup_cache_tests {
         unregister(resource, start);
         assert_ne!(replaced, LOOKUP_TABLES_CHANGED.load(Ordering::SeqCst));
     }
+
+    /// Exercise an actual remembered answer while the previous copy remains
+    /// alive: a weak reference alone cannot detect replacement in the table.
+    #[test]
+    fn cached_answer_is_not_reused_after_buffer_re_registration() {
+        if !lookup_cache_enabled() {
+            eprintln!("lookup-cache test skipped: VICTORY_LOOKUP_CACHE is not enabled");
+            return;
+        }
+        if host().is_none() {
+            eprintln!("lookup-cache test skipped: no D3D12 host device");
+            return;
+        }
+        let slot = Box::new([0u64; 8]);
+        let start = slot.as_ptr() as u64;
+        let resource = start as usize;
+        register(resource, start, 64);
+        let first = lookup(start, 8, false).expect("registered buffer has a host copy");
+        let cached = lookup(start, 8, false).expect("second lookup has a host copy");
+        assert!(Arc::ptr_eq(&first, &cached));
+        // Initial creation may invalidate the generation, so populate the
+        // cache after that creation, then verify the next hit is remembered.
+        let hit = lookup(start, 8, false).expect("cache hit has a host copy");
+        assert!(Arc::ptr_eq(&first, &hit));
+        LOOKUP_CACHE.with(|cache| assert!(cache.borrow().1.contains_key(&(start, 8, false))));
+        register(resource, start, 64);
+        let replacement = lookup(start, 8, false).expect("replacement has a host copy");
+        assert!(!Arc::ptr_eq(&first, &replacement), "a live stale copy must not be reused");
+        unregister(resource, start);
+        eprintln!("lookup-cache re-registration exercised on a D3D12 host device");
+    }
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
