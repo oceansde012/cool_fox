@@ -229,6 +229,10 @@ pub(crate) struct HostHeap {
 /// for that pass were its threads waiting there (run city4, timeline 113).
 /// What is done is the same: forgetting a slot that is not there does
 /// nothing.
+///
+/// Run heapsync-ab3 (A/B in the street): 13,300 of 13,500 such writes a
+/// frame left it alone; making views 1.7 ms a frame against 2.4, the pass
+/// 11.7-12.0 ms against 13.2-13.8; the picture the same.
 /// Since the last frame line: writes that left `placed` alone
 /// ([`spans_quick`]), writes that took its lock.
 pub(crate) static SPANS_QUICK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
