@@ -31,6 +31,15 @@ float4 ps(V v) : SV_Target {
 }
 "#;
 
+/// Whether a second presented plane is composed over the first
+/// (`VICTORY_PLANES`; on by default, `0` turns it off). It acts only when
+/// the title presents a second plane (the Series S profile does; Series X
+/// presents one), so the default costs nothing elsewhere.
+pub(crate) fn on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLANES").is_none_or(|v| v != "0"))
+}
+
 pub(crate) struct Composer {
     root: ID3D12RootSignature,
     pso: ID3D12PipelineState,
