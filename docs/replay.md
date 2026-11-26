@@ -74,7 +74,7 @@ with the presented one.
 | `--no-restore` | leaves what a loop changed, and makes no copies to restore from (of a capture that does not fit in the card's memory with them) |
 | `--pace <ms>` | a wait after each submission sent: the card stands idle between them, as in a game that prepares the next one |
 | `--awake` | keeps the card's clocks up (`VICTORY_CARD_AWAKE=1`) |
-| `--breadcrumbs` | the system's breadcrumbs (`VICTORY_D3D12_DRED=light`) |
+| `--breadcrumbs` | the system's breadcrumbs (`VICTORY_D3D12_DRED=light`); a lost card names the list and breadcrumb each stopped list stopped at, and the resource under a page fault |
 | `--debug-layer` | D3D12's debug layer; its errors in the report |
 
 Use the median of several loops; the first is slower. An experiment that
