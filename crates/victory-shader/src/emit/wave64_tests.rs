@@ -736,3 +736,163 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+/// Each lane increments its coordinate's counter and records the console wave info.
+fn console_thread_probe(
+    threads: [u32; 3],
+    wave64: bool,
+    lds_blocks: u32,
+    thread_ticket: Option<bool>,
+) -> HostShader {
+    let [x, y, z] = threads;
+    let thread_count = x * y * z;
+    let mut words = vec![
+        0xD765_0003, 0x0001_007E, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x3408_0280 | x.ilog2(), // v_lshlrev_b32 v4, log2(x), v1
+        0x4A08_0104, // v_add_nc_u32 v4, v4, v0
+    ];
+    if z > 1 {
+        words.extend([
+            0x340A_0480 | (x * y).ilog2(), // v_lshlrev_b32 v5, log2(x * y), v2
+            0x4A08_0905, // v_add_nc_u32 v4, v5, v4
+        ]);
+    }
+    words.extend([
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0xE0C8_1000, 0x8002_0504, // buffer_atomic_add v5, v4, s[8:11], 0 offen
+        0x4A08_08FF, (thread_count + 32) * 4, // v_add_nc_u32 v4, literal, v4
+        0x7E0A_0206, // v_mov_b32 v5, s6 (the group-info register)
+        0xE070_1000, 0x8002_0504, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ]);
+    let mut native = native_of(&words, wave64, thread_count);
+    native.io = StageIo::Cs(ComputeIo {
+        // The group X and group-info inputs follow the five user SGPRs.
+        rsrc2: 5 << 1 | 1 << 7 | 1 << 10 | (if z > 1 { 2 } else { 1 }) << 11 | lds_blocks << 15,
+        threads,
+    });
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let old = lower::TEST_THREAD_TICKET.replace(thread_ticket);
+    let shader = lowered(&native, &p, &HashSet::new());
+    lower::TEST_THREAD_TICKET.set(old);
+    shader.expect("lower")
+}
+
+fn check_console_thread_ids(threads: [u32; 3], wave64: bool) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1,
+    };
+
+    let thread_count = threads.iter().product::<u32>();
+    let count = thread_count as usize;
+    let shader = console_thread_probe(threads, wave64, 0, Some(true));
+    match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        Ok(mut validator) => validator.validate(&mut shader.dxil.clone()).expect("DXIL validation"),
+        Err(e) => eprintln!("DXIL validator unavailable: {e}"),
+    };
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("hardware dispatch unavailable: {e}");
+            return;
+        }
+    };
+    let mut opts = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: the feature query writes the matching structure of the given size.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut opts).cast(),
+            size_of_val(&opts) as u32,
+        )
+    }
+    .expect("query hardware wave support");
+    if !opts.WaveOps.as_bool() || !(opts.WaveLaneCountMin..=opts.WaveLaneCountMax).contains(&32) {
+        eprintln!("hardware dispatch unavailable: the adapter does not support wave32");
+        return;
+    }
+    let (root, pso) = host.compute_pipeline(&shader).expect("wave32 compute pipeline");
+    let output = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                views: &[View::RawUav(thread_count * 2 + 32)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("wave32 dispatch");
+    let once = output[0][..count].iter().filter(|&&hits| hits == 1).count();
+    let missing = output[0][..count].iter().filter(|&&hits| hits == 0).count();
+    let repeated = count - missing - once;
+    assert!(output[0][count..count + 32].iter().all(|&hits| hits == 0), "out-of-range thread ID");
+    eprintln!(
+        "{threads:?}, console wave64={wave64}: {once}/{count} written once, {missing} missing, {repeated} repeated"
+    );
+    assert_eq!(once, count, "each console thread ID must occur once");
+    let wave_width = if wave64 { 64 } else { 32 };
+    let wave_count = thread_count.div_ceil(wave_width);
+    for (thread, &actual) in output[0][count + 32..].iter().enumerate() {
+        let wave_id = thread as u32 / wave_width;
+        assert_eq!(
+            actual,
+            (wave_id << 6) | wave_count,
+            "group info disagrees with the relabelled ID for {threads:?} thread {thread}"
+        );
+    }
+}
+
+#[test]
+fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
+    check_console_thread_ids([32, 2, 1], false);
+}
+
+#[test]
+fn the_console_threads_of_a_three_dimensional_group_are_each_given_once() {
+    check_console_thread_ids([32, 2, 2], false);
+}
+
+#[test]
+fn the_console_threads_of_a_partial_wave_are_each_given_once() {
+    for threads in [[16, 3, 1], [8, 5, 1]] {
+        for wave64 in [false, true] {
+            check_console_thread_ids(threads, wave64);
+        }
+    }
+}
+
+#[test]
+fn the_thread_counter_requires_multiple_waves_and_available_lds_in_a_multidimensional_group() {
+    // LDS reservations come in 512-byte blocks.
+    for (threads, lds_blocks, changed) in [
+        ([32, 2, 1], 0, true),
+        ([32, 2, 1], 63, true),
+        ([32, 2, 1], 64, false),
+        ([64, 1, 1], 0, false),
+        ([8, 4, 1], 0, false),
+    ] {
+        let enabled = console_thread_probe(threads, false, lds_blocks, Some(true));
+        let disabled = console_thread_probe(threads, false, lds_blocks, Some(false));
+        assert_eq!(
+            enabled.dxil != disabled.dxil,
+            changed,
+            "group {threads:?} reserving {lds_blocks} LDS blocks"
+        );
+    }
+}
+
+#[test]
+fn the_thread_counter_requires_explicit_opt_in() {
+    let enabled = std::env::var_os("VICTORY_THREAD_TICKET").is_some_and(|value| value == "1");
+    for (threads, wave64) in [([32, 2, 1], false), ([32, 3, 1], true)] {
+        let selected = console_thread_probe(threads, wave64, 0, None);
+        let expected = console_thread_probe(threads, wave64, 0, Some(enabled));
+        let alternative = console_thread_probe(threads, wave64, 0, Some(!enabled));
+        assert!(selected.dxil == expected.dxil, "opt-in setting for group {threads:?}");
+        assert!(selected.dxil != alternative.dxil, "opt-in takes effect for group {threads:?}");
+    }
+}

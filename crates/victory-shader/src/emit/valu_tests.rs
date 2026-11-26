@@ -2398,6 +2398,8 @@ fn typed_non_d16_table_load_preserves_integer_bits() {
             assert_eq!(out[0], want, "{backend} {label}: buffer_load_format_x mismatch");
         }
     }
+}
+
 #[test]
 fn packed_dot_products_and_clamps_execute_cleanly() {
     let [iw0, iw1] = vop3p(0x016, 0, vgpr(1), vgpr(2), vgpr(3));
