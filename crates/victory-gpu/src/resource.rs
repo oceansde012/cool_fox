@@ -2548,6 +2548,12 @@ fn host_texture_as(
         crate::host::name(t, || {
             format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
         });
+        // A committed texture the GPU writes every frame is demoted last
+        // when the process passes its budget (`VICTORY_RESIDENCY_PRIORITY`).
+        // Not a reserved one: its memory is in tiles, not its own.
+        if !reserved {
+            crate::vram::keep_resident(&host.device, t, crate::vram::Residency::of_texture(d.flags));
+        }
     }
     texture
 }
