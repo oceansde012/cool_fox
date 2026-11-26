@@ -4483,17 +4483,44 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    // Ranges of one copy whose pieces and result places follow each other,
+                    // in one mode, go in one pass (`VICTORY_CARD_COMPARE_JOIN=0`: a pass each).
+                    let join = compare_join();
+                    let mut pending: Option<(u64, u64, u32, crate::shadow::CardSpan, u32, u32)> = None;
+                    let flush = |p: Option<(u64, u64, u32, crate::shadow::CardSpan, u32, u32)>| {
+                        if let Some((buffer, before, size, span, at, mode)) = p {
+                            list.SetComputeRootShaderResourceView(1, buffer);
+                            list.SetComputeRootUnorderedAccessView(2, before);
+                            card_pass(list, &span, size, at, mode);
+                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        }
+                    };
                     for r in plan.ranges.iter().filter(|r| r.compared) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        let (buffer, before_at) = (r.shadow.buffer.GetGPUVirtualAddress(), before.GetGPUVirtualAddress());
                         // (What is only looked at keeps its hashes: what
                         // changed there is the next declared range's to land.)
-                        card_pass(list, &r.span, size as u32, r.at, if flown && !r.picked { 2 } else { 1 });
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        let mode = if flown && !r.picked { 2 } else { 1 };
+                        if join
+                            && let Some((b, h, s, span, at, m)) = pending.as_mut()
+                            && *b == buffer
+                            && *h == before_at
+                            && *s == size as u32
+                            && *m == mode
+                            && span.skew == r.span.skew
+                            && span.first + span.pieces == r.span.first
+                            && *at + span.pieces == r.at
+                        {
+                            span.pieces += r.span.pieces;
+                            span.to = r.span.to;
+                            continue;
+                        }
+                        flush(pending.take());
+                        pending = Some((buffer, before_at, size as u32, r.span, r.at, mode));
                     }
+                    flush(pending.take());
                     list.Close()?;
                     list.cast()
                 })()
@@ -10927,3 +10954,12 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+/// Whether the compares of ranges of one copy in the card's memory whose
+/// pieces and result places follow each other go in one pass
+/// (`VICTORY_CARD_COMPARE_JOIN=0`: a pass each). Some 390 compare passes a
+/// frame walking in the prison, each one dispatch.
+fn compare_join() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_JOIN").is_none_or(|v| v != "0"))
+}
