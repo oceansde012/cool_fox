@@ -330,6 +330,9 @@ struct Voice {
     skip: usize,
     ended: bool,
     trace: Trace,
+    /// One frame's decoded samples, kept between frames so each frame
+    /// does not allocate anew.
+    scratch: Vec<i16>,
 }
 
 /// What a voice did, for the debug log when it is disabled.
@@ -427,6 +430,7 @@ impl Xma {
             pcm: VecDeque::new(),
             skip: context.field(1, 24, 3) as usize * xma::SUBFRAME_SAMPLES,
             ended: false,
+            scratch: Vec::new(),
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
@@ -612,7 +616,9 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         const RATES: [u32; 4] = [24_000, 32_000, 44_100, 48_000];
         xma::Decoder::new(channels, RATES[context.field(1, 27, 2) as usize])
     });
-    let mut pcm = Vec::with_capacity(xma::FRAME_SAMPLES * channels);
+    let mut pcm = std::mem::take(&mut voice.scratch);
+    pcm.clear();
+    pcm.reserve(xma::FRAME_SAMPLES * channels);
     voice.trace.frames += 1;
     if let Err(e) = decoder.decode(&frame.data, frame.bits, &mut pcm) {
         voice.trace.bad_frames += 1;
@@ -646,6 +652,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
     let skip = (voice.skip * channels).min(pcm.len());
     voice.skip -= skip / channels;
     voice.pcm.extend(&pcm[skip..]);
+    voice.scratch = pcm;
     if looping {
         // The loop's own skip is of its first frame, decoded next: not of
         // this one, its last.
@@ -1310,6 +1317,7 @@ mod tests {
             pcm: VecDeque::new(),
             skip: 0,
             ended: false,
+            scratch: Vec::new(),
             trace: Trace {
                 since: Instant::now(),
                 produced: 0,
