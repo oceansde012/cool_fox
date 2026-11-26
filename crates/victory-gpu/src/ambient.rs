@@ -243,8 +243,14 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     float3 c = scattered[at];
+    // Next to a very bright lamp the title's value can be infinite: then
+    // `cap / has` is 0 and inf * 0 is NaN, written back into the volume and
+    // drawn black or as a stray colour (purple, pink) where it was brightest.
+    // NaN counts as nothing, infinity as the most a half float holds.
+    c = any(isnan(c)) ? 0.0 : min(max(c, 0.0), 65504.0);
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
+    else if (any(isnan(scattered[at])) || any(isinf(scattered[at]))) scattered[at] = c;
 }
 #endif
 
