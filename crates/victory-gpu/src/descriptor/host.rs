@@ -2216,24 +2216,24 @@ impl HostHeap {
     /// when `list`, which holds the upload of what that view shows, has run:
     /// until then it shows what it showed. (Made at once, the frames on the
     /// card read the new view before its levels were filled.)
-    pub(crate) fn texture_slot_flip(&self, list: &crate::host::HostList, index: u32, handle: u64) {
-        self.flip(list, index, handle, None);
+    pub(crate) fn texture_slot_flip(&self, list: &crate::host::HostList, index: u32, handle: u64, key: u64) {
+        self.flip(list, index, handle, key, None);
     }
 
     /// The same of a slot that shows nothing of the texture the record at
     /// `handle` views, or something else: until then it shows the neutral
     /// texture ([`show_after`]).
-    pub(crate) fn texture_slot_show_after(&self, list: &crate::host::HostList, index: u32, handle: u64) {
-        if self.show_later(index, handle) {
-            self.flip(list, index, handle, Some(crate::frame::current()));
+    pub(crate) fn texture_slot_show_after(&self, list: &crate::host::HostList, index: u32, handle: u64, key: u64) {
+        if self.show_later(index, handle, key) {
+            self.flip(list, index, handle, key, Some(crate::frame::current()));
         }
     }
 
-    /// What slot `index` shows until the texture the record at `handle` views
-    /// is shown. False: it shows it, or there is none.
-    fn show_later(&self, index: u32, handle: u64) -> bool {
+    /// What slot `index` shows until the texture of record `key` is shown.
+    /// False: it shows it, there is none, or the title has written another
+    /// record to `handle` since `key` was read.
+    fn show_later(&self, index: u32, handle: u64, key: u64) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
-        let key = record_key(handle);
         let view = view_at(key as u32, (key >> 32) as u32);
         let (true, Some(view)) = (key != 0, view) else {
             return false;
@@ -2243,7 +2243,7 @@ impl HostHeap {
             let Some(shown) = self.made.get(index) else {
                 return false;
             };
-            if shown == key {
+            if shown == key || record_key(handle) != key {
                 return false;
             }
             // (As `mirror`.)
@@ -2272,11 +2272,11 @@ impl HostHeap {
 
     /// [`HostHeap::texture_slot_show_after`] of a texture whose upload `job`
     /// makes: shown when that has run.
-    pub(crate) fn texture_slot_show_ahead(&self, job: &crate::texture::ahead::Job, index: u32, handle: u64) {
-        if !self.show_later(index, handle) {
+    pub(crate) fn texture_slot_show_ahead(&self, job: &crate::texture::ahead::Job, index: u32, handle: u64, key: u64) {
+        if !self.show_later(index, handle, key) {
             return;
         }
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let heap = std::ptr::from_ref(self) as usize;
         let late = Some(crate::frame::current());
         job.then(move || {
             let flip = Flip { after: 0, heap, index, handle, key, late };
@@ -2292,20 +2292,20 @@ impl HostHeap {
             && !crate::texture::BAKING.get()
             && index < self.count
             && !self.texture_slot_made_from(index, handle)
-            && let Some(view) = super::view(handle)
+            && let Some((view, key)) = self.prepare_texture_slot(index, handle)
             && let Some(View::Shader(resource, _)) = placed_texture(&view).or(Some(view))
             && crate::resource::buffer_bytes(resource as crate::object::This).is_none()
             && crate::resource::host_resource(resource as crate::object::This).is_some_and(crate::pool::fresh)
             && !crate::texture::ahead::there(resource as crate::object::This)
         {
-            return self.texture_slot_show_after(list, index, handle);
+            return self.texture_slot_show_after(list, index, handle, key);
         }
         self.mirror(index, handle, true);
     }
 
-    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, late: Option<u64>) {
+    fn flip(&self, list: &crate::host::HostList, index: u32, handle: u64, key: u64, late: Option<u64>) {
         use std::sync::atomic::Ordering::{Relaxed, Release};
-        let (heap, key) = (std::ptr::from_ref(self) as usize, record_key(handle));
+        let heap = std::ptr::from_ref(self) as usize;
         let id = NEXT_PENDING_FLIP.fetch_add(1, Relaxed);
         let origin = (std::ptr::from_ref(list) as usize, list.epoch());
         {
@@ -2394,11 +2394,12 @@ impl HostHeap {
         key != 0 && record_key(handle) == key
     }
 
-    /// Looks up `(view, key)` for slot `index` prior to a synchronous bake
-    /// upload without replacing its current host descriptor with `neutral()`;
-    /// [`HostHeap::publish_uploaded_slot`] exposes the real descriptor and
-    /// updates `Spans`/stride tracking once the GPU copy finishes.
-    pub(crate) fn prepare_bake_slot(&self, index: u32, handle: u64) -> Option<(View, u64)> {
+    /// The view of the record at `handle` and its key, read once and without
+    /// touching what slot `index` shows. The upload of that view and what
+    /// shows it later ([`HostHeap::publish_uploaded_slot`], the flips) all
+    /// refer to this key, so a record the title writes to the slot meanwhile
+    /// is never shown on the strength of the replaced record's upload.
+    pub(crate) fn prepare_texture_slot(&self, index: u32, handle: u64) -> Option<(View, u64)> {
         if index >= self.count {
             return None;
         }
@@ -5910,6 +5911,31 @@ pub(crate) fn list_views() -> bool {
 #[cfg(test)]
 mod bake_flip_tests {
     use super::*;
+
+    /// The title writes another record to a slot while the upload of the
+    /// first one's texture is under way: the flip that upload schedules
+    /// keeps the first record's key, so it does not show the new record.
+    #[test]
+    fn an_upload_cannot_publish_a_replacement_slot_record() {
+        let Some(host) = host() else { return };
+        let heap = HostHeap::new(false, 4).unwrap();
+        let list = host.new_list().unwrap();
+        let record = |address| {
+            let [index, generation] = crate::descriptor::constant_words(address, 256).unwrap();
+            [VIEW_TAG, index, generation]
+        };
+        let slot = std::cell::Cell::new(record(0x10000));
+        let handle = slot.as_ptr() as u64;
+        let (_, uploaded_key) = heap.prepare_texture_slot(0, handle).unwrap();
+
+        slot.set(record(0x20000));
+        assert!(!heap.show_later(0, handle, uploaded_key));
+        heap.texture_slot_flip(&list, 0, handle, uploaded_key);
+        let pending = heap.take_pending_list_flips();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key(), uploaded_key);
+        assert!(!heap.slot_still_at(handle, pending[0].key()));
+    }
 
     #[test]
     fn pending_list_flips_promote_once_and_clean_up() {
