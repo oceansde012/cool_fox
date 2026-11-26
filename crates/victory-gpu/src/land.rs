@@ -127,7 +127,7 @@ pub(crate) mod stat {
     pub(crate) const RB_BUFFER_COUNT: usize = 30;
     pub(crate) const RB_BUFFER_BYTES: usize = 31;
     /// Writing texture read-backs into title memory (`texback::write`, on
-    /// its own thread unless `VICTORY_TEXBACK_ASYNC=0`): waiting for the
+    /// its own thread only with `VICTORY_TEXBACK_ASYNC=1`): waiting for the
     /// locks against mapping changes, the work after, read-backs written,
     /// and those replaced by a newer one before they were.
     pub(crate) const TB_WAIT: usize = 32;
@@ -202,9 +202,9 @@ pub(crate) fn log(frames: f64) {
         ms(stat::RB_DONE),
     );
     tracing::info!(
-        "texture read-backs written per frame (VICTORY_TEXBACK_ASYNC={}): {:.1}, {:.1} replaced by a newer one first; \
+        "async texture read-backs written per frame (VICTORY_TEXBACK_ASYNC={}): {:.1}, {:.1} replaced by a newer one first; \
          waiting for the mapping locks {:.2} ms, tiling and writing {:.2} ms",
-        u8::from(std::env::var_os("VICTORY_TEXBACK_ASYNC").is_none_or(|v| v != "0")),
+        u8::from(std::env::var_os("VICTORY_TEXBACK_ASYNC").is_some_and(|v| v == "1")),
         s[stat::TB_WRITTEN],
         s[stat::TB_REPLACED],
         ms(stat::TB_WAIT),

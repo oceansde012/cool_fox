@@ -198,7 +198,7 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 }
 
 /// Whether texture read-backs are written into title memory by a thread of
-/// their own (`VICTORY_TEXBACK_ASYNC`; on unless `0`).
+/// their own (experimental, enabled only by `VICTORY_TEXBACK_ASYNC=1`).
 ///
 /// Writing one takes the lock against mapping changes
 /// ([`crate::watch::title_memory_reading`]), and while the title streams the
@@ -209,11 +209,23 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
 /// landing of everything else. Here the landing thread only copies the
 /// texels out of the read-back buffer; the waiting, tiling and writing go to
 /// [`writer`]. Of several copies of one texture waiting there only the newest
-/// is written: the title reads the frame before at most, which it may on the
-/// console too.
+/// is written. There is no synchronization between the writer and title CPU
+/// consumers, so the opt-in mode can expose stale data after fence completion.
 fn asynchronous() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXBACK_ASYNC").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        let enabled = async_setting(std::env::var_os("VICTORY_TEXBACK_ASYNC").as_deref());
+        if enabled {
+            tracing::warn!("experimental asynchronous texture readback: CPU may observe stale data after fence completion");
+        }
+        enabled
+    })
+}
+
+/// Async publication can happen after the CPU observes fence completion.
+/// Keep it an explicit experiment until that ordering has been fixed.
+fn async_setting(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_some_and(|v| v == "1")
 }
 
 /// A read-back's texels taken out of its buffer, to be tiled into title memory.
@@ -230,6 +242,10 @@ struct Landing {
 /// Once the list has run, tile its texels back into the same title allocation
 /// (on [`writer`]'s thread when [`asynchronous`]).
 pub(crate) fn land(back: &Back) {
+    if !asynchronous() {
+        land_synchronously(back);
+        return;
+    }
     if !back.ticket.valid.load(Ordering::Acquire) {
         stale();
         return;
@@ -263,6 +279,57 @@ pub(crate) fn land(back: &Back) {
     match asynchronous().then(writer).flatten() {
         Some(writer) => writer.send(landing),
         None => write(&landing),
+    }
+}
+
+/// Once the list has run, tile its texels back into the same title allocation.
+fn land_synchronously(back: &Back) {
+    static COPIED: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    let _mapping = crate::watch::title_memory_reading();
+    let _ticket_guard = TICKETS.lock().unwrap_or_else(|e| e.into_inner());
+    if !back.ticket.valid.load(Ordering::Acquire) {
+        let skipped = STALE.fetch_add(1, Ordering::Relaxed) + 1;
+        if skipped.is_power_of_two() {
+            tracing::info!(skipped, "skipping texture readbacks whose title allocation changed");
+        }
+        return;
+    }
+    let (at, end) = back.range();
+    let size = end - at;
+    let mut tiled = vec![0u8; size];
+    // Keep title bytes the subresources do not cover.
+    if !crate::host::read_into(at as *const u8, &mut tiled) {
+        return;
+    }
+    let mut data = std::ptr::null_mut();
+    // SAFETY: our read-back buffer, written by the list that has run.
+    unsafe {
+        if back.buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+            return;
+        }
+    }
+    for (i, (footprint, &rows)) in back.footprints.iter().zip(&back.rows).enumerate() {
+        let (mip, slice) = (i as u32 % back.mips, i as u32 / back.mips);
+        let f = footprint.Footprint;
+        let pitch = f.RowPitch as usize;
+        let len = pitch * rows as usize * f.Depth as usize;
+        // SAFETY: the subresource's part of the mapped buffer.
+        let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
+        if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            // SAFETY: mapped above.
+            unsafe { back.buffer.Unmap(0, None) };
+            return;
+        }
+    }
+    // SAFETY: mapped above.
+    unsafe { back.buffer.Unmap(0, None) };
+    crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
+    let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
+    if copied == 1 || copied.is_multiple_of(128) {
+        tracing::info!(copied, bytes = size, "texture readback landed");
     }
 }
 
@@ -365,6 +432,16 @@ fn writer() -> Option<&'static Writer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asynchronous_readback_requires_explicit_opt_in() {
+        use std::ffi::OsStr;
+        assert!(!async_setting(None));
+        for value in ["", "0", "true", "2"] {
+            assert!(!async_setting(Some(OsStr::new(value))));
+        }
+        assert!(async_setting(Some(OsStr::new("1"))));
+    }
 
     #[test]
     fn only_readbacks_for_changed_allocations_are_invalidated() {
