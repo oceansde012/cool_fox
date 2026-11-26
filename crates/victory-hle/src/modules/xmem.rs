@@ -180,7 +180,21 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
-    if !at.is_null() && placeholder && constrained && flags & ADDRESS_32BIT != 0 {
+    if port_on() && size >= 64 << 20 && flags & ADDRESS_32BIT != 0 {
+        tracing::info!(
+            size,
+            at = format_args!("{at:p}"),
+            placeholder,
+            constrained,
+            kind = format_args!("{kind:#x}"),
+            flags = format_args!("{flags:#x}"),
+            "renderer port 1: a large 32-bit reservation"
+        );
+    }
+    // (This build of the title reserves its 185 MB graphics heap without the
+    // 64 KiB page flag, so not as a placeholder: a reservation without
+    // commit counts too.)
+    if !at.is_null() && (placeholder || kind & MEM_COMMIT == 0) && constrained && flags & ADDRESS_32BIT != 0 {
         LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
     note_protection(asked, kind, flags, at as usize, size);
@@ -1106,6 +1120,14 @@ static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// port1-1: "Scattered"). Only fresh slices are exchanged: never mapped,
 /// never written (no commit bit), so every page still reads as zeros and
 /// which slice a number names is not observable by the title.
+/// Why [`arrange`] left large mappings as they were (the first few times).
+fn arrange_note(base: usize, pages: usize, why: &str) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if port_on() && pages >= 16 && SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+        tracing::info!(at = format_args!("{base:#x}"), pages, why, "renderer port 1: pages not arranged");
+    }
+}
+
 fn arrange(base: usize, pages: &[usize]) {
     let Some((first, bytes)) = LOW_RESERVATIONS
         .lock()
@@ -1114,15 +1136,28 @@ fn arrange(base: usize, pages: &[usize]) {
         .copied()
         .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
     else {
+        arrange_note(base, pages.len(), "not in a 32-bit reservation");
         return;
     };
     let mut table = page_table_mut();
     let Some(section) = pages.first().and_then(|p| table.pages.get(p)).map(|s| s.section.clone()) else {
+        drop(table);
+        arrange_note(base, pages.len(), "no section");
         return;
     };
     if section.pages * PAGE != bytes
         || !pages.iter().all(|p| table.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section)))
     {
+        let sizes = (section.pages * PAGE, bytes);
+        drop(table);
+        arrange_note(
+            base,
+            pages.len(),
+            if sizes.0 != sizes.1 { "section size differs from the reservation" } else { "pages from more than one section" },
+        );
+        if port_on() && pages.len() >= 16 {
+            tracing::info!(section_bytes = sizes.0, reservation = sizes.1, "renderer port 1: sizes");
+        }
         return;
     }
     let fresh = |index: usize| section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0;
