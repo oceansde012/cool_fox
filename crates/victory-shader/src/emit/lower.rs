@@ -1208,7 +1208,7 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
-/// `VICTORY_THREAD_TICKET=0` restores the rounded first-lane index in multidimensional groups.
+/// `VICTORY_THREAD_TICKET=0` restores rounded IDs for the new console wave32 counter.
 fn thread_ticket_on() -> bool {
     #[cfg(test)]
     if let Some(enabled) = TEST_THREAD_TICKET.get() {
@@ -2629,7 +2629,11 @@ impl<'a> Lower<'a> {
                 let wave: u32 = if self.x.native.wave64 { 64 } else { 32 };
                 let threads = cs.threads.iter().product::<u32>();
                 let (e, i32t) = (self.s.entry, self.s.t.i32);
-                let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+                let flat = if self.halves.is_some() || self.ticket.is_some() {
+                    self.console_thread()
+                } else {
+                    self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[])
+                };
                 let w = self.s.m.i32(wave.trailing_zeros());
                 let index = self.s.m.bin(e, Bin::LShr, flat, w);
                 let six = self.s.m.i32(6);
@@ -4169,6 +4173,8 @@ impl<'a> Lower<'a> {
     /// for its wave. The low half of the counter tracks aligned wave-sized blocks. The
     /// high half tracks partial waves, which start after the full blocks regardless of
     /// arrival order. Every thread reaches the barrier in the entry block.
+    /// The tail starts at the rounded-down group size, assuming every host wave
+    /// except the tail is full at entry.
     fn wave_base(&mut self) -> Option<(V, V)> {
         let slot = self.halves.or(self.ticket)?;
         if let Some(base_and_rank) = self.wave_base {
