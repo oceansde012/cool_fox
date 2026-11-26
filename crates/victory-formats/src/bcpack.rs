@@ -482,10 +482,39 @@ fn references(s: &[u8], paired: bool) -> (usize, usize) {
     (usize::from(ix.wrapping_add(delta)), usize::from(ix))
 }
 
+/// A 4-bit value's bits moved to the even bit positions of a byte.
+const SPREAD: [u8; 16] = {
+    let mut t = [0u8; 16];
+    let mut v = 0;
+    while v < 16 {
+        let mut k = 0;
+        while k < 4 {
+            t[v] |= ((v as u8 >> k) & 1) << (2 * k);
+            k += 1;
+        }
+        v += 1;
+    }
+    t
+};
+
+/// A byte's even bits gathered into a 4-bit value (the inverse of `SPREAD`).
+const GATHER: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut v = 0;
+    while v < 256 {
+        let mut k = 0;
+        while k < 4 {
+            t[v] |= ((v as u8 >> (2 * k)) & 1) << k;
+            k += 1;
+        }
+        v += 1;
+    }
+    t
+};
+
 /// Two 4-bit symbols, the first on the even bits.
 fn interleave(a: u8, b: u8) -> u8 {
-    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
-    spread(a) | spread(b) << 1
+    SPREAD[usize::from(a & 15)] | SPREAD[usize::from(b & 15)] << 1
 }
 
 /// Block `i`'s reference `r`: 0 none, else `r` blocks back, before the first
@@ -662,7 +691,7 @@ fn bc5_pack(v: &Plain, out: &mut [u8]) {
 
 /// A byte's even and odd bits as two zigzag-coded 4-bit residuals.
 fn nibbles(b: u8, odd_first: bool) -> [i16; 2] {
-    let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
+    let half = |v: u8| GATHER[usize::from(v)];
     let z = |u: u8| i16::from(u >> 1) ^ -i16::from(u & 1);
     let (even, odd) = (z(half(b)), z(half(b >> 1)));
     if odd_first { [odd, even] } else { [even, odd] }
@@ -1163,6 +1192,20 @@ fn bc6<'a>(
 
 #[cfg(test)]
 mod tests {
+    /// The tables give what the bit loops they replace gave, for every input.
+    #[test]
+    fn spread_and_gather_tables_match_the_loops() {
+        let spread = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> k & 1) << (2 * k));
+        let half = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> (2 * k) & 1) << k);
+        for a in 0..=255u8 {
+            assert_eq!(super::GATHER[usize::from(a)], half(a));
+            for b in 0..=255u8 {
+                // The loop form only ever sees 4-bit symbols' low bits.
+                assert_eq!(super::interleave(a, b), spread(a & 15) | spread(b & 15) << 1);
+            }
+        }
+    }
+
     #[test]
     fn the_shipped_tables_parse() {
         assert!(super::Tables::builtin().is_ok());
