@@ -119,6 +119,17 @@ pub(crate) struct AllocationInfo {
     alignment: u64,
 }
 
+#[cfg(test)]
+pub(crate) fn readback_test_descriptions() -> (HeapProperties, ResourceDesc) {
+    (
+        HeapProperties { kind: 1, cpu_pages: 0, pool: 0, creation_nodes: 0, visible_nodes: 0 },
+        ResourceDesc {
+            dimension: 3, alignment: 0, width: 256, height: 256, depth_or_array_size: 1,
+            mip_levels: 1, format: 41, sample_count: 1, sample_quality: 0, layout: 0, flags: 4,
+        },
+    )
+}
+
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
@@ -1385,6 +1396,33 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`hold`], [`alias_of`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Held {
+    /// The texture the handle keeps alive.
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// Holds title texture `this` alive, for work on a thread the title knows
+/// nothing of. `None` if it is no texture, or is being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    // A texture leaves the table before it is freed, under this lock.
+    let all = textures();
+    (all.contains(&(this as usize)) && crate::object::add_ref_alive(this)).then(|| Held(this))
+}
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1414,7 +1452,7 @@ static TARGETS_AT: std::sync::Mutex<std::collections::BTreeMap<u64, usize>> =
 /// `VICTORY_ALIAS_COPY=0`: none is found, as before; `=1`: only textures
 /// of one level and one layer, as at first.
 #[cfg(windows)]
-pub(crate) fn alias_of(this: This) -> Option<This> {
+pub(crate) fn alias_of(this: This) -> Option<Held> {
     use std::sync::atomic::Ordering::Relaxed;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if this.is_null()
@@ -1475,7 +1513,12 @@ pub(crate) fn alias_of(this: This) -> Option<This> {
             );
         }
     }
-    same.then_some(other)
+    // Pinned under the lock: once it is let go, the title can drop its last
+    // reference, and the caller's alias copy still needs the texture.
+    if !same || !crate::object::add_ref_alive(other) {
+        return None;
+    }
+    Some(Held(other))
 }
 
 /// Whether host copies are made on first use. On by default;
@@ -1495,6 +1538,20 @@ fn lazy() -> bool {
 fn fills(desc: &ResourceDesc) -> bool {
     const TARGET_DEPTH_UNORDERED: u32 = 0x7;
     desc.dimension != BUFFER && desc.flags & TARGET_DEPTH_UNORDERED == 0
+}
+
+/// Read-only textures over title-mapped memory can have a sparse mip chain
+/// whether the title provided a resource object or only a placed view.
+/// Committed copies and textures the GPU writes retain their existing path.
+#[cfg(windows)]
+fn streamed_mip_levels(r: &Resource) -> Option<u32> {
+    const TEXTURE_2D: u32 = 3;
+    let levels = mip_count(&r.desc);
+    (fills(&r.desc) && r.desc.dimension == TEXTURE_2D
+        && r.desc.depth_or_array_size == 1 && levels > 1 && r.desc.sample_count <= 1
+        && (r.host.placed.load(std::sync::atomic::Ordering::Relaxed)
+            || matches!(&r.backing, Backing::Address(_))))
+        .then_some(levels)
 }
 
 /// Whether the title fills texture `this` itself ([`fills`]).
@@ -1551,7 +1608,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             && r.desc.depth_or_array_size == 1
             && r.desc.mip_levels > 1
             && r.desc.sample_count <= 1;
-        if shape_fits && r.host.placed.load(Relaxed) && crate::tiles::wanted() {
+        if let Some(levels) = streamed_mip_levels(r)
+            && crate::tiles::wanted()
+        {
             let bytes = footprint(&r.desc).map_or(0, |f| f.size);
             let start = r.data() as u64;
             // What the upload can read: a console layout, no XOR mode
@@ -1566,7 +1625,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             let cut = reserved
                 .as_ref()
                 .zip(crate::host::host())
-                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
+                .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, levels));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
             if cut.is_some() {
@@ -2481,7 +2540,11 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    // A request for a reserved mip chain must reach CreateReservedResource;
+    // a pooled committed texture would allocate every level and make the
+    // sparse path fall back before it can map any tiles.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -3358,6 +3421,60 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real GPU integration; run with VICTORY_LEVELS_ON_DEMAND=1"]
+    fn address_backed_readonly_texture_keeps_unmapped_mips_unallocated() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RESERVE, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE};
+        assert!(crate::tiles::wanted(), "requires sparse texture support and VICTORY_LEVELS_ON_DEMAND=1");
+        for (levels, all_mapped, flags) in [(12, false, 0), (0, false, 0), (12, true, 0), (12, false, 4)] {
+            let mut desc = texture(2048, 2048, 28, levels);
+            desc.flags = flags;
+            let size = footprint(&desc).unwrap().size as usize;
+            // Only the tail is mapped, as with a streamed console texture.
+            let address = unsafe { VirtualAlloc(std::ptr::null(), size, MEM_RESERVE, PAGE_READWRITE) };
+            assert!(!address.is_null());
+            struct Pages(*mut std::ffi::c_void);
+            impl Drop for Pages { fn drop(&mut self) { unsafe { VirtualFree(self.0, 0, MEM_RELEASE); } } }
+            let _pages = Pages(address);
+            let mapped = if all_mapped { size } else { 65536 };
+            assert!(!unsafe { VirtualAlloc(address, mapped, MEM_COMMIT, PAGE_READWRITE) }.is_null());
+            unsafe { std::ptr::write_bytes(address.cast::<u8>(), 0x5a, mapped); }
+            let mut title = std::ptr::null();
+            assert_eq!(create_at_address(std::ptr::null(), address as u64, &desc, 0, std::ptr::null(), &RESOURCE_IIDS[0], &mut title), S_OK);
+            struct Object(This);
+            impl Drop for Object { fn drop(&mut self) { crate::object::release(self.0); } }
+            let _title = Object(title);
+            let r = resource(title);
+            assert!(!r.host.placed.load(std::sync::atomic::Ordering::Relaxed), "ordinary title resource object");
+            assert_eq!(streamed_mip_levels(r), if flags == 0 { Some(12) } else { None });
+            let host = host_resource(title).unwrap();
+            let of = unsafe { host.GetDesc() };
+            assert_eq!(of.MipLevels, 12);
+            assert_eq!((of.Width, of.Height), (2048, 2048));
+            let made = r.host.made.lock().unwrap();
+            if all_mapped || flags != 0 {
+                assert_eq!(of.Layout, D3D12_TEXTURE_LAYOUT_UNKNOWN);
+                assert!(made.as_ref().unwrap().0.tiled.is_none(), "fully mapped and GPU-written textures retain their original allocation path");
+                continue;
+            }
+            assert_eq!(of.Layout, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+            let held = made.as_ref().unwrap().0.clone();
+            drop(made);
+            let tiled = held.tiled.as_ref().expect("reserved mip chain");
+            assert_eq!(tiled.given_bytes(), 0, "unmapped mip levels consume no physical tiles");
+            let gpu = crate::host::host().unwrap();
+            let list = gpu.new_list().unwrap();
+            crate::texture::upload(&list, title, host);
+            list.close();
+            gpu.execute_sync_internal(&list);
+            assert!(tiled.given_bytes() > 0, "mapped tail is uploaded and given physical tiles: mips={levels}");
+            assert!(tiled.given_bytes() < size as u64, "unmapped large levels still consume no tiles after upload");
+            unsafe { assert!(gpu.device.GetDeviceRemovedReason().is_ok()); }
+        }
+    }
+
     fn heap(size: u64) -> This {
         let desc = HeapDesc {
             size,
@@ -3796,6 +3913,49 @@ mod tests {
         }
     }
 
+    /// The source a placed view aliases is held while the caller copies it:
+    /// the title may let go of its own reference between the lookup and the
+    /// copy (or a recording thread may), and the copy still needs it.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn an_alias_source_is_held_after_the_title_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        let held = alias_of(view).expect("an alias source");
+        assert_eq!(held.get(), source);
+        // The title lets go: the pin, not the title's reference, keeps the
+        // source (and the copy about to be made from it) alive.
+        resource_release(source);
+        assert!(host_resource(held.get()).is_some(), "a held source is still copyable");
+        assert!(textures().contains(&(source as usize)), "the held source is not freed");
+        drop(held);
+        assert!(!textures().contains(&(source as usize)), "the last reference frees it");
+        resource_release(view);
+    }
     /// A 16-bit depth texture the title also asks unordered access for gets
     /// a colour twin, and the host copies one into the other, both ways: a
     /// pattern put into the twin is copied to the depth texture, the twin
