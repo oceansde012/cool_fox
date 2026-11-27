@@ -1639,6 +1639,10 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            // What its views, root views and title memory by address declare
+            // written goes into title memory, unless `VICTORY_LAND_NOT`
+            // names the shader.
+            let _lands = crate::shadow::writer_lands(crate::land::lands(&stage.shader.hash));
             STORES.set(t.stores);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);

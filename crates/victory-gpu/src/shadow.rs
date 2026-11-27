@@ -83,6 +83,9 @@ pub(crate) struct Shadow {
     unsized_asks: AtomicU64,
     /// Whether shaders were ever declared to write it.
     written: std::sync::atomic::AtomicBool,
+    /// Who was declared to write it ([`WRITER_LANDS`]): [`BY_UNLANDED`],
+    /// [`BY_OTHERS`], both.
+    writers: AtomicU8,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -1317,8 +1320,37 @@ fn give_back(v: Vec<u8>) {
 }
 
 const NOT_WATCHED: u8 = 2;
+
 /// Watched, not by the kernel but by the guards, when last asked about.
 const GUARDED: u8 = 3;
+
+thread_local! {
+    /// Whether the shaders of the stage being bound on this thread have what
+    /// they write put into title memory (`crate::land::lands`); declared
+    /// writes are noted with it ([`Shadow::gpu_writes`]).
+    static WRITER_LANDS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// [`Shadow::writers`]: written by a pipeline `VICTORY_LAND_NOT` names, by
+/// another.
+const BY_UNLANDED: u8 = 1;
+const BY_OTHERS: u8 = 2;
+
+/// Writes declared on this thread are of shaders that land (`lands`) until
+/// the value returned is dropped.
+pub(crate) fn writer_lands(lands: bool) -> WriterLands {
+    WRITER_LANDS.set(lands);
+    WriterLands
+}
+
+/// See [`writer_lands`].
+pub(crate) struct WriterLands;
+
+impl Drop for WriterLands {
+    fn drop(&mut self) {
+        WRITER_LANDS.set(true);
+    }
+}
 
 // Fixed-size equality compiles to two SIMD comparisons on Windows x64.
 // Only the first or last unequal chunk needs a byte-wise search.
@@ -2985,6 +3017,7 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
+            writers: AtomicU8::new(0),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -3023,8 +3056,24 @@ impl Shadow {
             return;
         }
         self.written.store(true, Ordering::Relaxed);
+        self.writers.fetch_or(if WRITER_LANDS.get() { BY_OTHERS } else { BY_UNLANDED }, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether what shaders wrote to this copy in the card's memory stays
+    /// there, not fetched nor put into title memory (`crate::land::not_on`):
+    /// only pipelines `VICTORY_LAND_NOT` names were ever declared to write
+    /// it; it is scratch-sized (1 MiB or more: a small buffer of the same
+    /// shaders may be one the title reads, and costs nothing to land); and
+    /// its memory is watched, so that no refresh takes title memory that the
+    /// title did not write (that would send it up over the card's).
+    pub(crate) fn not_landed(&self) -> bool {
+        self.card.is_some()
+            && self.len >= 1 << 20
+            && self.writers.load(Ordering::Relaxed) == BY_UNLANDED
+            && matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED)
+            && crate::land::not_on()
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders

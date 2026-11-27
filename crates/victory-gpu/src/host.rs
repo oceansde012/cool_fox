@@ -4641,6 +4641,17 @@ impl Host {
                             continue;
                         }
                         let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                        // Scratch of shaders whose writes the title never
+                        // reads stays on the card (`land::lands`).
+                        if lo < hi && r.shadow.not_landed() {
+                            land::count(land::stat::NOT, 1);
+                            land::count(land::stat::NOT_BYTES, (hi - lo) as u64);
+                            #[cfg(feature = "diagnostics")]
+                            if land::probe::on() {
+                                land::probe::arm(r.shadow.span().0 as usize + lo, hi - lo);
+                            }
+                            continue;
+                        }
                         if lo < hi && !seen.contains(&(copy, lo, hi)) {
                             let key = (r.shadow.id(), r.shadow.span().0 as usize + lo, hi - lo);
                             if fetch.as_ref().is_some_and(|f| f.had.holds(behind, key)) {

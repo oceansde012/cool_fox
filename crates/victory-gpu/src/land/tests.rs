@@ -468,3 +468,13 @@ fn what_landing_costs() {
         busy.store(false, Ordering::Relaxed);
     });
 }
+
+#[test]
+fn shaders_named_and_only_those_are_not_landed() {
+    let list = ["32aa8384586e0f12".to_string(), "ba578b".to_string()];
+    assert!(!lands_by(&list, "32aa8384586e0f12"));
+    // A beginning names every hash it begins.
+    assert!(!lands_by(&list, "ba578b59c8c28a57"));
+    assert!(lands_by(&list, "14264103296aa43a"));
+    assert!(lands_by(&[], "32aa8384586e0f12"));
+}
