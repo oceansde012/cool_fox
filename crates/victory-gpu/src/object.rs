@@ -221,15 +221,38 @@ pub(crate) const fn d3d12_object<const N: usize>(mut f: [*const (); N]) -> [*con
     f
 }
 
+/// The most UTF-16 units [`set_name`] reads: 2 KiB. D3D12 names are short
+/// debug strings, so no real one comes near this; the bound is what keeps a
+/// stale or unterminated name pointer from walking memory without end.
+const MAX_NAME_UNITS: usize = 1024;
+
 /// The object methods' name setter: names only reach our log.
 pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
     let name = if name.is_null() {
         String::new()
     } else {
-        // SAFETY: a non-null name is NUL-terminated UTF-16.
-        let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
-        // SAFETY: `len` units were just read.
-        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
+        // The title passes a NUL-terminated UTF-16 string, but the pointer
+        // may have gone stale by now. `read_there` touches only mapped
+        // memory and reports how much of it it could read: no unsafe here,
+        // and a bad pointer costs an empty name in our log instead of
+        // faulting inside the title's call.
+        let mut bytes = [0u8; MAX_NAME_UNITS * 2];
+        let got = crate::host::read_there(name.cast(), &mut bytes);
+        let units: Vec<u16> = bytes[..got & !1]
+            .chunks_exact(2)
+            .map(|unit| u16::from_le_bytes([unit[0], unit[1]]))
+            .collect();
+        match units.iter().position(|&unit| unit == 0) {
+            Some(end) => String::from_utf16_lossy(&units[..end]),
+            // Nothing readable, or the readable memory ended before the
+            // string did: no name we can use.
+            None if got < bytes.len() => {
+                tracing::debug!(object = ?this, "object name unreadable");
+                String::new()
+            }
+            // Longer than any real name: keep what the bound allows.
+            None => String::from_utf16_lossy(&units),
+        }
     };
     tracing::debug!(object = ?this, %name, "named");
     S_OK
