@@ -1081,6 +1081,9 @@ fn create() -> windows::core::Result<Host> {
                 "host D3D12 adapter"
             );
         }
+        if let Some(adapter) = &adapter {
+            crate::vram::reserve(adapter);
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
@@ -11202,6 +11205,13 @@ impl Host {
             crate::book::made(b, || "an unordered access buffer".into());
         }
         let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        // Card copies of title buffers and their hashes are read by most
+        // frames: demoted last (`VICTORY_RESIDENCY_PRIORITY`).
+        if made.is_ok()
+            && let Some(b) = &buffer
+        {
+            crate::vram::keep_resident(&self.device, b, crate::vram::Residency::Frame);
+        }
         match made {
             Ok(()) => buffer,
             Err(e) => {

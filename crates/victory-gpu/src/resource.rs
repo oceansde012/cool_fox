@@ -2648,6 +2648,10 @@ fn host_texture_as(
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
     });
+    // Placed textures returned above. Only committed textures receive priority.
+    if !reserved {
+        crate::vram::keep_resident(&host.device, &texture, crate::vram::Residency::of_texture(d.flags));
+    }
     Ok(texture)
 }
 
