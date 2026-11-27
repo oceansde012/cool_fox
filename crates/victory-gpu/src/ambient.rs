@@ -128,7 +128,12 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#if defined(PLACE) || defined(GATHER) || defined(RAISE)
+#define RESOLVE_DEPTH
+#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t0))"
+#else
+#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#endif
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -139,7 +144,6 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float unused;
 };
-Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are.
 RWStructuredBuffer<float4> cells : register(u1);
@@ -147,6 +151,8 @@ RWStructuredBuffer<float4> cells : register(u1);
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
+#ifdef RESOLVE_DEPTH
+Texture2D<float> depth : register(t0);
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
     float d = depth.Load(int3(clamp(p, int2(0, 0), int2(size) - 1), 0));
@@ -154,6 +160,7 @@ float3 seen(int2 p, float2 size) {
     float2 ndc = (float2(p) + 0.5) / size * 2.0 - 1.0;
     return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
 }
+#endif
 
 #ifdef KEEP
 RWTexture2D<float3> radiance : register(u0);
@@ -338,6 +345,8 @@ const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
     root: ID3D12RootSignature,
+    /// For the passes that read the depth (place, gather, raise).
+    resolve_root: ID3D12RootSignature,
     keep: ID3D12PipelineState,
     mean: ID3D12PipelineState,
     place: ID3D12PipelineState,
@@ -354,15 +363,17 @@ unsafe impl Sync for Pass {}
 
 fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -> windows::core::Result<Pass> {
     let mut root: Option<ID3D12RootSignature> = None;
+    let mut resolve_root: Option<ID3D12RootSignature> = None;
     let mut pipeline = |part: &str, entry| -> windows::core::Result<ID3D12PipelineState> {
         let code = crate::host::compile(&format!("#define {part}\n{SOURCE}"), entry, s!("cs_5_1"))?;
+        let root = if matches!(part, "PLACE" | "GATHER" | "RAISE") { &mut resolve_root } else { &mut root };
         // SAFETY: the root signature is inside the shader; plain creations.
         unsafe {
             if root.is_none() {
-                root = Some(device.CreateRootSignature(0, &code)?);
+                *root = Some(device.CreateRootSignature(0, &code)?);
             }
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-                pRootSignature: std::mem::transmute_copy(&root),
+                pRootSignature: std::mem::transmute_copy(root),
                 CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
                 ..Default::default()
             };
@@ -378,6 +389,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
+        resolve_root: resolve_root.ok_or_else(windows::core::Error::empty)?,
         keep,
         mean,
         place,
@@ -414,8 +426,9 @@ static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 pub(crate) struct Views {
     /// The image the title's program just wrote.
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
-    /// The scene's depth, for [`Role::Resolve`].
-    pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// The scene's depth, for [`Role::Resolve`] (none for the others: their
+    /// passes read no depth, and their root signature has no table for it).
+    pub(crate) depth: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
@@ -462,17 +475,20 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
     let l = &list.list;
+    let root = if views.depth.is_some() { &pass.resolve_root } else { &pass.root };
     // SAFETY: an open list with the heap of the views set; the title's
-    // program has just used both views, so their textures are in the states
-    // these views need; buffers the list keeps.
+    // program has just used the bound views, so their textures are in the
+    // states these views need; buffers the list keeps.
     unsafe {
         uav_barrier(l);
-        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRootSignature(root);
         l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
-        l.SetComputeRootDescriptorTable(1, views.depth);
-        l.SetComputeRootDescriptorTable(2, views.image);
-        l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
-        l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootDescriptorTable(1, views.image);
+        l.SetComputeRootUnorderedAccessView(2, pass.cells.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(3, pass.points.GetGPUVirtualAddress());
+        if let Some(depth) = views.depth {
+            l.SetComputeRootDescriptorTable(4, depth);
+        }
         let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
