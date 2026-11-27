@@ -1361,7 +1361,34 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference};
+    use super::{PIECE, Shadow, first_difference, last_difference};
+
+    #[test]
+    fn parallel_compare_includes_the_first_partial_piece() {
+        const LEN: usize = 48 << 20;
+        const START: u64 = 0x0012_3456_8000;
+        let before = vec![0u8; LEN];
+        let mut data = before.clone();
+        let changed = [0, PIECE - 1, 3 << 20, 20 << 20, 40 << 20, LEN - 1];
+        for at in changed {
+            data[at] = 1;
+        }
+
+        // The compare reads the copy directly, so it needs no D3D12 device.
+        let shadow = Shadow::unbacked(START, data.as_mut_ptr(), LEN as u64, false);
+        let found = shadow.differing(0, LEN, &before);
+        for at in changed {
+            assert!(
+                found.iter().any(|&(start, len)| (start..start + len).contains(&at)),
+                "missed change at {at:#x}"
+            );
+        }
+        for (start, len) in found {
+            assert!(changed.iter().any(|at| (start..start + len).contains(at)));
+            let end = start + len;
+            assert!(end == LEN || (START as usize + end).is_multiple_of(PIECE));
+        }
+    }
 
     /// The chunk searches agree with a byte-wise scan across chunk boundaries.
     #[test]
@@ -3484,7 +3511,8 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // The first piece can begin before the copy.
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
