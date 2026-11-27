@@ -344,11 +344,6 @@ impl Asking {
         held.push((first, last));
         Asking(first, last)
     }
-
-    /// Everything: an asking for a whole submission.
-    fn hold_all() -> Asking {
-        Asking::hold(0, usize::MAX)
-    }
 }
 
 impl Drop for Asking {
@@ -360,6 +355,54 @@ impl Drop for Asking {
         drop(held);
         ASKING.1.notify_all();
     }
+}
+
+/// The pages of each of a submission's runs (`[first, last)`) held in
+/// [`ASKING`] until dropped, taken all at once; or with [`ask_own`] off,
+/// everything.
+struct AskingRuns(Vec<(usize, usize)>);
+
+impl AskingRuns {
+    fn hold(runs: Vec<(usize, usize)>) -> AskingRuns {
+        let runs = if ask_own() { runs } else { vec![(0, usize::MAX)] };
+        let busy = |held: &[(usize, usize)]| held.iter().any(|&(a, b)| runs.iter().any(|&(first, last)| a < last && first < b));
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        if busy(&held) {
+            held = waited(0, || {
+                let mut held = held;
+                while busy(&held) {
+                    held = ASKING.1.wait(held).unwrap_or_else(|e| e.into_inner());
+                }
+                held
+            });
+        }
+        held.extend_from_slice(&runs);
+        drop(held);
+        AskingRuns(runs)
+    }
+}
+
+impl Drop for AskingRuns {
+    fn drop(&mut self) {
+        let mut held = ASKING.0.lock().unwrap_or_else(|e| e.into_inner());
+        for run in &self.0 {
+            if let Some(i) = held.iter().position(|r| r == run) {
+                held.swap_remove(i);
+            }
+        }
+        drop(held);
+        ASKING.1.notify_all();
+    }
+}
+
+/// Whether a submission's asking ([`ask_once`]) holds only the pages it
+/// asks about (`VICTORY_ASK_OWN=0`: every page, as before). Other threads
+/// ask about other memory meanwhile (a texture's refresh, the guards of view
+/// memory, which the submission never asks about), and the submission
+/// waited for each of them to be done: 1.3-1.5 ms a frame in a timeline of
+/// the Series S cell, behind askings that waited for the guards' lock.
+fn ask_own() -> bool {
+    crate::toggled!("VICTORY_ASK_OWN")
 }
 
 thread_local! {
@@ -455,8 +498,9 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    let _all = Asking::hold_all();
-    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    // The runs of pieces asked about together (each a place in `pieces`, and
+    // its pages).
+    let mut runs: Vec<(usize, usize, (usize, usize))> = Vec::new();
     let mut i = 0;
     while i < pieces.len() {
         let first = pieces[i].0;
@@ -469,8 +513,14 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
             last = last.max(pieces[k].1);
             k += 1;
         }
-        ask_run(&pieces[i..k], &mut asked, &mut written);
+        runs.push((i, k, (first, last)));
         i = k;
+    }
+    // (A piece alone is left to `writes`.)
+    let _held = AskingRuns::hold(runs.iter().filter(|r| r.1 - r.0 > 1).map(|r| r.2).collect());
+    let (mut asked, mut written) = (Vec::new(), Vec::new());
+    for &(i, k, _) in &runs {
+        ask_run(&pieces[i..k], &mut asked, &mut written);
     }
     note_hot(&written);
     let mut j = journal_mut();
@@ -665,7 +715,18 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
 /// [`ask_once`] after its [`ask_ahead`]: what that left to `writes`, and the
 /// asking stands.
 fn ask_rest(ranges: &[(usize, usize)]) {
-    let _all = Asking::hold_all();
+    // What may be asked here: the ranges that part did not hold. (Only this
+    // thread changes what the journal holds as asked ahead.)
+    let lone: Vec<(usize, usize)> = {
+        let j = journal();
+        ranges
+            .iter()
+            .filter(|r| r.0 < r.1 && !published(r.0, r.1))
+            .map(|&(start, end)| (start / PAGE, end.div_ceil(PAGE)))
+            .filter(|&(first, last)| !j.ahead.holds(first, last))
+            .collect()
+    };
+    let _held = AskingRuns::hold(lone);
     let mut ahead = {
         let mut j = journal_mut();
         std::mem::take(&mut j.ahead)
@@ -3207,6 +3268,32 @@ fn writable(at: usize) -> bool {
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+}
+
+#[cfg(test)]
+mod asking_tests {
+    use super::{ASKING, Asking, AskingRuns};
+
+    /// A submission's asking holds its own pages, not those another thread is
+    /// asking about elsewhere, and lets them go when it is done; one that
+    /// meets a held range waits for it.
+    #[test]
+    fn a_submissions_asking_waits_only_for_its_own_pages() {
+        // (Pages no other test asks about.)
+        let base = 1 << 40;
+        let held = |r: (usize, usize)| ASKING.0.lock().unwrap_or_else(|e| e.into_inner()).contains(&r);
+        let other = Asking::hold(base, base + 10);
+        let mine = AskingRuns::hold(vec![(base + 20, base + 30), (base + 40, base + 50)]);
+        assert!(held((base + 20, base + 30)) && held((base + 40, base + 50)));
+        drop(mine);
+        assert!(!held((base + 20, base + 30)) && !held((base + 40, base + 50)) && held((base, base + 10)));
+        let waiting = std::thread::spawn(move || drop(AskingRuns::hold(vec![(base + 5, base + 25)])));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!waiting.is_finished());
+        drop(other);
+        waiting.join().unwrap();
+        assert!(!held((base + 5, base + 25)));
+    }
 }
 
 #[cfg(test)]
