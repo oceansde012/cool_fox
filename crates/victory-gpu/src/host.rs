@@ -2725,6 +2725,27 @@ fn heat_on() -> bool {
     })
 }
 
+/// Whether a flight that owes pieces is held back from landing until a
+/// compare of them has run (`VICTORY_CARD_COMPARE_HOT_HOLD=0`: it lands, and
+/// what a later compare finds lands when that has run, at most the deadline
+/// of [`heat`] in submissions after the shader wrote it; on by default).
+/// Held, every flight waits for the pieces it left for later and the saving
+/// is only what several flights declare in common; not held, a piece no
+/// shader has written lately is read once a deadline instead of with every
+/// flight that declares it (the opening scene: a 182 MB buffer declared
+/// whole by seven submissions a frame, 2.4 GB read a frame, 10 ms of the
+/// card, for 34 pieces found changed).
+fn heat_holds() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_COMPARE_HOT_HOLD").is_none_or(|v| v != "0");
+        if !on && heat_on() {
+            tracing::info!("flights are not held back for the pieces they left for a later compare (VICTORY_CARD_COMPARE_HOT_HOLD=0)");
+        }
+        on
+    })
+}
+
 /// The book of [`heat`]: the owed pieces, the covers on the card, what
 /// compares found. Taken after [`QUEUE_ORDER`] and [`CARD_WORK`] where those
 /// are held, and inside [`line`]'s lock by the thread that lands flights
@@ -3688,7 +3709,9 @@ fn relay_worker() {
                         let mut last = None;
                         for (i, item) in line.line[..run].iter().enumerate() {
                             if let Late::Run(flight) = item {
-                                held = book.hold(flight.number, done);
+                                if heat_holds() {
+                                    held = book.hold(flight.number, done);
+                                }
                                 if held != heat::Hold::Free {
                                     n = i;
                                     break;
