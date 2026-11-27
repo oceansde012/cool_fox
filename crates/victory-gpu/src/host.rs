@@ -515,7 +515,41 @@ fn bury(finished: u64) {
         }
         retired.drain(..n).collect()
     };
-    drop(done);
+    release_later(done);
+}
+
+/// Drops `done` on a thread of its own (`victory-release`): releasing a
+/// D3D12 object is a call into the driver (under Wine and vkd3d-proton a
+/// Vulkan free each), and `bury` runs on the submitting thread
+/// (upstream VIctory 3e10052c: ~5 % of that thread in releases).
+/// `VICTORY_RELEASE_THREAD=0` drops them where they are buried, as before.
+fn release_later(done: Vec<(u64, Retired)>) {
+    static SEND: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
+    let send = SEND.get_or_init(|| {
+        if std::env::var_os("VICTORY_RELEASE_THREAD").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();
+        std::thread::Builder::new()
+            .name("victory-release".into())
+            .spawn(move || {
+                for batch in rx {
+                    drop(batch);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(tx))
+    });
+    match send {
+        Some(tx) => {
+            let tx = tx.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(std::sync::mpsc::SendError(done)) = tx.send(done) {
+                drop(tx);
+                drop(done);
+            }
+        }
+        None => drop(done),
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
