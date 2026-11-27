@@ -179,12 +179,77 @@ struct Journal {
     /// Page ranges asked ahead for a submission's refreshes ([`ask_ahead`])
     /// and the asking that did: `writes` answers for a range inside one
     /// from the journal, without another kernel call.
-    ahead: Vec<(usize, usize)>,
+    ahead: Ahead,
     ahead_asked: u64,
     /// The ahead asking stands for a whole submission ([`ask_once`]): no
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+}
+
+/// The page ranges of [`Journal::ahead`] that no other one holds, by their
+/// first pages: their ends rise with them, so whether one of them holds a
+/// range is one binary search. Every refresh's look asked it (`writes`,
+/// `nothing_new`), through all of the ranges, some ten thousand times a
+/// frame. (Vice-Tay's index, after its 755dc92d.)
+#[derive(Default)]
+struct Ahead {
+    ranges: Vec<(usize, usize)>,
+}
+
+impl Ahead {
+    const fn new() -> Ahead {
+        Ahead { ranges: Vec::new() }
+    }
+
+    fn from_ranges(mut ranges: Vec<(usize, usize)>) -> Ahead {
+        ranges.sort_unstable_by_key(|&(first, last)| (first, std::cmp::Reverse(last)));
+        let mut furthest = None;
+        ranges.retain(|&(_, last)| {
+            if furthest.is_some_and(|end| last <= end) {
+                return false;
+            }
+            furthest = Some(last);
+            true
+        });
+        Ahead { ranges }
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ranges.is_empty()
+    }
+
+    /// Whether one of the ranges holds pages `[first, last)`
+    /// (`VICTORY_AHEAD_INDEX=0`: looked for through all of them, as before).
+    fn holds(&self, first: usize, last: usize) -> bool {
+        if !crate::toggled!("VICTORY_AHEAD_INDEX") {
+            return self.ranges.iter().any(|&(a, b)| a <= first && last <= b);
+        }
+        let past = self.ranges.partition_point(|&(start, _)| start <= first);
+        past != 0 && self.ranges[past - 1].1 >= last
+    }
+
+    /// Adds `[first, last)` unless one of the ranges holds it, and drops
+    /// those it holds; whether it was added.
+    fn insert_uncovered(&mut self, first: usize, last: usize) -> bool {
+        let mut at = self.ranges.partition_point(|&(start, _)| start <= first);
+        if at > 0 {
+            let (start, end) = self.ranges[at - 1];
+            if last <= end {
+                return false;
+            }
+            if start == first {
+                at -= 1;
+            }
+        }
+        let end = at + self.ranges[at..].partition_point(|&(_, end)| end <= last);
+        drop(self.ranges.splice(at..end, [(first, last)]));
+        true
+    }
 }
 
 /// Read by many threads at once (a submission's refreshes run on several),
@@ -196,7 +261,7 @@ struct Journal {
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: Written::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-    ahead: Vec::new(),
+    ahead: Ahead::new(),
     ahead_asked: 0,
     kept: false,
 });
@@ -373,6 +438,12 @@ const AHEAD_MAX: usize = (1 << 30) / PAGE;
 /// 456 ms, in run 14). Ranges that are not write-watched, or lie alone, are
 /// left to `writes`.
 pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
+    // The submission's one asking stands ([`ask_once`]): what it does not
+    // hold is left to `writes`. (Looked at first: the pieces are not made
+    // and sorted for nothing.)
+    if journal().kept {
+        return;
+    }
     let mut pieces: Vec<(usize, usize)> = ranges
         .iter()
         // Not view memory known by its bits: the kernel would refuse the
@@ -384,11 +455,6 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
         return;
     }
     pieces.sort_unstable();
-    // The submission's one asking stands ([`ask_once`]): what it does not
-    // hold is left to `writes`.
-    if journal().kept {
-        return;
-    }
     let _all = Asking::hold_all();
     let (mut asked, mut written) = (Vec::new(), Vec::new());
     let mut i = 0;
@@ -409,7 +475,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     note_hot(&written);
     let mut j = journal_mut();
     j.ahead_asked = next_asking();
-    j.ahead = asked;
+    j.ahead = Ahead::from_ranges(asked);
     let now = j.ahead_asked;
     for (page, parts) in written {
         j.note(page, parts, now);
@@ -615,11 +681,11 @@ fn ask_rest(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !ahead.iter().any(|&(a, b)| a <= first && last <= b)
+        if !ahead.holds(first, last)
             && let Some(pages) = kernel_written(first, last)
         {
             written.extend(pages);
-            ahead.push((first, last));
+            ahead.insert_uncovered(first, last);
         }
     }
     note_hot(&written);
@@ -707,10 +773,7 @@ fn ask_run(pieces: &[(usize, usize)], asked: &mut Vec<(usize, usize)>, written: 
 pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let j = journal();
-    j.ahead
-        .iter()
-        .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first, last).collect()))
+    j.ahead.holds(first, last).then(|| (j.ahead_asked, j.written.range(first, last).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -722,7 +785,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first, last).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
-    let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
+    let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
         return Some(known);
     }
@@ -806,7 +869,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         crate::faultbook::note(crate::faultbook::What::Known, first, last, 1);
     }
     let j = journal();
-    if !known && !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) {
+    if !known && !j.ahead.holds(first, last) {
         return false;
     }
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
@@ -3155,7 +3218,7 @@ mod parts_tests {
         let mut j = Journal {
             written: Written::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
-            ahead: Vec::new(),
+            ahead: Ahead::new(),
             ahead_asked: 0,
             kept: false,
         };
@@ -3175,6 +3238,31 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    /// The index of the ranges asked ahead says what a look through all of
+    /// them says, built at once or a range at a time.
+    #[test]
+    fn ranges_asked_ahead_hold_what_lies_in_one_of_them() {
+        let all = [(30, 40), (12, 14), (10, 16), (15, 35), (40, 48), (10, 20), (10, 20), (50, 51)];
+        let indexed = Ahead::from_ranges(all.to_vec());
+        let mut ahead = Ahead::new();
+        let mut asked: Vec<(usize, usize)> = Vec::new();
+        for (first, last) in all {
+            let uncovered = !asked.iter().any(|&(a, b)| a <= first && last <= b);
+            assert_eq!(ahead.insert_uncovered(first, last), uncovered, "{first}..{last}");
+            if uncovered {
+                asked.push((first, last));
+            }
+        }
+        for first in 0..60 {
+            for last in first..62 {
+                let held = all.iter().any(|&(a, b)| a <= first && last <= b);
+                assert_eq!(indexed.holds(first, last), held, "{first}..{last}");
+                assert_eq!(ahead.holds(first, last), held, "{first}..{last}");
+            }
+        }
+        assert!(!Ahead::new().holds(0, 0));
     }
 
     /// The pieces answer for any range what a tree of the same pages does.
