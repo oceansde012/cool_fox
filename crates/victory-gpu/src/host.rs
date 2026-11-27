@@ -4692,6 +4692,12 @@ impl Host {
                         }
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+                    if r.compared {
+                        let changed = (0..r.span.pieces)
+                            .filter(|&p| differs.get((r.at + p) as usize).is_some_and(|&d| torn::flagged(d)))
+                            .count();
+                        found_of(r.shadow.span(), changed as u32);
+                    }
                 }
             }
         }
@@ -5057,6 +5063,10 @@ impl Host {
                 }
             }
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
+            if r.compared {
+                let changed = (0..r.span.pieces).filter(|&p| torn::flagged(differs[(r.at + p) as usize])).count();
+                found_of(r.shadow.span(), changed as u32);
+            }
         }
         let mut written = vec![0usize; plan.ranges.len()];
         if !pieces.is_empty() {
@@ -10961,44 +10971,61 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
 /// Since the last frame-rate line, by copy in the card's memory (the title buffer's address and
 /// length): the pieces of 64 KiB the card compared of it after submissions whose shaders may
-/// write it, and how many such compares.
-static COMPARED_OF: Mutex<Option<std::collections::HashMap<(u64, u64), (u64, u64)>>> = Mutex::new(None);
+/// write it, how many such compares (declared ranges), the pieces those compares found changed,
+/// and the compares that found no piece changed.
+static COMPARED_OF: Mutex<Option<std::collections::HashMap<(u64, u64), [u64; 4]>>> = Mutex::new(None);
 
 /// A submission has `pieces` of the copy of the title buffer `copy` compared on the card.
 fn compared_of(copy: (u64, u64), pieces: u32) {
     let mut by = COMPARED_OF.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(Default::default).entry(copy).or_insert((0, 0));
-    e.0 += u64::from(pieces);
-    e.1 += 1;
+    let e = by.get_or_insert_with(Default::default).entry(copy).or_insert([0; 4]);
+    e[0] += u64::from(pieces);
+    e[1] += 1;
+}
+
+/// The compare of a declared range of the copy of the title buffer `copy` found `changed` of
+/// its pieces changed (read when its submission is landed). Says, for [`compared_line`], how
+/// much of what the card reads finds anything: a copy compared twice a frame whose second
+/// compare finds nothing is the case a compare left to the last declaration would save.
+fn found_of(copy: (u64, u64), changed: u32) {
+    let mut by = COMPARED_OF.lock().unwrap_or_else(|e| e.into_inner());
+    let e = by.get_or_insert_with(Default::default).entry(copy).or_insert([0; 4]);
+    e[2] += u64::from(changed);
+    e[3] += u64::from(changed == 0);
 }
 
 /// The copies the card compares most of, a frame: which title buffers the declared writes of
-/// shaders make it read through, and how many times over.
+/// shaders make it read through, how many times over, and how much of it was found changed.
 fn compared_line(frames: f64) {
     let by = COMPARED_OF.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut by: Vec<_> = by.into_iter().flatten().collect();
     if by.is_empty() {
         return;
     }
-    by.sort_by_key(|&(_, (pieces, _))| std::cmp::Reverse(pieces));
-    let all: u64 = by.iter().map(|&(_, (pieces, _))| pieces).sum();
+    by.sort_by_key(|&(_, [pieces, ..])| std::cmp::Reverse(pieces));
+    let all: u64 = by.iter().map(|&(_, [pieces, ..])| pieces).sum();
+    let found: u64 = by.iter().map(|&(_, [_, _, found, _])| found).sum();
     let top: Vec<String> = by
         .iter()
         .take(8)
-        .map(|&((start, len), (pieces, times))| {
+        .map(|&((start, len), [pieces, times, found, empty])| {
             format!(
-                "{start:#x}+{:.1} MB: {:.0} pieces in {:.1} compares",
+                "{start:#x}+{:.1} MB: {:.0} pieces in {:.1} compares, {:.0} found changed, {:.1} compares finding nothing",
                 len as f64 / 1e6,
                 pieces as f64 / frames,
-                times as f64 / frames
+                times as f64 / frames,
+                found as f64 / frames,
+                empty as f64 / frames
             )
         })
         .collect();
     tracing::info!(
-        "pieces of 64 KiB compared on the card per frame, by copy: {:.0} in {} copies ({:.0} MB read a frame); the most: {}",
+        "pieces of 64 KiB compared on the card per frame, by copy: {:.0} in {} copies ({:.0} MB read a frame), {:.0} of them \
+         found changed; the most: {}",
         all as f64 / frames,
         by.len(),
         all as f64 * 65536.0 / 1e6 / frames,
+        found as f64 / frames,
         top.join("; ")
     );
 }
