@@ -2312,6 +2312,10 @@ struct CardRange {
     /// Of a cover ([`heat`]): the first submission that owed the piece; 0
     /// for a declared range.
     owed_since: u64,
+    /// With [`lean_on`]: pieces left by earlier compares that this
+    /// submission's sends hash again, compared ahead of the sends in a list
+    /// of their own (`heat::Lean::ahead`), not by the compare after its lists.
+    ahead: bool,
 }
 
 impl CardPlan {
@@ -2738,8 +2742,10 @@ fn lean_on() -> bool {
                 on,
                 every = heat::every(),
                 hot = heat::hot_span(),
+                ahead = heat::ahead_on(),
                 "compares read a declared range whole once in so many submissions and its pieces found changed lately between \
-                 (VICTORY_CARD_COMPARE_EVERY; needs the relay, not with VICTORY_CARD_COMPARE_HOT)"
+                 (VICTORY_CARD_COMPARE_EVERY; needs the relay, not with VICTORY_CARD_COMPARE_HOT); the pieces they left that \
+                 sends hash again are compared ahead of the sends (VICTORY_CARD_COMPARE_EVERY_AHEAD=0: not)"
             );
         }
         on
@@ -4744,6 +4750,78 @@ impl Host {
                 );
             }
         }
+        // With `lean_on`: the pieces the sends below hash again that lie in a
+        // declared range a compare left in part since its last whole read
+        // (`heat::Lean::ahead`). Their stored hash may be from before a
+        // shader wrote them, and the sends would take that write into it
+        // where no compare finds it again. Asked first, before this
+        // submission's own plan, and for every submission, flown or not: the
+        // sends hash pieces again either way.
+        let mut ahead: Vec<CardRange> = Vec::new();
+        if lean_on() && heat::ahead_on() && !dirty.is_empty() {
+            let mut lean = LEAN.lock().unwrap_or_else(|e| e.into_inner());
+            let lean = lean.get_or_insert_with(Default::default);
+            for (shadow, ranges) in &dirty {
+                if !shadow.card_sides().is_some_and(|(_, before, _)| before.is_some()) {
+                    continue;
+                }
+                // As the hash passes below cut them (all of a copy hashed whole).
+                let runs: Option<Vec<(u32, u32)>> = (!whole.iter().any(|s| Arc::ptr_eq(s, shadow))).then(|| {
+                    ranges
+                        .iter()
+                        .map(|&(a, b)| {
+                            let run = shadow.card_run(a, b);
+                            (run.first, run.first + run.pieces)
+                        })
+                        .collect()
+                });
+                // Pieces that follow each other in one span.
+                let mut spans: Vec<crate::shadow::CardSpan> = Vec::new();
+                for (piece, from, to) in lean.ahead(shadow.id(), runs.as_deref()) {
+                    let range = shadow.card_run(from as usize, to as usize);
+                    if piece < range.first || piece - range.first >= range.pieces {
+                        continue;
+                    }
+                    let (lo, hi) = shadow.card_piece(&range, piece - range.first);
+                    if lo >= hi {
+                        continue;
+                    }
+                    match spans.last_mut() {
+                        Some(last) if last.first + last.pieces == piece && last.to as usize == lo => {
+                            last.pieces += 1;
+                            last.to = hi as u32;
+                        }
+                        _ => spans.push(shadow.card_run(lo, hi)),
+                    }
+                }
+                let mut read = 0;
+                for span in spans {
+                    let room = u64::from(work.taken + span.pieces) * 4 <= work.differs.2;
+                    let at = work.taken;
+                    if room {
+                        work.taken += span.pieces;
+                        read += span.pieces;
+                    } else {
+                        // Fetched whole when this submission lands.
+                        heat::LEAN_STATS[heat::lean_stat::AHEAD_UNCOMPARED].fetch_add(u64::from(span.pieces), Ordering::Relaxed);
+                    }
+                    let base = shadow.span().0 as usize;
+                    ahead.push(CardRange {
+                        shadow: shadow.clone(),
+                        declared: (base + span.from as usize, base + span.to as usize),
+                        span,
+                        at,
+                        compared: room,
+                        picked: false,
+                        owed_since: 0,
+                        ahead: true,
+                    });
+                }
+                if read > 0 {
+                    compared_of(shadow.span(), read);
+                }
+            }
+        }
         // With `lean_on`: a declared range with hashes is read whole once in
         // so many submissions, and in its hot pieces by the compares between.
         if flown && let Some(every) = lean_on().then(heat::every).flatten() {
@@ -4751,11 +4829,51 @@ impl Host {
             let lean = lean.get_or_insert_with(Default::default);
             for (i, (shadow, _, span, twin)) in cards.iter().enumerate() {
                 if *twin {
-                    chosen[i] = lean.plan(number, every, heat::hot_span(), shadow.id(), span.first, span.pieces);
+                    chosen[i] =
+                        lean.plan(number, every, heat::hot_span(), shadow.id(), span.first, span.pieces, (span.from, span.to));
                 }
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
+        // The pieces of `ahead` are compared, storing their hashes, by a list
+        // of ours put on the queue now: behind the submissions before, ahead
+        // of this one's sends (the queue's order is held). Its results are
+        // this plan's, read when it lands, as those of its own compare.
+        if ahead.iter().any(|r| r.compared) {
+            let Some(pre) = work.check.pop().or_else(|| self.make_prelude()) else {
+                fail(format_args!("no host list to compare pieces of host copies in the card's memory ahead of their sends"));
+            };
+            let (allocator, list) = &pre;
+            // SAFETY: the list's last run finished (it came back with its
+            // plan, done when its submission or landing has run); live
+            // buffers (the ranges hold the copies); the compare's own root
+            // signature.
+            let recorded = unsafe {
+                (|| -> windows::core::Result<()> {
+                    allocator.Reset()?;
+                    list.Reset(allocator, None)?;
+                    list.SetComputeRootSignature(&work.root);
+                    list.SetPipelineState(&work.pso);
+                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    for r in ahead.iter().filter(|r| r.compared) {
+                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
+                            continue;
+                        };
+                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        card_pass(list, &r.span, size as u32, r.at, 2);
+                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    list.Close()?;
+                    self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                    Ok(())
+                })()
+            };
+            if let Err(e) = recorded {
+                fail(format_args!("the compare of host copies in the card's memory ahead of their sends could not be sent ({e})"));
+            }
+            used.push((true, pre));
+        }
         let mut stamped: Vec<(u64, bool)> = Vec::new();
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
@@ -4875,7 +4993,7 @@ impl Host {
         }
         drop(order);
         let mut plan = CardPlan {
-            ranges: Vec::new(),
+            ranges: ahead,
             check: None,
             _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
             lists: used,
@@ -4906,6 +5024,7 @@ impl Host {
                     compared,
                     picked: false,
                     owed_since: 0,
+                    ahead: false,
                 });
                 if compared {
                     at += part.pieces;
@@ -4930,12 +5049,13 @@ impl Host {
                     compared: true,
                     picked: true,
                     owed_since: 0,
+                    ahead: false,
                 });
                 at += span.pieces;
             }
         }
         work.taken = at;
-        if plan.ranges.iter().any(|r| r.compared) {
+        if plan.ranges.iter().any(|r| r.compared && !r.ahead) {
             let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
@@ -4980,7 +5100,8 @@ impl Host {
                             CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                         }
                     };
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    // (Not the pieces compared ahead of the sends.)
+                    for r in plan.ranges.iter().filter(|r| r.compared && !r.ahead) {
                         let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
                             continue;
                         };
@@ -5072,6 +5193,7 @@ impl Host {
                     compared: room,
                     picked: false,
                     owed_since: owed.first,
+                    ahead: false,
                 };
                 if room {
                     at += 1;
@@ -5364,6 +5486,9 @@ impl Host {
                         let changed: Vec<u32> = (0..r.span.pieces)
                             .filter(|&p| differs.get((r.at + p) as usize).is_some_and(|&d| torn::flagged(d)))
                             .collect();
+                        if r.ahead {
+                            heat::LEAN_STATS[heat::lean_stat::AHEAD_FOUND].fetch_add(changed.len() as u64, Ordering::Relaxed);
+                        }
                         if lean_on() && !changed.is_empty() {
                             let mut lean = LEAN.lock().unwrap_or_else(|e| e.into_inner());
                             let lean = lean.get_or_insert_with(Default::default);
@@ -5773,6 +5898,9 @@ impl Host {
             crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
             if r.compared {
                 let changed = (0..r.span.pieces).filter(|&p| torn::flagged(differs[(r.at + p) as usize])).count();
+                if r.ahead {
+                    heat::LEAN_STATS[heat::lean_stat::AHEAD_FOUND].fetch_add(changed as u64, Ordering::Relaxed);
+                }
                 found_of(r.shadow.span(), changed as u32);
             }
         }
