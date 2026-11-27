@@ -1141,7 +1141,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Renderer port #6: view memory, which the kernel would refuse, and the
     // caller does not ask the guards (textures, which then guard by a way of
     // their own): no kernel call, ~300 a frame (run guard-2).
-    if !guarded && refused_as_view(start, end) {
+    // Only with VICTORY_PORT_GUARD=1.
+    if !guarded && port_guard() && refused_as_view(start, end) {
         return None;
     }
     // Asked, and the answer noted, with the range held: nothing else asks

@@ -2169,9 +2169,10 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 /// prison), and it is what every change to them is to be weighed by.
 ///
 /// What it adds: four timestamps and two resolves of 16 bytes a submission.
+/// Off by default (VICTORY_CARD_PASS_TIME=1 turns it on).
 fn card_pass_time() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_PASS_TIME").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_PASS_TIME").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame-rate line, in timestamp ticks ([`card_pass_time`]):
@@ -11884,9 +11885,9 @@ fn compared_line(frames: f64) {
 
 /// Whether the compares of ranges of one copy in the card's memory whose
 /// pieces and result places follow each other go in one pass
-/// (`VICTORY_CARD_COMPARE_JOIN=0`: a pass each). Some 390 compare passes a
+/// (`VICTORY_CARD_COMPARE_JOIN=1`; off by default: a pass each). Some 390 compare passes a
 /// frame walking in the prison, each one dispatch.
 fn compare_join() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_JOIN").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_JOIN").is_some_and(|v| v == "1"))
 }
