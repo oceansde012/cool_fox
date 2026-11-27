@@ -2280,6 +2280,30 @@ mod readback_pool_tests {
     }
 
     #[test]
+    fn readback_buffers_pool_by_power_of_two_up_to_16_mib() {
+        const LIMIT: u64 = 256 << 20;
+        let pool = ReadbackPool::new();
+        for (size, capacity) in [
+            (1, 64 << 10),
+            (64 << 10, 64 << 10),
+            ((256 * 256 * 4) * 4 / 3, 512 << 10),
+            (16 << 20, 16 << 20),
+        ] {
+            let lease = pool.take(size, LIMIT, Some).unwrap();
+            assert_eq!(*lease.resource(), capacity, "requested {size} bytes");
+        }
+
+        // Requests above the largest size class bypass the pool.
+        for size in [(16 << 20) + 1, u64::MAX] {
+            let pool = ReadbackPool::new();
+            let lease = pool.take(size, LIMIT, Some).unwrap();
+            assert_eq!(*lease.resource(), size);
+            drop(lease);
+            assert_eq!(pool.0.lock().unwrap().1.idle_bytes, 0);
+        }
+    }
+
+    #[test]
     fn readback_pool_tries_original_size_after_a_rounded_allocation_fails() {
         let pool = ReadbackPool::new();
         let mut attempts = Vec::new();
