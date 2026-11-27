@@ -372,6 +372,8 @@ fn uncount(uncovered: &mut BTreeMap<u64, u32>, first: u64) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::{Book, Hold, Span};
 
     fn span(copy: u64, pieces: std::ops::Range<u32>) -> Span<()> {
@@ -536,10 +538,7 @@ mod tests {
                     continue;
                 }
                 let idle = rand(3) == 0;
-                loop {
-                    let Some(front) = line.front() else {
-                        break;
-                    };
+                while let Some(front) = line.front() {
                     match book.hold(front.0, cover_value) {
                         Hold::Free => {}
                         Hold::Cover(_) => unreachable!("covers are done at once here"),
@@ -567,5 +566,231 @@ mod tests {
             }
             assert!(landings > 100, "D {deadline}: {landings} landings");
         }
+    }
+
+    /// What the second model does otherwise on purpose.
+    #[derive(Clone, Copy, Default)]
+    struct Flaws {
+        /// A cover is said to run behind its submission's sends (it runs
+        /// ahead of them): wrong.
+        cover_behind_its_sends: bool,
+        /// A landing on the copy queue takes only its plans' sends as known,
+        /// not what earlier landings knew, as `relay_card_back` does: a
+        /// landing with covers may know more than the next one. Harmless:
+        /// the notes let go of are of sends the card is known to have run.
+        forgets_what_was_known: bool,
+    }
+
+    /// One piece in the second model: the shader's bytes and the title's
+    /// bytes in it, each a version.
+    type Cells = (u64, u64);
+
+    enum Op {
+        Cover(u64, Vec<u32>),
+        /// Piece, the title's version it takes up.
+        Send(u32, u64),
+        Write(u32, u64),
+        /// A flight's lists are done and its compare reads these pieces.
+        Own(u64, Vec<u32>),
+    }
+
+    /// The relay with the queue in it, and the title's own bytes beside the
+    /// shaders' in each piece: what `Host::card_before`, the card, the
+    /// landing thread (`relay_worker`, `relay_card_back`) and the merge
+    /// (`Shadow::card_merge_relay`) do, step by step. The card runs the queue
+    /// behind the submitting side, as far as it got; covers, sends, writes
+    /// and compares take effect when it reaches them. A landing waits for
+    /// its flight and for what `Book::hold` names; its fetch reads the card
+    /// as it is then: on the copy queue (`copy_queue`) at once, beside
+    /// whatever the card is still at, else behind everything sent. The merge
+    /// leaves out the title's bytes still to go up and those of sends after
+    /// the ones the fetch is known to run behind. The title writes its own
+    /// bytes now and then (they go up with the next send, which hashes the
+    /// piece again).
+    ///
+    /// Checked at every landing: title memory holds every write of the
+    /// flight's shaders, and no title byte is older than the title last
+    /// wrote it. Returns the landings, or what went wrong.
+    fn relay_model(seed: u64, deadline: u64, copy_queue: bool, flaws: Flaws) -> Result<u32, String> {
+        const PIECES: usize = 10;
+        let mut seed = seed | 1;
+        let mut rand = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut book: Book<(), (u64, u64)> = Book::default();
+        let (mut card, mut stored, mut held, mut title) = ([(0, 0); PIECES], [(0, 0); PIECES], [(0, 0); PIECES], [(0, 0); PIECES]);
+        let mut newest_title = [0u64; PIECES];
+        let (mut queue, mut ran): (Vec<Op>, usize) = (Vec::new(), 0);
+        let (mut covers_done, mut flights_done) = (0u64, 0u64);
+        let mut flags: HashMap<(bool, u64), Vec<u32>> = HashMap::new();
+        let (mut dirty, mut sent): (Vec<usize>, Vec<(u64, usize)>) = (Vec::new(), Vec::new());
+        let (mut order, mut known, mut covers, mut version) = (0u64, 0u64, 0u64, 0u64);
+        // Flights in the line: number, sends it ran behind, its writes.
+        let mut line: std::collections::VecDeque<(u64, u64, Vec<(usize, u64)>)> = Default::default();
+        let mut landings = 0;
+        let compare = |pieces: &[u32], card: &[Cells; PIECES], stored: &mut [Cells; PIECES]| -> Vec<u32> {
+            let flagged = pieces.iter().copied().filter(|&p| card[p as usize] != stored[p as usize]).collect();
+            for &p in pieces {
+                stored[p as usize] = card[p as usize];
+            }
+            flagged
+        };
+        // The card goes on to `to`.
+        let run = |to: usize, queue: &[Op], ran: &mut usize, card: &mut [Cells; PIECES], stored: &mut [Cells; PIECES],
+                       flags: &mut HashMap<(bool, u64), Vec<u32>>, covers_done: &mut u64, flights_done: &mut u64| {
+            while *ran < to {
+                match &queue[*ran] {
+                    Op::Cover(id, pieces) => {
+                        flags.insert((true, *id), compare(pieces, card, stored));
+                        *covers_done = *id;
+                    }
+                    &Op::Send(p, v) => {
+                        card[p as usize].1 = v;
+                        stored[p as usize] = card[p as usize];
+                    }
+                    &Op::Write(p, v) => card[p as usize].0 = v,
+                    Op::Own(flight, pieces) => {
+                        flags.insert((false, *flight), compare(pieces, card, stored));
+                        *flights_done = *flight;
+                    }
+                }
+                *ran += 1;
+            }
+        };
+        for number in 1..=500u64 {
+            // The title writes its bytes of a piece: into title memory and
+            // the CPU's side, to go up with the next send.
+            if rand(2) == 0 {
+                let p = rand(PIECES as u64) as usize;
+                version += 1;
+                (title[p].1, held[p].1, newest_title[p]) = (version, version, version);
+                if !dirty.contains(&p) {
+                    dirty.push(p);
+                }
+            }
+            let mut declared: Vec<u32> = Vec::new();
+            for _ in 0..1 + rand(2) {
+                let from = rand(PIECES as u64) as u32;
+                declared.extend(from..(from + 1 + rand(4) as u32).min(PIECES as u32));
+            }
+            declared.sort_unstable();
+            declared.dedup();
+            let spans = [Span { copy: 1, handle: (), pieces: declared.iter().map(|&p| (p, 0, 1)).collect() }];
+            let rehashed = dirty.clone();
+            let planned = book.plan(number, deadline, 6, &spans, &|_, p| rehashed.contains(&(p as usize)), true);
+            // `card_dirty` lets go of notes no merge needs; the taking is
+            // numbered.
+            sent.retain(|s| s.0 > known);
+            order += 1;
+            if !planned.covers.is_empty() {
+                covers += 1;
+                queue.push(Op::Cover(covers, planned.covers.iter().map(|t| t.2).collect()));
+                let behind = if flaws.cover_behind_its_sends { order } else { order - 1 };
+                book.add_cover(covers, &planned.covers, (covers, behind));
+            }
+            for p in dirty.drain(..) {
+                queue.push(Op::Send(p as u32, held[p].1));
+                sent.push((order, p));
+            }
+            let mut writes = Vec::new();
+            for &p in &declared {
+                if rand(3) == 0 {
+                    version += 1;
+                    queue.push(Op::Write(p, version));
+                    writes.push((p as usize, version));
+                }
+            }
+            let chosen = declared.iter().zip(&planned.chosen[0]).filter(|(_, c)| **c).map(|(p, _)| *p).collect();
+            queue.push(Op::Own(number, chosen));
+            line.push_back((number, order, writes));
+            // The card gets on some way.
+            let to = (ran + rand(12) as usize).min(queue.len());
+            run(to, &queue, &mut ran, &mut card, &mut stored, &mut flags, &mut covers_done, &mut flights_done);
+            if rand(2) == 0 {
+                continue;
+            }
+            // The landing thread.
+            while let Some(&(flight, behind, _)) = line.front() {
+                if flights_done < flight {
+                    break;
+                }
+                match book.hold(flight, covers_done) {
+                    Hold::Free => {}
+                    Hold::Cover(_) => break,
+                    // The card has run the line: the landing thread covers.
+                    Hold::Uncovered if ran == queue.len() => {
+                        let taken = book.take_all();
+                        covers += 1;
+                        queue.push(Op::Cover(covers, taken.iter().map(|t| t.2).collect()));
+                        book.add_cover(covers, &taken, (covers, order));
+                        break;
+                    }
+                    Hold::Uncovered => break,
+                }
+                let (_, _, writes) = line.pop_front().expect("the front");
+                let landed = book.take_landed(flight, covers_done);
+                let mut fetched: Vec<u32> = flags.remove(&(false, flight)).unwrap_or_default();
+                let mut after = landed.iter().map(|c| c.1).fold(behind, u64::max);
+                for (id, _) in &landed {
+                    fetched.extend(flags.remove(&(true, *id)).unwrap_or_default());
+                }
+                if copy_queue {
+                    if !flaws.forgets_what_was_known {
+                        after = after.max(known);
+                    }
+                } else {
+                    // Behind everything sent.
+                    run(queue.len(), &queue, &mut ran, &mut card, &mut stored, &mut flags, &mut covers_done, &mut flights_done);
+                    after = order;
+                }
+                for p in fetched.iter().map(|&p| p as usize) {
+                    if card[p].0 != held[p].0 {
+                        (title[p].0, held[p].0) = (card[p].0, card[p].0);
+                    }
+                    let later = dirty.contains(&p) || sent.iter().any(|s| s.1 == p && s.0 > after);
+                    if !later && card[p].1 != held[p].1 {
+                        (title[p].1, held[p].1) = (card[p].1, card[p].1);
+                    }
+                    book.found(1, p as u32, flight);
+                }
+                known = known.max(after);
+                for (p, v) in writes {
+                    if title[p].0 < v {
+                        return Err(format!("flight {flight}'s write {v} of piece {p} is not in title memory"));
+                    }
+                }
+                if let Some(p) = (0..PIECES).find(|&p| title[p].1 != newest_title[p]) {
+                    return Err(format!("landing flight {flight}: the title's byte of piece {p} went back"));
+                }
+                landings += 1;
+            }
+        }
+        Ok(landings)
+    }
+
+    /// The second model holds on either queue for every deadline; it sees a
+    /// cover said to run behind its own sends (the title's bytes put back by
+    /// the merge of a fetch on the copy queue), and a landing that knows less
+    /// than an earlier one does no harm.
+    #[test]
+    fn no_write_reaches_the_title_late_with_the_fetch_beside_later_flights() {
+        let seeds = [0x9e37_79b9_7f4a_7c15u64, 0x2545_f491_4f6c_dd1d, 0xd1b5_4a32_d192_ed03, 7, 12345];
+        let harmless = Flaws { forgets_what_was_known: true, ..Flaws::default() };
+        for deadline in [1u64, 2, 4, 8, 30] {
+            for copy_queue in [false, true] {
+                for &seed in &seeds {
+                    for flaws in [Flaws::default(), harmless] {
+                        let landed = relay_model(seed, deadline, copy_queue, flaws);
+                        assert!(landed.as_ref().is_ok_and(|&n| n > 100), "D {deadline}, copy queue {copy_queue}, seed {seed}: {landed:?}");
+                    }
+                }
+            }
+        }
+        let wrong = Flaws { cover_behind_its_sends: true, ..Flaws::default() };
+        let caught = seeds.iter().any(|&seed| [1u64, 2, 4, 8].iter().any(|&d| relay_model(seed, d, true, wrong).is_err()));
+        assert!(caught, "the model sees a cover said to run behind its sends");
     }
 }
