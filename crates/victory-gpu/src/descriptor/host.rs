@@ -3973,6 +3973,7 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
+    shadow.keep_for_writable_view();
     if let Some(twin) = twin {
         let window = twin_window(desc.Format, first, count, stride, raw, width);
         if let Some((first, count, by)) = window {

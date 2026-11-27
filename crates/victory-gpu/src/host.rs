@@ -417,13 +417,13 @@ pub(crate) fn references(object: &impl Interface) -> u32 {
     }
 }
 
-/// Once a second, before a submission starts: lets go of what nothing
-/// names any more (copies of windows of title memory, staging buffers,
-/// host copies of textures the title fills).
+/// Before a submission starts: applies the opt-in shadow budget once per
+/// present, then sweeps idle windows, staging buffers and textures once a second.
 /// `VICTORY_SWEEP=0` keeps everything, as before.
 fn sweep() {
     // The in-place probe and census, if asked for (`VICTORY_INPLACE_PROBE`).
     crate::inplace::tick();
+    crate::shadow::evict_buffer_copies();
     static ON: OnceLock<bool> = OnceLock::new();
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP").is_none_or(|v| v != "0")) {
         return;

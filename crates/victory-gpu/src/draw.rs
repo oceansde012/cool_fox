@@ -1883,6 +1883,7 @@ impl State {
         };
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
+            s.keep_for_writable_view();
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]

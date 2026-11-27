@@ -75,6 +75,10 @@ pub(crate) struct Shadow {
     /// outside buffers nothing asked for in a while, and nothing holds, is
     /// let go ([`let_go_idle`]).
     used: AtomicU64,
+    /// Last lookup of a registered buffer copy, with the shadow budget on.
+    budget_used: AtomicU64,
+    /// A writable descriptor can leave bytes that never land in title memory.
+    writable_view: std::sync::atomic::AtomicBool,
     /// The lowest and highest title address asked for in the copy (a
     /// window is 4 MiB whatever was asked: measured for the memory line).
     asked: [AtomicU64; 2],
@@ -2982,6 +2986,8 @@ impl Shadow {
             merging: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
+            budget_used: AtomicU64::new(0),
+            writable_view: Default::default(),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
@@ -4138,6 +4144,21 @@ impl Shadow {
         self.written.load(Ordering::Relaxed)
     }
 
+    /// A shader can write through this view even if there is no writeback.
+    /// Its bytes can outlive the descriptor, so the copy stays pinned.
+    pub(crate) fn keep_for_writable_view(&self) {
+        if shadow_budget().is_some() {
+            self.writable_view.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn note_buffer_use(&self) {
+        if shadow_budget().is_some() {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            self.budget_used.fetch_max(NEXT.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        }
+    }
+
     /// `bytes` were put into title memory at `address`, and the submission
     /// being prepared copies the same to the copy at that copy's place in its
     /// list: the reference (the CPU's side of a copy in the card's memory, the
@@ -4822,6 +4843,122 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
     BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
+fn parse_shadow_budget(value: &str) -> Result<Option<u64>, std::num::ParseIntError> {
+    let mib = value.trim().parse::<u64>()?;
+    Ok((mib != 0).then(|| mib.saturating_mul(1 << 20)))
+}
+
+fn shadow_budget() -> Option<u64> {
+    static BUDGET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let value = std::env::var_os("VICTORY_SHADOW_BUDGET_MB")?;
+        if let Some(Ok(budget)) = value.to_str().map(parse_shadow_budget) {
+            return budget;
+        }
+        tracing::warn!(?value, "VICTORY_SHADOW_BUDGET_MB expects a whole number of MiB");
+        None
+    })
+}
+
+/// Bytes of host buffer storage allocated by `lookup` for a registered copy.
+/// An in-place buffer shares title memory. A card copy also has a CPU side.
+fn buffer_copy_bytes(shadow: &Shadow) -> u64 {
+    if shadow.in_place() {
+        return 0;
+    }
+    let size = shadow.len.next_multiple_of(1 << 16);
+    if shadow.card.is_some() { 2 * size } else { size }
+}
+
+fn can_evict_buffer_copy(shadow: &Arc<Shadow>) -> bool {
+    if Arc::strong_count(shadow) != 1 {
+        return false;
+    }
+    // Observe writes by the last holder before it released its Arc.
+    std::sync::atomic::fence(Ordering::Acquire);
+    !shadow.written()
+        && !shadow.writable_view.load(Ordering::Relaxed)
+        && shadow.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        && shadow.before.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+        // Heap slots and some lists keep the D3D12 resource directly.
+        && crate::host::references(&shadow.buffer) == 1
+}
+
+/// Takes the oldest eligible copies first, leaving the title registrations.
+/// The caller holds the write lock and has invalidated fast lookups.
+fn take_buffer_copies(
+    map: &mut BTreeMap<(u64, usize), Entry>,
+    mut total: u64,
+    budget: u64,
+) -> Vec<Shadow> {
+    let mut evictable = 0;
+    let mut candidates = Vec::new();
+    for (&key, entry) in map.iter() {
+        if let Some(shadow) = &entry.shadow {
+            let bytes = buffer_copy_bytes(shadow);
+            if bytes != 0 && can_evict_buffer_copy(shadow) {
+                evictable += bytes;
+                candidates.push((shadow.budget_used.load(Ordering::Relaxed), key, bytes));
+            }
+        }
+    }
+    let held = total - evictable;
+    if held > budget {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| tracing::warn!(budget, held, "retained shadow copies exceed VICTORY_SHADOW_BUDGET_MB"));
+        return Vec::new();
+    }
+
+    candidates.sort_unstable();
+    let mut evicted = Vec::new();
+    for (_, key, bytes) in candidates {
+        if total <= budget {
+            break;
+        }
+        let entry = map.get_mut(&key).expect("registered buffer");
+        if !entry.shadow.as_ref().is_some_and(can_evict_buffer_copy) {
+            continue;
+        }
+        // A weak reference upgraded since the check can still hold this
+        // copy. Unwrap only if it is still ours alone and close future upgrades.
+        match Arc::try_unwrap(entry.shadow.take().expect("candidate copy")) {
+            Ok(shadow) => {
+                evicted.push(shadow);
+                total -= bytes;
+            }
+            Err(shadow) => entry.shadow = Some(shadow),
+        }
+    }
+    evicted
+}
+
+/// Checks the opt-in budget once per present count, at the submission sweep's
+/// idle point. Retire the removed copies outside the map lock.
+pub(crate) fn evict_buffer_copies() {
+    let Some(budget) = shadow_budget() else {
+        return;
+    };
+    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = crate::queue::presented();
+    if LAST.swap(frame, Ordering::Relaxed) == frame {
+        return;
+    }
+    let evicted = {
+        let mut map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
+        let total = map.values().filter_map(|e| e.shadow.as_deref()).map(buffer_copy_bytes).sum();
+        if total <= budget {
+            return;
+        }
+        // Do this before testing ownership so `found` cannot hand out an
+        // old copy concurrently with removal.
+        BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+        take_buffer_copies(&mut map, total, budget)
+    };
+    for shadow in evicted {
+        crate::host::retire(shadow);
+    }
+}
+
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     buffers().insert(
@@ -4927,12 +5064,16 @@ pub(crate) fn find_any(address: u64, len: u64) -> Option<Arc<Shadow>> {
 /// The copy [`find`] gives for a range inside a title buffer, if it was made.
 pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
-    buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
+    let map = buffers_read();
+    let shadow = map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end)?.1.shadow.as_ref()?;
+    shadow.note_buffer_use();
+    Some(shadow.clone())
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        shadow.note_buffer_use();
         return Some(shadow);
     }
     let end = address.checked_add(len.max(1))?;
@@ -4941,6 +5082,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         match map.range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end) {
             // The copy is made already (nearly always).
             Some((_, Entry { shadow: Some(shadow), .. })) => {
+                shadow.note_buffer_use();
                 if quick {
                     // (Nobody changes the map while this lock is held.)
                     remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
@@ -5027,7 +5169,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         }
         entry.shadow = Some(shadow);
     }
-    entry.shadow.clone()
+    let shadow = entry.shadow.as_ref()?;
+    shadow.note_buffer_use();
+    Some(shadow.clone())
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (
@@ -5420,6 +5564,53 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn budget_values_in_mib() {
+        assert_eq!(parse_shadow_budget("0"), Ok(None));
+        assert_eq!(parse_shadow_budget(" 512 "), Ok(Some(512 << 20)));
+        assert!(parse_shadow_budget("-1").is_err());
+        assert!(parse_shadow_budget("1.5").is_err());
+        assert_eq!(parse_shadow_budget(&u64::MAX.to_string()), Ok(Some(u64::MAX)));
+    }
+
+    #[test]
+    fn budget_evicts_oldest_copy_and_keeps_gpu_state() {
+        let Some(host) = host() else { return };
+        const SIZE: u64 = 1 << 16;
+        let mut map = BTreeMap::new();
+        for n in 0..7 {
+            let start = (n + 1) * SIZE;
+            let (buffer, data) = host.shared_buffer(SIZE).expect("host buffer");
+            let shadow = Arc::new(Shadow::new(buffer, data, 0, start, SIZE));
+            shadow.budget_used.store(7 - n, Ordering::Relaxed);
+            map.insert(
+                (start, 0),
+                Entry { end: start + SIZE, shadow: Some(shadow) },
+            );
+        }
+        let copy = |n| map[&(n * SIZE, 0)].shadow.as_ref().unwrap();
+        let weak = Arc::downgrade(copy(2));
+        let held = copy(3).clone();
+        let held_resource = copy(4).buffer.clone();
+        copy(5).writable_view.store(true, Ordering::Relaxed);
+        copy(6).pending.lock().unwrap().push((0, 4));
+        *copy(7).before.lock().unwrap() = Some(vec![0; 4]);
+
+        let evicted = take_buffer_copies(&mut map, 7 * SIZE, 6 * SIZE);
+        assert_eq!(evicted.len(), 1);
+        assert!(weak.upgrade().is_none());
+        assert!(map[&(2 * SIZE, 0)].shadow.is_none());
+        assert_eq!(map.values().filter(|entry| entry.shadow.is_some()).count(), 6);
+        assert!(take_buffer_copies(&mut map, 6 * SIZE, 4 * SIZE).is_empty());
+        assert!(map[&(SIZE, 0)].shadow.is_some());
+        drop((held, held_resource));
+    }
 }
 
 #[cfg(test)]
