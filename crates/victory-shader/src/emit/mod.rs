@@ -218,7 +218,9 @@ pub fn builder_bounds() -> bool {
 ///   128 extended algebraic/bitwise/shift/compare/select folds and canonical
 ///   comparison reuse/facts (not on unless asked),
 ///   256 alias-aware private-global forwarding, shared-memory load reuse, and
-///   overwritten-store elimination (not on unless asked: `511` is every pass).
+///   overwritten-store elimination (not on unless asked),
+///   512 pure loop-invariant code motion (not on unless asked: `1023` is
+///   every pass).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
@@ -1189,7 +1191,8 @@ mod tests {
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
         assert_eq!(parse_shader_opt(Some("128")), super::bitcode::opt::EXT_FOLD);
         assert_eq!(parse_shader_opt(Some("256")), super::bitcode::opt::MEM_FWD);
-        assert_eq!(parse_shader_opt(Some("511")), all);
+        assert_eq!(parse_shader_opt(Some("512")), super::bitcode::opt::LICM);
+        assert_eq!(parse_shader_opt(Some("1023")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }

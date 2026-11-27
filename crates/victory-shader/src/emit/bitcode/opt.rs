@@ -32,6 +32,8 @@
 //! - [`MEM_FWD`]: opt-in alias-aware forwarding and overwritten-store
 //!   elimination for non-escaping private globals, plus non-aliasing shared
 //!   (LDS) load reuse without store-to-load forwarding across lanes.
+//! - [`LICM`]: opt-in pure loop-invariant code motion hoisting non-trapping
+//!   invariants out of natural loops to dominating preheaders.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -72,8 +74,10 @@ pub const EXT_FOLD: u32 = 128;
 /// Opt-in alias-aware private-global forwarding, shared-memory load reuse,
 /// and overwritten-store elimination.
 pub const MEM_FWD: u32 = 256;
+/// Opt-in pure loop-invariant code motion.
+pub const LICM: u32 = 512;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: the original default passes
@@ -120,6 +124,26 @@ struct Tree {
     children: Vec<Vec<usize>>,
     /// Per block: the reached blocks that branch to it, once per edge.
     preds: Vec<Vec<usize>>,
+    /// Per block: immediate dominator (`usize::MAX` if unreachable).
+    idom: Vec<usize>,
+}
+
+/// Whether block `a` dominates block `b` given immediate dominators `idom`.
+fn dominates(idom: &[usize], a: usize, b: usize) -> bool {
+    if b >= idom.len() || idom[b] == usize::MAX {
+        return false;
+    }
+    let mut cur = b;
+    loop {
+        if cur == a {
+            return true;
+        }
+        let next = idom[cur];
+        if next == cur || next == usize::MAX {
+            return false;
+        }
+        cur = next;
+    }
 }
 
 /// The comparison that holds exactly when `p` does not (floats 0-15,
@@ -242,6 +266,13 @@ struct PrivateVals {
     dyn_vals: HashMap<(u32, V, Ty), V>,
 }
 
+/// A natural loop detected via the dominator tree.
+struct NaturalLoop {
+    header: usize,
+    in_loop: Vec<bool>,
+    size: usize,
+}
+
 /// What holds in the block being walked: values that are a known bit there,
 /// and comparisons (by their operands) with a known outcome.
 #[derive(Default)]
@@ -342,14 +373,21 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM) != 0 {
             // Values merged in one round can make two joins the same in
-            // the next (a loop's registers that only go round), and a
-            // branch that goes one way leaves blocks with one way in.
+            // the next (a loop's registers that only go round), a branch
+            // that goes one way leaves blocks with one way in, and LICM
+            // exposes hoisted pure values to REUSE/FOLD outside the loop.
             for _ in 0..4 {
-                let mut changed = self.merge(passes);
+                let mut changed = false;
+                if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD) != 0 {
+                    changed |= self.merge(passes);
+                }
                 if passes & (FOLD | EXT_FOLD) != 0 {
                     changed |= self.prune();
+                }
+                if passes & LICM != 0 {
+                    changed |= self.licm();
                 }
                 if !changed {
                     break;
@@ -461,6 +499,7 @@ impl Module {
             order,
             children,
             preds,
+            idom,
         }
     }
 
@@ -1439,6 +1478,16 @@ impl Module {
         escaped
     }
 
+    /// Whether `p` is a provably in-bounds constant pointer to a scalar of
+    /// type `val_ty` inside an immutable constant global (safe to load
+    /// speculatively during LICM).
+    fn is_in_bounds_const_global_ptr(&self, p: V, val_ty: Ty) -> bool {
+        matches!(
+            self.trace_ptr(p, &[]),
+            (PtrRoot::ConstGlobal(_), PtrPath::Const(leaf_ty, _)) if leaf_ty == val_ty
+        )
+    }
+
     /// What kind of instruction `i` is for merging.
     fn class(&self, effects: &[Effect], i: u32, deep_gep: bool) -> Effect {
         match &self.insts[i as usize].op {
@@ -1725,7 +1774,7 @@ impl Module {
                     changed = true;
                     continue;
                 }
-                let class = self.class(&effects, i, mem_fwd);
+                let class = self.class(&effects, i, passes & (MEM_FWD | LICM) != 0);
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i, ext_fold)
@@ -2066,6 +2115,297 @@ impl Module {
             }
         }
         true
+    }
+
+    /// Whether instruction `i` inside a loop is pure, non-trapping, and safe to
+    /// hoist to the loop preheader under plain [`LICM`] (`guaranteed`: `i`
+    /// executes on every entry to the loop with the exact same active lanes as
+    /// the preheader, before any `dx.op.discard` or unknown side-effecting
+    /// call).
+    ///
+    /// Plain [`LICM`] hoists only from `guaranteed` blocks, plus provably
+    /// in-bounds constant-table loads, so conditional branches inside a loop
+    /// never pay speculative execution or register-pressure costs unless
+    /// requested separately.
+    fn can_hoist(&self, effects: &[Effect], i: u32, guaranteed: bool) -> bool {
+        match &self.insts[i as usize].op {
+            Op::Bin(Bin::UDiv | Bin::URem, _, rhs) => {
+                guaranteed && self.int_k(*rhs).is_some_and(|(_, k)| k != 0)
+            }
+            Op::Bin(Bin::SDiv, _, rhs) => {
+                guaranteed
+                    && self
+                        .int_k(*rhs)
+                        .is_some_and(|(bits, k)| k != 0 && signed(bits, k) != -1)
+            }
+            Op::Bin(..)
+            | Op::Cast(..)
+            | Op::Cmp(..)
+            | Op::Select(..)
+            | Op::Extract(..)
+            | Op::Gep(..) => guaranteed,
+            Op::Load(p) => {
+                self.class(effects, i, true) == Effect::Pure
+                    && (guaranteed
+                        || self.is_in_bounds_const_global_ptr(*p, self.insts[i as usize].ty))
+            }
+            Op::Call(f, _) => guaranteed && effects[*f as usize] == Effect::Pure,
+            Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) | Op::Phi(_) => false,
+        }
+    }
+
+    /// Whether every operand of instruction `i` is defined outside the loop
+    /// `in_loop` and dominates `dom_target`.
+    fn operands_invariant(
+        &self,
+        i: u32,
+        in_loop: &[bool],
+        def_block: &[usize],
+        idom: &[usize],
+        dom_target: usize,
+    ) -> bool {
+        let mut ok = true;
+        for_each_operand(&self.insts[i as usize].op, |v| {
+            if let V::Inst(op) = v {
+                let b = def_block[op as usize];
+                if b == usize::MAX || in_loop[b] || !dominates(idom, b, dom_target) {
+                    ok = false;
+                }
+            }
+        });
+        ok
+    }
+
+    /// Splits conditional entry edge `entry_pred -> header` into
+    /// `entry_pred -> ph -> header`, updating header phis, `tree`, and outer
+    /// loop memberships.
+    fn split_preheader(
+        &mut self,
+        entry_pred: usize,
+        header: usize,
+        tree: &mut Tree,
+        loops: &mut [NaturalLoop],
+        cur_idx: usize,
+    ) -> usize {
+        let ph = self.new_block();
+        self.blocks[ph].term = Some(Term::Br(header));
+        match self.blocks[entry_pred].term {
+            Some(Term::CondBr(c, t, f)) => {
+                let t = if t == header { ph } else { t };
+                let f = if f == header { ph } else { f };
+                self.blocks[entry_pred].term = Some(Term::CondBr(c, t, f));
+            }
+            _ => unreachable!("split_preheader called on non-CondBr predecessor"),
+        }
+        for n in 0..self.blocks[header].phis.len() {
+            let p = self.blocks[header].phis[n];
+            if let Op::Phi(incoming) = &mut self.insts[p as usize].op {
+                for (_, from) in incoming {
+                    if *from == entry_pred {
+                        *from = ph;
+                    }
+                }
+            }
+        }
+        tree.idom.push(entry_pred);
+        tree.idom[header] = ph;
+        tree.preds.push(vec![entry_pred]);
+        for p in &mut tree.preds[header] {
+            if *p == entry_pred {
+                *p = ph;
+            }
+        }
+        tree.children.push(vec![header]);
+        for c in &mut tree.children[entry_pred] {
+            if *c == header {
+                *c = ph;
+            }
+        }
+        if let Some(pos) = tree.order.iter().position(|&b| b == header) {
+            tree.order.insert(pos, ph);
+        }
+        for (k, lp) in loops.iter_mut().enumerate() {
+            let in_outer = k != cur_idx && lp.in_loop[entry_pred] && lp.in_loop[header];
+            lp.in_loop.push(in_outer);
+            if in_outer {
+                lp.size += 1;
+            }
+        }
+        ph
+    }
+
+    /// [`LICM`]: hoists pure, non-trapping loop-invariant instructions out of
+    /// natural loops (innermost first) to their dominating preheader.
+    fn licm(&mut self) -> bool {
+        if self.blocks.is_empty() {
+            return false;
+        }
+        let effects = self.effects();
+        let mut tree = self.dominator_tree();
+        // Group all backedges `(latch -> header)` by header.
+        let mut latches_by_header: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &b in &tree.order {
+            for &s in successors(self.blocks[b].term).iter() {
+                if dominates(&tree.idom, s, b) {
+                    latches_by_header.entry(s).or_default().push(b);
+                }
+            }
+        }
+        if latches_by_header.is_empty() {
+            return false;
+        }
+        let n_blocks = self.blocks.len();
+        let mut loops: Vec<NaturalLoop> = Vec::with_capacity(latches_by_header.len());
+        for (header, latches) in latches_by_header {
+            if header == 0 {
+                continue;
+            }
+            let mut in_loop = vec![false; n_blocks];
+            in_loop[header] = true;
+            let mut work = Vec::new();
+            for latch in latches {
+                if !in_loop[latch] {
+                    in_loop[latch] = true;
+                    work.push(latch);
+                }
+            }
+            while let Some(b) = work.pop() {
+                for &p in &tree.preds[b] {
+                    if !in_loop[p] {
+                        in_loop[p] = true;
+                        work.push(p);
+                    }
+                }
+            }
+            let size = in_loop.iter().filter(|&&x| x).count();
+            loops.push(NaturalLoop {
+                header,
+                in_loop,
+                size,
+            });
+        }
+        // Innermost loops first, deterministically ordered by header.
+        loops.sort_by_key(|l| (l.size, l.header));
+
+        let mut def_block = vec![usize::MAX; self.insts.len()];
+        for &b in &tree.order {
+            for &i in self.blocks[b].phis.iter().chain(&self.blocks[b].body) {
+                def_block[i as usize] = b;
+            }
+        }
+
+        let mut any_changed = false;
+        for idx in 0..loops.len() {
+            let header = loops[idx].header;
+            let outside_preds: Vec<usize> = tree.preds[header]
+                .iter()
+                .copied()
+                .filter(|&p| !loops[idx].in_loop[p])
+                .collect();
+            if outside_preds.len() != 1 {
+                continue;
+            }
+            let entry_pred = outside_preds[0];
+            let mut preheader = match self.blocks[entry_pred].term {
+                Some(Term::Br(t)) if t == header => Some(entry_pred),
+                Some(Term::CondBr(_, t, f)) if (t == header) != (f == header) => None,
+                _ => continue,
+            };
+
+            // Blocks reached unconditionally from `header` along a single-pred /
+            // single-succ `Term::Br` chain without any intervening
+            // `WriteKind::All` call (e.g. `dx.op.discard`). Instructions in
+            // these blocks (before any `WriteKind::All` in the block itself)
+            // run on every loop entry with the exact same active lanes as the
+            // preheader, preserving dynamic uniformity and preventing
+            // speculation past conditional branches or discards.
+            let mut guaranteed_blocks = vec![false; self.blocks.len()];
+            let mut cur = header;
+            loop {
+                if guaranteed_blocks[cur] {
+                    break;
+                }
+                guaranteed_blocks[cur] = true;
+                let has_barrier_exit = self.blocks[cur].body.iter().any(|&inst_id| {
+                    matches!(self.insts[inst_id as usize].op, Op::Call(f, _)
+                        if effects[f as usize] == Effect::Writes
+                            && write_kind(&self.funcs[f as usize]) == WriteKind::All)
+                });
+                if has_barrier_exit {
+                    break;
+                }
+                match self.blocks[cur].term {
+                    Some(Term::Br(next))
+                        if loops[idx].in_loop[next]
+                            && next != header
+                            && tree.preds[next].len() == 1
+                            && tree.preds[next][0] == cur =>
+                    {
+                        cur = next;
+                    }
+                    _ => break,
+                }
+            }
+            let loop_blocks: Vec<usize> = tree
+                .order
+                .iter()
+                .copied()
+                .filter(|&b| loops[idx].in_loop[b])
+                .collect();
+
+            loop {
+                let mut round_changed = false;
+                for &b in &loop_blocks {
+                    let mut guaranteed = guaranteed_blocks[b];
+                    let body = std::mem::take(&mut self.blocks[b].body);
+                    let mut kept = Vec::with_capacity(body.len());
+                    for i in body {
+                        if let Op::Call(f, _) = self.insts[i as usize].op
+                            && effects[f as usize] == Effect::Writes
+                            && write_kind(&self.funcs[f as usize]) == WriteKind::All
+                        {
+                            guaranteed = false;
+                        }
+                        let dom_target = preheader.unwrap_or(entry_pred);
+                        if self.can_hoist(&effects, i, guaranteed)
+                            && self.operands_invariant(
+                                i,
+                                &loops[idx].in_loop,
+                                &def_block,
+                                &tree.idom,
+                                dom_target,
+                            )
+                        {
+                            let ph = match preheader {
+                                Some(ph) => ph,
+                                None => {
+                                    let ph = self.split_preheader(
+                                        entry_pred,
+                                        header,
+                                        &mut tree,
+                                        &mut loops,
+                                        idx,
+                                    );
+                                    preheader = Some(ph);
+                                    ph
+                                }
+                            };
+                            self.blocks[ph].body.push(i);
+                            def_block[i as usize] = ph;
+                            round_changed = true;
+                            any_changed = true;
+                        } else {
+                            kept.push(i);
+                        }
+                    }
+                    self.blocks[b].body = kept;
+                }
+                if !round_changed {
+                    break;
+                }
+            }
+        }
+        any_changed
     }
 
     /// [`FOLD`]: a branch on a constant goes one way. The side not taken
@@ -3321,9 +3661,10 @@ mod tests {
                 FACTS,
                 LOADS,
                 MEM_FWD,
+                LICM,
                 FOLD | FACTS,
                 FOLD | EXT_FOLD | FACTS,
-                LOADS | MEM_FWD,
+                LOADS | MEM_FWD | LICM,
                 FOLD | EXT_FOLD | REUSE | DEAD,
                 ALL,
             ] {
@@ -4123,6 +4464,414 @@ mod tests {
                 p0_stores, 3,
                 "36-hop dynamic load/store/atomic must preserve all 3 live p0 stores"
             );
+        }
+    }
+
+    #[test]
+    fn licm_hoists_pure_invariants_splits_cond_entry_and_respects_traps() {
+        // Part 1: conditional entry + nested invariant chain + safe vs unsafe div/rem + reads/lanes.
+        let build = || {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let inp = k.m.function("dx.op.loadInput.i32", fty, Some(Attr::ReadNone), false);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let wave = k.m.function("dx.op.waveReadLaneFirst.i32", fty, Some(Attr::NoUnwind), false);
+            let (k0, k1, k3, k7, km1) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(3),
+                k.m.i32(7),
+                k.m.i32(u32::MAX),
+            );
+            let n = k.m.call(k.b, inp, vec![k0, k0]);
+            let a = k.m.call(k.b, inp, vec![k1, k0]);
+            let d = k.m.call(k.b, inp, vec![k1, k1]); // potentially 0
+            let enter = k.m.cmp(k.b, pred::IUGT, n, k0);
+            let (head, exit) = (k.m.new_block(), k.m.new_block());
+            k.m.terminate(k.b, Term::CondBr(enter, head, exit));
+
+            let idx = k.m.phi(head, i32t);
+            let acc = k.m.phi(head, i32t);
+            // Pure loop-invariant chain: must hoist into lazily split preheader.
+            let inv1 = k.m.bin(head, Bin::Mul, a, k3);
+            let inv2 = k.m.bin(head, Bin::Add, inv1, k7);
+            let inv_div_safe = k.m.bin(head, Bin::UDiv, inv2, k3);
+            let inv_cb = k.m.call(head, cb, vec![k0, k1]);
+            // Negative controls: MUST NOT hoist.
+            let unsafe_udiv = k.m.bin(head, Bin::UDiv, a, d);
+            let unsafe_sdiv_m1 = k.m.bin(head, Bin::SDiv, a, km1);
+            let mem_read = k.m.call(head, k.reads, vec![k0, k1]);
+            let lane_op = k.m.call(head, wave, vec![a, k1]);
+            let t0 = k.m.bin(head, Bin::Add, acc, inv_div_safe);
+            let t1 = k.m.bin(head, Bin::Add, t0, inv_cb);
+            let t2 = k.m.bin(head, Bin::Add, t1, mem_read);
+            let t3 = k.m.bin(head, Bin::Add, t2, lane_op);
+            let t4 = k.m.bin(head, Bin::Xor, t3, unsafe_udiv);
+            let next_acc = k.m.bin(head, Bin::Xor, t4, unsafe_sdiv_m1);
+            let next_idx = k.m.bin(head, Bin::Add, idx, k1);
+            let more = k.m.cmp(head, pred::IULT, next_idx, n);
+            k.m.terminate(head, Term::CondBr(more, head, exit));
+            k.m.set_phi(idx, vec![(k0, k.b), (next_idx, head)]);
+            k.m.set_phi(acc, vec![(k0, k.b), (next_acc, head)]);
+
+            let final_acc = k.m.phi(exit, i32t);
+            k.m.set_phi(final_acc, vec![(k0, k.b), (next_acc, head)]);
+            k.m.call(exit, k.writes, vec![k0, final_acc]);
+            k.m.terminate(exit, Term::Ret);
+            (k.m, k.b, head, inv1, inv2, inv_div_safe, inv_cb, unsafe_udiv, unsafe_sdiv_m1, mem_read, lane_op)
+        };
+
+        let (mut m, entry, head, inv1, inv2, inv_div_safe, inv_cb, unsafe_udiv, unsafe_sdiv_m1, mem_read, lane_op) =
+            build();
+        m.optimise(LICM);
+        let Some(Term::CondBr(_, ph, _)) = m.blocks[entry].term else {
+            panic!("entry should stay CondBr");
+        };
+        assert_ne!(ph, head, "conditional entry must split a dedicated preheader");
+        assert!(matches!(m.blocks[ph].term, Some(Term::Br(h)) if h == head));
+        let inst_id = |v: V| match v {
+            V::Inst(i) => i,
+            _ => unreachable!(),
+        };
+        for v in [inv1, inv2, inv_div_safe, inv_cb] {
+            assert!(m.blocks[ph].body.contains(&inst_id(v)), "{v:?} should be hoisted to preheader");
+            assert!(!m.blocks[head].body.contains(&inst_id(v)), "{v:?} should leave loop header");
+        }
+        for v in [unsafe_udiv, unsafe_sdiv_m1, mem_read, lane_op] {
+            assert!(m.blocks[head].body.contains(&inst_id(v)), "{v:?} must NOT be hoisted");
+            assert!(!m.blocks[ph].body.contains(&inst_id(v)), "{v:?} must NOT be in preheader");
+        }
+        for &p in &m.blocks[head].phis {
+            let Op::Phi(inc) = &m.insts[p as usize].op else { panic!() };
+            assert!(inc.iter().any(|&(_, from)| from == ph), "phi must name split preheader");
+            assert!(!inc.iter().any(|&(_, from)| from == entry), "phi must not name stale entry");
+        }
+        m.write();
+
+        // Part 2: nested loop hoists doubly-invariant expression out of BOTH loops.
+        let mut k = kit();
+        let i32t = k.m.int(32);
+        let (k0, k1, k4) = (k.m.i32(0), k.m.i32(1), k.m.i32(4));
+        let x = k.m.call(k.b, k.reads, vec![k0, k1]);
+        let (outer, inner, outer_latch, exit) = (
+            k.m.new_block(),
+            k.m.new_block(),
+            k.m.new_block(),
+            k.m.new_block(),
+        );
+        k.m.terminate(k.b, Term::Br(outer));
+        let oi = k.m.phi(outer, i32t);
+        k.m.terminate(outer, Term::Br(inner));
+        let ii = k.m.phi(inner, i32t);
+        let dbl_inv = k.m.bin(inner, Bin::Add, x, k4);
+        let use_it = k.m.bin(inner, Bin::Add, dbl_inv, ii);
+        k.m.call(inner, k.writes, vec![ii, use_it]);
+        let next_ii = k.m.bin(inner, Bin::Add, ii, k1);
+        let in_more = k.m.cmp(inner, pred::IULT, next_ii, k4);
+        k.m.terminate(inner, Term::CondBr(in_more, inner, outer_latch));
+        k.m.set_phi(ii, vec![(k0, outer), (next_ii, inner)]);
+        let next_oi = k.m.bin(outer_latch, Bin::Add, oi, k1);
+        let out_more = k.m.cmp(outer_latch, pred::IULT, next_oi, k4);
+        k.m.terminate(outer_latch, Term::CondBr(out_more, outer, exit));
+        k.m.set_phi(oi, vec![(k0, k.b), (next_oi, outer_latch)]);
+        k.m.terminate(exit, Term::Ret);
+        k.m.optimise(LICM);
+        assert!(
+            k.m.blocks[k.b].body.contains(&inst_id(dbl_inv)),
+            "doubly-invariant op must hoist all the way to entry"
+        );
+        assert!(!k.m.blocks[outer].body.contains(&inst_id(dbl_inv)));
+        assert!(!k.m.blocks[inner].body.contains(&inst_id(dbl_inv)));
+        k.m.write();
+    }
+
+    #[test]
+    fn licm_negative_controls_speculative_resources_uniformity_discard_and_signed_const_gep() {
+        let inst_id = |v: V| match v {
+            V::Inst(i) => i,
+            _ => panic!("expected V::Inst, got {v:?}"),
+        };
+
+        // 2a: Conditional `if (valid)` inside loop MUST NOT speculatively hoist
+        //     createHandleFromHeap, annotateHandle, cbufferLoadLegacy, or getDimensions,
+        //     while pure math (`unary.f32`) in the same conditional block still hoists.
+        {
+            let mut k = kit();
+            let (i32t, i1t, f32t) = (k.m.int(32), k.m.int(1), k.m.float());
+            let hty = k.m.func_ty(i32t, vec![i32t, i32t, i1t, i1t]);
+            let aty = k.m.func_ty(i32t, vec![i32t, i32t, i32t]);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let uty = k.m.func_ty(f32t, vec![i32t, f32t]);
+            let heap =
+                k.m.function("dx.op.createHandleFromHeap", hty, Some(Attr::ReadNone), false);
+            let ann = k.m.function("dx.op.annotateHandle", aty, Some(Attr::ReadNone), false);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let dims = k.m.function("dx.op.getDimensions", fty, Some(Attr::ReadOnly), false);
+            let unary = k.m.function("dx.op.unary.f32", uty, Some(Attr::ReadNone), false);
+            let (k0, k1, k4, k13, k59, k72, k216, k218) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(13),
+                k.m.i32(59),
+                k.m.i32(72),
+                k.m.i32(216),
+                k.m.i32(218),
+            );
+            let (yes, no) = (k.m.bool(true), k.m.bool(false));
+            let slot = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let cond_val = k.m.call(k.b, k.reads, vec![k1, k0]);
+            let xf = k.m.cast(k.b, Cast::Bitcast, slot, f32t);
+
+            let (head, guarded, latch, exit) = (
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+            );
+            k.m.terminate(k.b, Term::Br(head));
+            let idx = k.m.phi(head, i32t);
+            let has_valid = k.m.cmp(head, pred::NE, cond_val, k0);
+            k.m.terminate(head, Term::CondBr(has_valid, guarded, latch));
+
+            let h_dyn_nu = k.m.call(guarded, heap, vec![k218, slot, no, yes]);
+            let h_const = k.m.call(guarded, heap, vec![k218, k0, no, no]);
+            let h_ann = k.m.call(guarded, ann, vec![k216, h_dyn_nu, k0]);
+            let cb_v = k.m.call(guarded, cb, vec![k59, h_ann]);
+            let dim_v = k.m.call(guarded, dims, vec![k72, h_const]);
+            let pure_sin = k.m.call(guarded, unary, vec![k13, xf]);
+            let alu_inv = k.m.bin(guarded, Bin::Add, slot, k4);
+            let sin_i = k.m.cast(guarded, Cast::Bitcast, pure_sin, i32t);
+            let sum = k.m.bin(guarded, Bin::Add, cb_v, dim_v);
+            let sum2 = k.m.bin(guarded, Bin::Add, sum, sin_i);
+            let sum3 = k.m.bin(guarded, Bin::Add, sum2, alu_inv);
+            k.m.call(guarded, k.writes, vec![idx, sum3]);
+            k.m.terminate(guarded, Term::Br(latch));
+
+            let next = k.m.bin(latch, Bin::Add, idx, k1);
+            let more = k.m.cmp(latch, pred::IULT, next, k4);
+            k.m.terminate(latch, Term::CondBr(more, head, exit));
+            k.m.set_phi(idx, vec![(k0, k.b), (next, latch)]);
+            k.m.terminate(exit, Term::Ret);
+
+            k.m.optimise(LICM);
+            for v in [h_dyn_nu, h_const, h_ann, cb_v, dim_v, pure_sin, alu_inv] {
+                assert!(
+                    k.m.blocks[guarded].body.contains(&inst_id(v)),
+                    "guarded call/ALU {v:?} MUST NOT hoist under plain LICM (512)"
+                );
+                assert!(!k.m.blocks[k.b].body.contains(&inst_id(v)));
+            }
+            k.m.write();
+        }
+
+        // 2b-i: `header: condbr %c, body, header; body: ... condbr %done, exit, header`
+        //       (`body` dominates all `exits` yet is NOT guaranteed on iter 0):
+        //       MUST NOT hoist uniform `createHandleFromHeap`, `cbufferLoadLegacy`, or
+        //       dynamic `Op::Load(ConstGlobal)` from `body`.
+        {
+            let mut k = kit();
+            let (i32t, i1t) = (k.m.int(32), k.m.int(1));
+            let arr4 = k.m.array(4, i32t);
+            let c_init = k.m.undef(arr4);
+            let cg = k.m.constant_global("tbl", c_init);
+            let hty = k.m.func_ty(i32t, vec![i32t, i32t, i1t, i1t]);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let heap =
+                k.m.function("dx.op.createHandleFromHeap", hty, Some(Attr::ReadNone), false);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let (k0, k1, k4, k59, k218) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(59),
+                k.m.i32(218),
+            );
+            let no = k.m.bool(false);
+            let dyn_idx = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let ptr_dyn = k.m.element(k.b, cg, dyn_idx);
+
+            let (head, body, exit) = (k.m.new_block(), k.m.new_block(), k.m.new_block());
+            k.m.terminate(k.b, Term::Br(head));
+            let iter = k.m.phi(head, i32t);
+            let next_h = k.m.bin(head, Bin::Add, iter, k1);
+            let ready = k.m.cmp(head, pred::EQ, iter, dyn_idx);
+            k.m.terminate(head, Term::CondBr(ready, body, head));
+
+            let h_unif = k.m.call(body, heap, vec![k218, dyn_idx, no, no]);
+            let cb_v = k.m.call(body, cb, vec![k59, h_unif]);
+            let dyn_cg_load = k.m.load(body, ptr_dyn);
+            let sum = k.m.bin(body, Bin::Add, cb_v, dyn_cg_load);
+            k.m.call(body, k.writes, vec![iter, sum]);
+            let done = k.m.cmp(body, pred::IUGE, next_h, k4);
+            k.m.terminate(body, Term::CondBr(done, exit, head));
+            k.m.set_phi(iter, vec![(k0, k.b), (next_h, head), (next_h, body)]);
+            k.m.terminate(exit, Term::Ret);
+
+            k.m.optimise(LICM);
+            for v in [h_unif, cb_v, dyn_cg_load] {
+                assert!(
+                    k.m.blocks[body].body.contains(&inst_id(v)),
+                    "{v:?} in continue-skipped exit-dominating body MUST NOT hoist"
+                );
+                assert!(!k.m.blocks[k.b].body.contains(&inst_id(v)));
+            }
+            k.m.write();
+        }
+
+        // 2b-ii: `dx.op.discard` inside `header` stops `guaranteed` for subsequent ops
+        //        in `header` and any `Term::Br` successor block, while ops BEFORE `discard`
+        //        and clean `header -> Br(b1)` chains without `discard` DO hoist.
+        {
+            let mut k = kit();
+            let (i32t, i1t, void) = (k.m.int(32), k.m.int(1), k.m.void());
+            let dty = k.m.func_ty(void, vec![i32t, i1t]);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            k.m.ptr(dty);
+            let discard = k.m.function("dx.op.discard", dty, Some(Attr::NoUnwind), false);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let arr4 = k.m.array(4, i32t);
+            let c_init = k.m.undef(arr4);
+            let cg = k.m.constant_global("tbl_d", c_init);
+            let (k0, k1, k4, k59, k82) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(59),
+                k.m.i32(82),
+            );
+            let dyn_idx = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let bad = k.m.cmp(k.b, pred::IUGE, dyn_idx, k4);
+            let ptr_dyn = k.m.element(k.b, cg, dyn_idx);
+
+            let (head, b1, exit) = (k.m.new_block(), k.m.new_block(), k.m.new_block());
+            k.m.terminate(k.b, Term::Br(head));
+            let iter = k.m.phi(head, i32t);
+            let cb_before = k.m.call(head, cb, vec![k59, k0]);
+            k.m.call(head, discard, vec![k82, bad]);
+            let cb_after = k.m.call(head, cb, vec![k59, k1]);
+            let load_after = k.m.load(head, ptr_dyn);
+            k.m.terminate(head, Term::Br(b1));
+
+            let cb_in_b1 = k.m.call(b1, cb, vec![k59, k4]);
+            let s0 = k.m.bin(b1, Bin::Add, cb_before, cb_after);
+            let s1 = k.m.bin(b1, Bin::Add, s0, load_after);
+            let s2 = k.m.bin(b1, Bin::Add, s1, cb_in_b1);
+            k.m.call(b1, k.writes, vec![iter, s2]);
+            let next = k.m.bin(b1, Bin::Add, iter, k1);
+            let more = k.m.cmp(b1, pred::IULT, next, k4);
+            k.m.terminate(b1, Term::CondBr(more, head, exit));
+            k.m.set_phi(iter, vec![(k0, k.b), (next, b1)]);
+            k.m.terminate(exit, Term::Ret);
+
+            k.m.optimise(LICM);
+            assert!(
+                k.m.blocks[k.b].body.contains(&inst_id(cb_before)),
+                "cbufferLoadLegacy BEFORE discard in header must hoist"
+            );
+            assert!(
+                k.m.blocks[head].body.contains(&inst_id(cb_after)),
+                "cbufferLoadLegacy AFTER discard in header must NOT hoist"
+            );
+            assert!(
+                k.m.blocks[head].body.contains(&inst_id(load_after)),
+                "dynamic ConstGlobal load AFTER discard in header must NOT hoist"
+            );
+            assert!(
+                k.m.blocks[b1].body.contains(&inst_id(cb_in_b1)),
+                "cbufferLoadLegacy in block after discard must NOT hoist"
+            );
+            k.m.write();
+        }
+
+        // Positive control for 2b: clean `header -> Br(b1)` without `discard` DOES hoist from `b1`.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let (k0, k1, k4, k59) = (k.m.i32(0), k.m.i32(1), k.m.i32(4), k.m.i32(59));
+            let (head, b1, exit) = (k.m.new_block(), k.m.new_block(), k.m.new_block());
+            k.m.terminate(k.b, Term::Br(head));
+            let iter = k.m.phi(head, i32t);
+            k.m.terminate(head, Term::Br(b1));
+            let cb_b1 = k.m.call(b1, cb, vec![k59, k0]);
+            k.m.call(b1, k.writes, vec![iter, cb_b1]);
+            let next = k.m.bin(b1, Bin::Add, iter, k1);
+            let more = k.m.cmp(b1, pred::IULT, next, k4);
+            k.m.terminate(b1, Term::CondBr(more, head, exit));
+            k.m.set_phi(iter, vec![(k0, k.b), (next, b1)]);
+            k.m.terminate(exit, Term::Ret);
+            k.m.optimise(LICM);
+            assert!(
+                k.m.blocks[k.b].body.contains(&inst_id(cb_b1)),
+                "unconditional single-pred Br chain from header with no discard must hoist"
+            );
+            k.m.write();
+        }
+
+        // 2c: `is_in_bounds_const_global_ptr` rejects signed `i8(-1)` into `[512 x i32]`
+        //     and rejects mismatched GEP `arr_ty`, while allowing provably in-bounds `i32(7)`.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let arr512 = k.m.array(512, i32t);
+            let arr4 = k.m.array(4, i32t);
+            let c_init = k.m.undef(arr512);
+            let cg = k.m.constant_global("big_tbl", c_init);
+            let (k0, k1, k4, k7, km1_i8) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(7),
+                k.m.i8(u8::MAX),
+            );
+            let flag = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let p_neg_i8 = k.m.push(k.b, ptr_i32, Op::Gep(arr512, cg, vec![k0, km1_i8]));
+            let p_mismatch = k.m.push(k.b, ptr_i32, Op::Gep(arr4, cg, vec![k0, k1]));
+            let p_ok = k.m.push(k.b, ptr_i32, Op::Gep(arr512, cg, vec![k0, k7]));
+
+            let (head, guarded, latch, exit) = (
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+            );
+            k.m.terminate(k.b, Term::Br(head));
+            let iter = k.m.phi(head, i32t);
+            let cond = k.m.cmp(head, pred::NE, flag, k0);
+            k.m.terminate(head, Term::CondBr(cond, guarded, latch));
+
+            let ld_neg = k.m.load(guarded, p_neg_i8);
+            let ld_mis = k.m.load(guarded, p_mismatch);
+            let ld_ok = k.m.load(guarded, p_ok);
+            let s0 = k.m.bin(guarded, Bin::Add, ld_neg, ld_mis);
+            let s1 = k.m.bin(guarded, Bin::Add, s0, ld_ok);
+            k.m.call(guarded, k.writes, vec![iter, s1]);
+            k.m.terminate(guarded, Term::Br(latch));
+
+            let next = k.m.bin(latch, Bin::Add, iter, k1);
+            let more = k.m.cmp(latch, pred::IULT, next, k4);
+            k.m.terminate(latch, Term::CondBr(more, head, exit));
+            k.m.set_phi(iter, vec![(k0, k.b), (next, latch)]);
+            k.m.terminate(exit, Term::Ret);
+
+            k.m.optimise(LICM);
+            assert!(
+                k.m.blocks[guarded].body.contains(&inst_id(ld_neg)),
+                "i8(-1) ConstGlobal GEP is OOB and MUST NOT hoist speculatively"
+            );
+            assert!(
+                k.m.blocks[guarded].body.contains(&inst_id(ld_mis)),
+                "mismatched arr_ty ConstGlobal GEP MUST NOT hoist speculatively"
+            );
+            assert!(
+                k.m.blocks[k.b].body.contains(&inst_id(ld_ok)),
+                "provably in-bounds ConstGlobal GEP load must hoist"
+            );
+            k.m.write();
         }
     }
 }
