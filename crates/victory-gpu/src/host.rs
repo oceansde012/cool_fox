@@ -2725,6 +2725,31 @@ fn heat_on() -> bool {
     })
 }
 
+/// Whether declared ranges are read whole only once in so many submissions
+/// ([`heat::every`], `VICTORY_CARD_COMPARE_EVERY=<D>`; off by default).
+/// With the relay, whose compares store the hashes they make, and not with
+/// [`heat_on`].
+fn lean_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = heat::every().is_some() && relay() && !heat_on();
+        if heat::every().is_some() {
+            tracing::info!(
+                on,
+                every = heat::every(),
+                hot = heat::hot_span(),
+                "compares read a declared range whole once in so many submissions and its pieces found changed lately between \
+                 (VICTORY_CARD_COMPARE_EVERY; needs the relay, not with VICTORY_CARD_COMPARE_HOT)"
+            );
+        }
+        on
+    })
+}
+
+/// The book of [`lean_on`]. Taken after [`QUEUE_ORDER`] and [`CARD_WORK`]
+/// where those are held, and by the thread that reads what compares found.
+static LEAN: Mutex<Option<heat::Lean>> = Mutex::new(None);
+
 /// Whether a flight that owes pieces is held back from landing until a
 /// compare of them has run (`VICTORY_CARD_COMPARE_HOT_HOLD=0`: it lands, and
 /// what a later compare finds lands when that has run, at most the deadline
@@ -4719,6 +4744,17 @@ impl Host {
                 );
             }
         }
+        // With `lean_on`: a declared range with hashes is read whole once in
+        // so many submissions, and in its hot pieces by the compares between.
+        if flown && let Some(every) = lean_on().then(heat::every).flatten() {
+            let mut lean = LEAN.lock().unwrap_or_else(|e| e.into_inner());
+            let lean = lean.get_or_insert_with(Default::default);
+            for (i, (shadow, _, span, twin)) in cards.iter().enumerate() {
+                if *twin {
+                    chosen[i] = lean.plan(number, every, heat::hot_span(), shadow.id(), span.first, span.pieces);
+                }
+            }
+        }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut stamped: Vec<(u64, bool)> = Vec::new();
         let mut looks = None;
@@ -5328,6 +5364,13 @@ impl Host {
                         let changed: Vec<u32> = (0..r.span.pieces)
                             .filter(|&p| differs.get((r.at + p) as usize).is_some_and(|&d| torn::flagged(d)))
                             .collect();
+                        if lean_on() && !changed.is_empty() {
+                            let mut lean = LEAN.lock().unwrap_or_else(|e| e.into_inner());
+                            let lean = lean.get_or_insert_with(Default::default);
+                            for &p in &changed {
+                                lean.found(r.shadow.id(), r.span.first + p, plan.number);
+                            }
+                        }
                         if let Some(book) = book.as_mut().and_then(|b| b.as_mut()) {
                             for &p in &changed {
                                 book.found(r.shadow.id(), r.span.first + p, plan.number);
@@ -9721,6 +9764,7 @@ impl Meter {
         }
         compared_line(frames);
         heat::line(frames);
+        heat::lean_line(frames);
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);

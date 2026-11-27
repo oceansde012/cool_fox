@@ -63,6 +63,90 @@ pub(super) fn hot_span() -> u64 {
     })
 }
 
+/// `VICTORY_CARD_COMPARE_EVERY=<D>` (off by default; not with
+/// `VICTORY_CARD_COMPARE_HOT`): a declared range of a copy is read whole by
+/// a compare at most once in `D` submissions; the compares between read only
+/// its pieces found changed in the last [`hot_span`] submissions ([`Lean`]).
+/// Nothing is owed and no flight waits: a shader's write to a piece nobody
+/// found changed lately reaches title memory with the range's next whole
+/// compare, at most `D` submissions after its own flight landed.
+pub(super) fn every() -> Option<u64> {
+    static EVERY: OnceLock<Option<u64>> = OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CARD_COMPARE_EVERY").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&d| d > 0)
+    })
+}
+
+/// What [`every`] goes by: for each declared range the submission whose
+/// compare last read all of it, and for each copy the pieces found changed
+/// and when. A range is a copy, its first piece and its pieces: the title
+/// declares the same ranges frame after frame.
+#[derive(Default)]
+pub(super) struct Lean {
+    whole: HashMap<(u64, u32, u32), u64>,
+    changed: HashMap<u64, HashMap<u32, u64>>,
+}
+
+/// Since the last frame-rate line ([`lean_line`]): declared ranges read
+/// whole, ranges read in their hot pieces only, the pieces read of those,
+/// the pieces left.
+pub(super) static LEAN_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+impl Lean {
+    /// What submission `number`'s compare reads of the declared range
+    /// (`copy`, from piece `first`, `pieces` of them): `None` for all of
+    /// it, else each piece's yes or no.
+    pub(super) fn plan(&mut self, number: u64, every: u64, span: u64, copy: u64, first: u32, pieces: u32) -> Option<Vec<bool>> {
+        let whole = self.whole.entry((copy, first, pieces)).or_insert(0);
+        if *whole == 0 || *whole + every <= number {
+            *whole = number;
+            // (What changed long ago is forgotten at these.)
+            if let Some(changed) = self.changed.get_mut(&copy) {
+                changed.retain(|_, n| *n + 4 * span >= number);
+            }
+            LEAN_STATS[0].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let mut chosen = vec![false; pieces as usize];
+        let mut hot = 0u64;
+        if let Some(changed) = self.changed.get(&copy) {
+            for (&p, &n) in changed {
+                if n + span >= number && p >= first && p - first < pieces {
+                    chosen[(p - first) as usize] = true;
+                    hot += 1;
+                }
+            }
+        }
+        LEAN_STATS[1].fetch_add(1, Ordering::Relaxed);
+        LEAN_STATS[2].fetch_add(hot, Ordering::Relaxed);
+        LEAN_STATS[3].fetch_add(u64::from(pieces) - hot, Ordering::Relaxed);
+        Some(chosen)
+    }
+
+    /// Submission `number`'s compare found `piece` of `copy` changed.
+    pub(super) fn found(&mut self, copy: u64, piece: u32, number: u64) {
+        let at = self.changed.entry(copy).or_default().entry(piece).or_insert(number);
+        *at = (*at).max(number);
+    }
+}
+
+/// The frame-rate line's part ([`LEAN_STATS`]), if the switch is on.
+pub(super) fn lean_line(frames: f64) {
+    let Some(every) = every() else {
+        return;
+    };
+    let s: Vec<f64> = LEAN_STATS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "declared ranges read whole once in {every} submissions (VICTORY_CARD_COMPARE_EVERY, hot for {} submissions) per frame: {:.1} read whole, \
+         {:.1} read in their hot pieces only, {:.0} pieces read of those, {:.0} left",
+        hot_span(),
+        s[0],
+        s[1],
+        s[2],
+        s[3],
+    );
+}
+
 /// Since the last frame-rate line ([`line`]): declared pieces compared as
 /// hot, declared pieces left for later, owed pieces compared by covers (as
 /// due, ahead of a send, ahead of the submission's own compare, by the thread
@@ -389,6 +473,30 @@ mod tests {
     /// A piece found changed is read after every submission that declares
     /// it while it is hot, the others are owed and their flight is held
     /// until a cover took them and ran.
+    #[test]
+    fn a_range_is_read_whole_once_in_so_many_submissions_and_in_its_hot_pieces_between() {
+        let mut lean = super::Lean::default();
+        // The first time, and again when the count has passed: whole.
+        assert_eq!(lean.plan(10, 30, 90, 7, 100, 8), None);
+        assert_eq!(lean.plan(11, 30, 90, 7, 100, 8), Some(vec![false; 8]), "nothing found changed yet");
+        // Another range of the same copy has its own count.
+        assert_eq!(lean.plan(11, 30, 90, 7, 0, 4), None);
+        // A piece found changed is read by every compare for the span, in the ranges that hold it.
+        lean.found(7, 103, 11);
+        lean.found(7, 2, 11);
+        let mut hot = vec![false; 8];
+        hot[3] = true;
+        assert_eq!(lean.plan(12, 30, 90, 7, 100, 8), Some(hot.clone()));
+        assert_eq!(lean.plan(39, 30, 90, 7, 100, 8), Some(hot.clone()));
+        assert_eq!(lean.plan(40, 30, 90, 7, 100, 8), None, "thirty submissions after the last whole one");
+        assert_eq!(lean.plan(41, 30, 90, 7, 100, 8), Some(hot));
+        // Past the span it is cold again.
+        assert_eq!(lean.plan(41 + 61, 30, 90, 7, 100, 8), None);
+        assert_eq!(lean.plan(41 + 62, 30, 90, 7, 100, 8), Some(vec![false; 8]));
+        // Another copy knows nothing of it.
+        assert_eq!(lean.plan(12, 30, 90, 8, 100, 8), None);
+    }
+
     #[test]
     fn hot_pieces_are_read_and_cold_ones_owed_until_covered() {
         let mut book: Book<(), &str> = Book::default();
