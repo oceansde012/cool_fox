@@ -1035,7 +1035,8 @@ static PROTECTED: Bits = Bits::new();
 /// The bit is set when the bytes are in, at every view of the page, and
 /// [`PUBLISHED`]'s is cleared after that. So an asking either finds the bit
 /// or came before the title's thread went on from its write; and who takes
-/// the bit reads the bytes after.
+/// the bit reads the bytes after. A fault that opens a block without the
+/// lock sets it too, before the block is writable ([`fast_open`]).
 static BESIDE: Bits = Bits::new();
 
 /// How much was put into a block beside its guard since it was last told as
@@ -1528,10 +1529,8 @@ fn guards() -> GuardsHeld {
 }
 
 /// Whether a write fault opens its block without the guards' lock where the
-/// block's page is shown at no other address (`VICTORY_FAULT_FAST=1`; off by
-/// default: a write can go unreported to a later asking when [`open`] clears
-/// an aliased block's mark while a fault opens it alone; `VICTORY_AB` can
-/// name it).
+/// block's page is shown at no other address (`VICTORY_FAULT_FAST=0`: with
+/// the lock, as before; `VICTORY_AB` can name it).
 ///
 /// The title's job threads spent 41 ms a frame in write faults, most of it
 /// waiting for the guards' lock (287 waits a frame, 47 ms of all threads'
@@ -1556,13 +1555,25 @@ fn fast_faults() -> bool {
 
 fn fast_asked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_FAST").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_FAST").is_none_or(|v| v != "0"))
 }
 
 #[cfg(test)]
 thread_local! {
     /// [`fast_faults`], for this thread's faults.
     static FAST_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How long this thread waits halfway through opening a block (made
+    /// writable and not yet noted, or no longer aliased and not yet open):
+    /// for another thread to come between.
+    static WAIT_IN_TEST: std::cell::Cell<std::time::Duration> = const { std::cell::Cell::new(std::time::Duration::ZERO) };
+}
+
+#[cfg(test)]
+fn wait_in_test() {
+    let wait = WAIT_IN_TEST.get();
+    if !wait.is_zero() {
+        std::thread::sleep(wait);
+    }
 }
 
 /// Whether faults may open blocks without the lock ([`fast_faults`]), now or
@@ -1677,12 +1688,14 @@ static ALIASED: Bits = Bits::new();
 ///
 /// With the block's gate held nobody else changes its protection, nor what
 /// is noted of it, nor can make it shown elsewhere; so it is ours and
-/// read-only while [`PROTECTED`] says so. Its bit of [`PUBLISHED`] goes
-/// first, before any thread can write it; then it is opened, and noted
-/// opened ([`OPENED`]) before the gate is let go: whoever takes the gate next
-/// takes that note into the guards before looking at the block. Until then
-/// the guards hold it as guarded and clean, which no answer is the worse
-/// for: the title's write that faulted comes after this returns.
+/// read-only while [`PROTECTED`] says so. Its bit of [`BESIDE`] is set and
+/// its bit of [`PUBLISHED`] goes, before any thread can write it; then it is
+/// opened, and noted opened ([`OPENED`]) before the gate is let go: whoever
+/// takes the gate next takes that note into the guards before looking at the
+/// block. Until then the guards hold it as guarded and clean, and the bit of
+/// [`BESIDE`] has an asking tell it as written: once it is writable, another
+/// thread's write lands in it with no fault, and that thread may ask before
+/// the note is there.
 fn fast_open(block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
     let ours = || PROTECTED.any(block, block + 1) && !ALIASED.any(block, block + 1);
@@ -1693,6 +1706,7 @@ fn fast_open(block: usize) -> bool {
     if !ours() {
         return false;
     }
+    BESIDE.set(block);
     PUBLISHED.clear(block);
     let mut old = 0;
     // SAFETY: a block of title view memory we made read-only.
@@ -1705,6 +1719,8 @@ fn fast_open(block: usize) -> bool {
         }
         return false;
     }
+    #[cfg(test)]
+    wait_in_test();
     {
         let mut opened = OPENED.lock().unwrap_or_else(|e| e.into_inner());
         opened.push((block, std::time::Instant::now()));
@@ -2351,10 +2367,20 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
     let mut blocks: Vec<usize> = g.protected.range(first..last).collect();
     let here = blocks.len();
     let aliased: Vec<usize> = g.aliased.range(first..last).collect();
+    // A block that leaves the aliased is not opened by a fault alone
+    // ([`fast_open`]) before its other views are told and it is open: its
+    // gate is held until then (and so are those of the other views opened
+    // with it). Else a write through it could land while another view is
+    // still known clean by its bits.
+    let mut gates = Vec::new();
     if !aliased.is_empty() {
+        gates.push(Busy::take(aliased.iter().copied()));
+        drain(g);
         let one = open_one_view();
         for block in aliased {
             g.unalias(block);
+            #[cfg(test)]
+            wait_in_test();
             for other in crate::inplace::pages_of(block * BLOCK) {
                 let other = other / BLOCK;
                 if one {
@@ -2363,6 +2389,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
                     PUBLISHED.clear(other);
                     continue;
                 }
+                gates.push(Busy::take([other]));
                 g.unalias(other);
                 if !(first..last).contains(&other) && g.protected.contains(other) {
                     blocks.push(other);
@@ -2373,6 +2400,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> usize {
         ALIASES[1].fetch_add((blocks.len() - here) as u64, std::sync::atomic::Ordering::Relaxed);
     }
     unguard(g, &blocks);
+    drop(gates);
     here
 }
 
@@ -4079,6 +4107,78 @@ mod tests {
         unsafe { ((one + 8) as *mut u8).write(1) };
         assert_eq!(guard(two, two + BLOCK), Some(vec![two / PAGE]), "written at the other view");
         FAST_IN_TEST.set(false);
+        drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// Waits until `done`, at most ten seconds.
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let since = std::time::Instant::now();
+        while !done() {
+            assert!(since.elapsed() < std::time::Duration::from_secs(10), "{what}: not within ten seconds");
+            std::hint::spin_loop();
+        }
+    }
+
+    /// A block a fault is opening without the lock is writable before the
+    /// opening is noted: a write of another thread lands in it meanwhile,
+    /// with no fault, and is told at that thread's asking.
+    #[test]
+    fn a_write_while_a_fault_opens_its_block_alone_is_told() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile};
+        FAST_USED.store(true, std::sync::atomic::Ordering::Release);
+        // SAFETY: a fresh pagefile section, mapped once.
+        let (section, one) = unsafe {
+            let section = CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let one = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK).Value as usize;
+            assert_ne!(one, 0);
+            crate::inplace::title_memory_view(one, BLOCK, section as usize, 0);
+            (section as usize, one)
+        };
+        let page = one / PAGE;
+        assert_eq!(guard(one, one + BLOCK), Some(vec![page]));
+        assert!(!writable(one));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                FAST_IN_TEST.set(true);
+                WAIT_IN_TEST.set(std::time::Duration::from_millis(200));
+                // SAFETY (all): a view, opened by the handler.
+                unsafe { ((one + 8) as *mut u8).write_volatile(1) };
+            });
+            until("opened", || writable(one));
+            unsafe { ((one + 16) as *mut u8).write_volatile(1) };
+            assert_eq!(guard(one, one + BLOCK), Some(vec![page]), "a write while the block was opened");
+        });
+        drop_views(section, &[one], BLOCK);
+    }
+
+    /// A block that a fault on another view of its page takes out of the
+    /// aliased is not opened by a fault alone before the other views are
+    /// told: a write let through meanwhile would be missing at an asking at
+    /// another view, which its bits answer.
+    #[test]
+    fn a_fault_on_a_block_leaving_the_aliased_waits_for_the_other_views() {
+        FAST_USED.store(true, std::sync::atomic::Ordering::Release);
+        let (section, one, two) = two_views(BLOCK);
+        let aliased = || ALIASED.any(one / PAGE, one / PAGE + 1);
+        assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
+        let (before, _) = writes(two, two + BLOCK, true).expect("a view");
+        assert!(aliased() && published(two, two + BLOCK));
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                WAIT_IN_TEST.set(std::time::Duration::from_millis(200));
+                // SAFETY (all): a view, opened by the handler (with the lock).
+                unsafe { ((one + 8) as *mut u8).write_volatile(1) };
+            });
+            until("taken out of the aliased", || !aliased());
+            FAST_IN_TEST.set(true);
+            unsafe { ((one + 16) as *mut u8).write_volatile(1) };
+            FAST_IN_TEST.set(false);
+            let (_, written) = writes(two, two + BLOCK, true).expect("a view");
+            let number = written.iter().find(|w| w.0 == two / PAGE).map_or(0, |w| w.1);
+            assert!(number > before, "written through the other view: {number} is not after {before}");
+        });
         drop_views(section, &[one, two], BLOCK);
     }
 
