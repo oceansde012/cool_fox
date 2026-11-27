@@ -4292,7 +4292,7 @@ impl Host {
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
-        let own = if send::own() { send::take(self, &dirty) } else { None };
+        let mut own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
@@ -4386,6 +4386,9 @@ impl Host {
                         }
                     }
                     list.Close()?;
+                    if let Some(own) = &mut own {
+                        own.finish();
+                    }
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()

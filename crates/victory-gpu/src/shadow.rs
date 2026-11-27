@@ -798,16 +798,37 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// Copies of memory (from, to, bytes: apart), on several threads if they are
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
+    copy_all_inner(copies, false);
+}
+
+/// The destination is a mapped upload buffer. Fence stores on each writer
+/// before it tells the submitter that its part is ready for the GPU.
+pub(crate) fn copy_all_upload(copies: Vec<(usize, usize, usize)>) {
+    copy_all_inner(copies, true);
+}
+
+pub(crate) fn upload_fence() {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: SSE2 is baseline for x86-64.
+    unsafe { std::arch::x86_64::_mm_sfence() };
+    #[cfg(not(target_arch = "x86_64"))]
+    std::sync::atomic::fence(Ordering::SeqCst);
+}
+
+fn copy_all_inner(copies: Vec<(usize, usize, usize)>, upload: bool) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    let threshold = wide_min_bytes();
+    let threshold = wide_min_bytes().or(upload.then_some(256 << 10));
     if threshold.map_or(bytes > 4 << 20, |min| bytes > min) {
         let part = threshold.map_or(WIDE_JOB, |_| bytes.div_ceil(wide_threads() + 1).clamp(64 << 10, WIDE_JOB));
-        wide_scheduled(copy_jobs(copies, part), threshold.is_some());
+        wide_scheduled(copy_jobs(copies, part, upload), threshold.is_some());
         return;
     }
     for (src, dst, len) in copies {
         // SAFETY: the caller's ranges.
         unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+    }
+    if upload {
+        upload_fence();
     }
 }
 
@@ -1771,12 +1792,12 @@ pub(crate) fn take_snapshots() {
             return copy_all(snaps);
         }
     }
-    wide_scheduled(copy_jobs(snaps, WIDE_JOB), threshold.is_some());
+    wide_scheduled(copy_jobs(snaps, WIDE_JOB, false), threshold.is_some());
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
-fn copy_jobs(copies: Vec<(usize, usize, usize)>, part: usize) -> Vec<Job> {
+fn copy_jobs(copies: Vec<(usize, usize, usize)>, part: usize, upload: bool) -> Vec<Job> {
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
@@ -1788,6 +1809,9 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>, part: usize) -> Vec<Job> {
                     // SAFETY: the caller's ranges: a host copy's mapping and
                     // its snapshot, which do not overlap.
                     unsafe { std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len) };
+                }
+                if upload {
+                    upload_fence();
                 }
             }));
         }
@@ -1980,7 +2004,7 @@ mod wide_tests {
         // Ranges of the buffer, each to the same offsets of the other.
         let cuts = [0, 1, 1, 4096, 70_000, WIDE_JOB + 3, 2 * WIDE_JOB + 3, 2 * WIDE_JOB + 9, len];
         let copies: Vec<(usize, usize, usize)> = cuts.windows(2).map(|w| (s + w[0], d + w[0], w[1] - w[0])).collect();
-        let jobs = copy_jobs(copies, WIDE_JOB);
+        let jobs = copy_jobs(copies, WIDE_JOB, false);
         assert!(jobs.len() >= 3);
         wide(jobs);
         assert!(src == dst);

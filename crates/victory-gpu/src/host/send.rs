@@ -27,6 +27,11 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
+fn lean() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SEND_OWN_LEAN"))
+}
+
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 
@@ -182,8 +187,66 @@ struct Copy {
 
 /// Where a submission's bytes are taken to.
 pub(super) struct Own {
+    // Drop joins the writer before dropping the mapped upload buffer.
+    pending: Option<Fill>,
     memory: Memory,
     copies: Vec<Copy>,
+}
+
+type Move = (usize, usize, usize);
+
+struct FillWork {
+    moves: Vec<Move>,
+    _sources: Vec<std::sync::Arc<Shadow>>,
+    done: std::sync::mpsc::Sender<()>,
+}
+
+struct Fill(Option<std::sync::mpsc::Receiver<()>>);
+
+impl Drop for Fill {
+    fn drop(&mut self) {
+        if let Some(done) = self.0.take() {
+            let _ = done.recv();
+        }
+    }
+}
+
+fn note_moves(moves: &[Move]) {
+    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
+    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+}
+
+/// Only raw dirty runs go to the copier. Their destinations are in increasing
+/// address order and do not overlap the submitting thread's short-run pairs.
+fn start_fill(moves: Vec<Move>, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Fill> {
+    static COPIER: OnceLock<Option<std::sync::mpsc::Sender<FillWork>>> = OnceLock::new();
+    let copier = COPIER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<FillWork>();
+        std::thread::Builder::new()
+            .name("victory-send-own".into())
+            .spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-send-own");
+                while let Ok(work) = rx.recv() {
+                    let began = std::time::Instant::now();
+                    crate::shadow::copy_all_upload(work.moves);
+                    STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    let _ = work.done.send(());
+                }
+            })
+            .ok()?;
+        Some(tx)
+    });
+    if let Some(copier) = copier {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let work = FillWork { moves, _sources: dirty.iter().map(|(s, _)| s.clone()).collect(), done: tx };
+        match copier.send(work) {
+            Ok(()) => return Some(Fill(Some(rx))),
+            Err(e) => crate::shadow::copy_all_upload(e.0.moves),
+        }
+    } else {
+        crate::shadow::copy_all_upload(moves);
+    }
+    None
 }
 
 /// Runs whose pairs are one piece of work.
@@ -212,6 +275,7 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
         return None;
     }
     let memory = memory(host, at)?;
+    let lean = lean();
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
     let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
@@ -227,6 +291,12 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
             }
         }
     }
+    let pending = if lean && !moves.is_empty() {
+        note_moves(&moves);
+        start_fill(std::mem::take(&mut moves), dirty)
+    } else {
+        None
+    };
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
         let mut to = to as *mut [u32; 2];
@@ -243,17 +313,33 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
                 }
             }
         }
+        if lean {
+            crate::shadow::upload_fence();
+        }
     };
     crate::land::each_under(work.len(), &one);
-    STATS[0].fetch_add(moves.iter().map(|m| m.2 as u64).sum(), Ordering::Relaxed);
-    STATS[1].fetch_add(moves.len() as u64, Ordering::Relaxed);
+    if !lean {
+        note_moves(&moves);
+    }
     STATS[2].fetch_add(copies.iter().map(|c| u64::from(c.pairs.1)).sum(), Ordering::Relaxed);
-    crate::shadow::copy_all(moves);
+    if !lean {
+        crate::shadow::copy_all(moves);
+    }
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
-    Some(Own { memory, copies })
+    Some(Own { pending, memory, copies })
 }
 
 impl Own {
+    /// After recording and before executing the command list, every writer
+    /// must have finished. The queue-order lock is still held by the caller.
+    pub(super) fn finish(&mut self) {
+        if let Some(mut pending) = self.pending.take()
+            && pending.0.take().unwrap().recv().is_err()
+        {
+            fail(format_args!("the card upload copier stopped before filling a submission"));
+        }
+    }
+
     /// Records the sends into `list`; the copies that `looked` says are in
     /// `COPY_DEST`, the others in the common state. Those with a "before" are
     /// left readable by compute shaders.
@@ -323,7 +409,8 @@ impl Own {
     }
 
     /// The memory, to be kept until the submission has run.
-    pub(super) fn memory(self) -> Memory {
+    pub(super) fn memory(mut self) -> Memory {
+        self.finish();
         self.memory
     }
 }
