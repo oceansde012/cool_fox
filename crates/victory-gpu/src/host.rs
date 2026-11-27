@@ -5095,7 +5095,7 @@ impl Host {
                         }) as Box<dyn FnOnce() + Send>
                     })
                     .collect();
-                crate::shadow::wide_run(jobs);
+                crate::shadow::wide_run_bytes(jobs, total as usize);
                 for (written, count) in written.iter_mut().zip(counts.iter()) {
                     *written += count.load(Ordering::Relaxed);
                 }
@@ -7909,7 +7909,7 @@ impl Batch {
 
     fn refresh_fanout(n: usize) {
         #[cfg(feature = "diagnostics")]
-        if n > 1 {
+        if crate::shadow::wide_splits(n) {
             FLUSHES[4].fetch_add(1, Ordering::Relaxed);
         }
         let _ = n;

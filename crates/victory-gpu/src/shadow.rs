@@ -799,8 +799,10 @@ pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize
 /// many.
 pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
     let bytes: usize = copies.iter().map(|c| c.2).sum();
-    if bytes > 4 << 20 {
-        wide(copy_jobs(copies));
+    let threshold = wide_min_bytes();
+    if threshold.map_or(bytes > 4 << 20, |min| bytes > min) {
+        let part = threshold.map_or(WIDE_JOB, |_| bytes.div_ceil(wide_threads() + 1).clamp(64 << 10, WIDE_JOB));
+        wide_scheduled(copy_jobs(copies, part), threshold.is_some());
         return;
     }
     for (src, dst, len) in copies {
@@ -1622,6 +1624,37 @@ fn workers() -> &'static Workers {
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
 fn wide(jobs: Vec<Job>) {
+    if !wide_splits(jobs.len()) {
+        for job in jobs {
+            job();
+        }
+        return;
+    }
+    wide_scheduled(jobs, wide_min_bytes().is_some());
+}
+
+fn wide_min_bytes() -> Option<usize> {
+    static MIN: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| std::env::var("VICTORY_WIDE_MIN_BYTES").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// For work without a byte count, estimate 32 KiB of work per index or job.
+pub(crate) fn wide_splits(jobs: usize) -> bool {
+    jobs > 1 && wide_min_bytes().is_none_or(|min| jobs.saturating_mul(32 << 10) > min)
+}
+
+fn wide_bytes(jobs: Vec<Job>, bytes: usize) {
+    let threshold = wide_min_bytes();
+    if threshold.is_some_and(|min| bytes <= min) {
+        for job in jobs {
+            job();
+        }
+    } else {
+        wide_scheduled(jobs, threshold.is_some());
+    }
+}
+
+fn wide_scheduled(jobs: Vec<Job>, caller_share: bool) {
     if jobs.len() < 2 {
         for job in jobs {
             job();
@@ -1630,7 +1663,11 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let count = jobs.len() - usize::from(caller_share);
+    let mut jobs = jobs.into_iter();
+    // Keep one job of this batch even if another group is using the pool.
+    let local = if caller_share { jobs.next() } else { None };
+    let left = Arc::new((Mutex::new(count), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
@@ -1647,6 +1684,9 @@ fn wide(jobs: Vec<Job>) {
         }
     }
     workers.more.notify_all();
+    if let Some(job) = local {
+        job();
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -1670,10 +1710,25 @@ pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
 }
 
+/// A wide group whose caller already knows its byte count.
+pub(crate) fn wide_run_bytes(jobs: Vec<Box<dyn FnOnce() + Send>>, bytes: usize) {
+    wide_bytes(jobs, bytes);
+}
+
 /// Calls `work` with every number under `n`, on the kept threads and on
 /// this one, the next number to whichever is free: for thousands of small
 /// pieces of work, where a job each ([`wide`]) is mostly the jobs' queue.
 pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    wide_each_bytes(n, n.saturating_mul(32 << 10), work);
+}
+
+fn wide_each_bytes(n: usize, bytes: usize, work: impl Fn(usize) + Send + Sync + 'static) {
+    if wide_min_bytes().is_some_and(|min| n < 2 || bytes <= min) {
+        for i in 0..n {
+            work(i);
+        }
+        return;
+    }
     let next = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let work = Arc::new(work);
     let threads = (wide_threads() + 1).min(n);
@@ -1691,7 +1746,7 @@ pub(crate) fn wide_each(n: usize, work: impl Fn(usize) + Send + Sync + 'static) 
             }) as Job
         })
         .collect();
-    wide(jobs);
+    wide_scheduled(jobs, wide_min_bytes().is_some());
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -1709,12 +1764,19 @@ pub(crate) fn take_snapshots() {
     if snaps.is_empty() {
         return;
     }
-    wide(copy_jobs(snaps));
+    let threshold = wide_min_bytes();
+    if let Some(min) = threshold {
+        let bytes = snaps.iter().map(|c| c.2).sum::<usize>();
+        if bytes <= min {
+            return copy_all(snaps);
+        }
+    }
+    wide_scheduled(copy_jobs(snaps, WIDE_JOB), threshold.is_some());
 }
 
 /// `copies` (from, to, bytes) as pieces of work of about [`WIDE_JOB`]
 /// bytes each: long ones cut, short ones together.
-fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
+fn copy_jobs(copies: Vec<(usize, usize, usize)>, part: usize) -> Vec<Job> {
     let mut jobs: Vec<Job> = Vec::new();
     let mut group: Vec<(usize, usize, usize)> = Vec::new();
     let mut bytes = 0;
@@ -1733,11 +1795,11 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
     for (src, dst, len) in copies {
         let mut at = 0;
         while at < len {
-            let n = (WIDE_JOB - bytes).min(len - at);
+            let n = (part - bytes).min(len - at);
             group.push((src + at, dst + at, n));
             at += n;
             bytes += n;
-            if bytes >= WIDE_JOB {
+            if bytes >= part {
                 flush(&mut group, &mut jobs);
                 bytes = 0;
             }
@@ -1817,6 +1879,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }));
     };
     let count = scans.len();
+    let total = if wide_min_bytes().is_some() { scans.iter().map(|s| s.4.saturating_sub(s.3)).sum() } else { 0 };
     for (which, (data, before, start, from, to)) in scans.into_iter().enumerate() {
         let (mut at, mut place) = (from, 0);
         while at < to {
@@ -1840,7 +1903,7 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
         }
     }
     flush(&mut group, &mut jobs);
-    wide(jobs);
+    wide_bytes(jobs, total);
     let mut found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
     found.sort_unstable_by_key(|f| (f.0, f.1));
     let mut out = vec![Vec::new(); count];
@@ -1917,7 +1980,7 @@ mod wide_tests {
         // Ranges of the buffer, each to the same offsets of the other.
         let cuts = [0, 1, 1, 4096, 70_000, WIDE_JOB + 3, 2 * WIDE_JOB + 3, 2 * WIDE_JOB + 9, len];
         let copies: Vec<(usize, usize, usize)> = cuts.windows(2).map(|w| (s + w[0], d + w[0], w[1] - w[0])).collect();
-        let jobs = copy_jobs(copies);
+        let jobs = copy_jobs(copies, WIDE_JOB);
         assert!(jobs.len() >= 3);
         wide(jobs);
         assert!(src == dst);
@@ -4055,7 +4118,7 @@ impl Shadow {
             }
         }
         let this = std::ptr::from_ref(self) as usize;
-        wide_each(parts.len(), move |i| {
+        wide_each_bytes(parts.len(), bytes, move |i| {
             // SAFETY: `wide_each` returns when every part is done, before
             // the borrow of `self` ends. The parts lie apart.
             let this = unsafe { &*(this as *const Shadow) };
