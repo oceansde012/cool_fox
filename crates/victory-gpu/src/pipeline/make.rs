@@ -140,7 +140,18 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            // A build that panics (a translation) must still finish this
+            // entry and wake its waiters, and leave the worker running
+            // (fxceless/victory-fork#1353).
+            let made = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            })) {
+                Ok(made) => made,
+                Err(_) => {
+                    tracing::warn!(key = self.key, "host pipeline build panicked: refused");
+                    None
+                }
+            };
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
