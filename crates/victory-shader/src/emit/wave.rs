@@ -182,7 +182,8 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                 && insts[j].read(Reg::S(saved_code(inst))) == Some(saved)
         });
         let Some(end) = end else {
-            break;
+            i += 1;
+            continue;
         };
         let (vec, uni) = simulate(&insts[i + 1..end], wave, saved);
         let mut reads = HashMap::new();
@@ -1288,5 +1289,31 @@ mod tests {
             bad_ident[0] = red(None, v0, m0, 1, 1);
             assert_eq!(per_lane(&bad_ident, all), None);
         }
+    }
+
+    /// A saveexec of every lane whose restore is not in the block (it lies in a later one) is
+    /// no section, and the sections after it in the block are still found (upstream #3187):
+    /// the scan used to stop at the first unmatched one.
+    #[test]
+    fn an_unmatched_saveexec_leaves_the_later_sections_of_its_block() {
+        let total = |w: &[u32], start: usize| {
+            let p = build(w, true);
+            let insts = &p.blocks[0].insts;
+            let saved = insts[start].write(Reg::S(4)).unwrap();
+            let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
+            // ..., v_readlane_b32 s7, v1, 0; s_mov_b64 exec, s[4:5]; s_endpgm
+            let s7 = insts[insts.len() - 3].write(Reg::S(7)).unwrap();
+            let secs = sections(&p, 0);
+            assert!(start == 0 || !secs.contains_key(&0), "the unmatched saveexec is no section");
+            let shape = secs.get(&start).and_then(|sec| sec.shapes.get(&s7).copied());
+            (shape, Shape::Active(Op::Or, v7, saved, 0))
+        };
+        let (alone, want) = total(&WAVE_OR_V7_TO_S7, 0);
+        assert_eq!(alone, Some(want));
+        // s_or_saveexec_b64 s[2:3], -1, restored nowhere in the block
+        let mut w = vec![sop1(2, 0x25, 193)];
+        w.extend(WAVE_OR_V7_TO_S7);
+        let (after, want) = total(&w, 1);
+        assert_eq!(after, Some(want), "the section after an unmatched saveexec");
     }
 }

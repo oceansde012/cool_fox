@@ -47,15 +47,15 @@ const _: () = assert!(std::mem::offset_of!(Queue, kind) == 0x10);
 /// One thing a waiting queue holds back.
 #[cfg(windows)]
 enum Held {
-    /// The queue waits for the fence (its address) to reach the value.
-    Wait(usize, u64),
+    /// The queue waits for the fence to reach the value.
+    Wait(crate::fence::FenceRef, u64),
     /// A list of the next submission waits for a memory value.
     Value(crate::list::ValueWait),
     /// A submission: the lists' host sides, taken from the title's lists
     /// (which it may reset meanwhile), and the order they run in.
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
-    Signal(usize, u64),
+    Signal(crate::fence::FenceRef, u64),
 }
 
 /// The queues that hold something (their addresses).
@@ -332,8 +332,8 @@ pub(crate) fn release_held(all: bool) {
             loop {
                 match held.first() {
                     None => break,
-                    Some(&Held::Wait(fence, value))
-                        if !all && crate::fence::completed(fence as This) < value =>
+                    Some(Held::Wait(fence, value))
+                        if !all && crate::fence::completed(fence.as_this()) < *value =>
                     {
                         break;
                     }
@@ -415,8 +415,8 @@ pub(crate) fn release_held(all: bool) {
                     // Behind what was sent to the card and not waited
                     // for, if anything was.
                     Held::Signal(fence, value) => {
-                        if !crate::host::late_signal(fence, value) {
-                            crate::fence::set(fence as This, value);
+                        if !crate::host::late_signal(fence.as_this(), value) {
+                            crate::fence::set(fence.as_this(), value);
                         }
                     }
                 }
@@ -439,6 +439,13 @@ pub(crate) fn release_held(all: bool) {
 pub(crate) fn before_sync() {
     if behind::on() {
         behind::drain();
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn wait_before_framegen() {
+    if behind::on() {
+        behind::wait_before_framegen();
     }
 }
 
@@ -566,6 +573,12 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    execute_with_token(this, count, lists, None);
+}
+
+fn execute_with_token(this: This, count: u32, lists: *const This, token: Option<u64>) {
+    #[cfg(not(windows))]
+    let _ = token;
     if lists.is_null() {
         return;
     }
@@ -576,6 +589,9 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if let Some(host) = crate::host::host() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
+        if let Some(token) = token && crate::framegen::requested() {
+            crate::framegen::bind_submission(lists, token);
+        }
         if behind::on() && !this.is_null() {
             behind::submit(this, lists);
             return;
@@ -688,9 +704,9 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
     crate::resource::is_resource(resource).then_some(resource)
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
-/// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
-extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
-    execute(this, count, lists);
+/// token, flags)`. Frame generation uses the token to match the next present.
+extern "system" fn execute_x(this: This, count: u32, lists: *const This, token: u64, _flags: u32) {
+    execute_with_token(this, count, lists, Some(token));
 }
 /// Signal with sync settings for the top and bottom of the pipe; our
 /// submissions are complete when they return, so it signals at once.
@@ -717,13 +733,13 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     // A queue that waits signals after what it holds.
     #[cfg(windows)]
-    if hold(this, || Held::Signal(fence as usize, value)) {
+    if hold(this, || Held::Signal(crate::fence::FenceRef::hold(fence), value)) {
         return S_OK;
     }
     // Behind the submissions sent to the card and not waited for: the
     // fence is set when they are settled.
     #[cfg(windows)]
-    if crate::host::late_signal(fence as usize, value) {
+    if crate::host::late_signal(fence, value) {
         return S_OK;
     }
     let _ = this;
@@ -761,7 +777,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let mut held = lock(&queue(this).held);
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
-                held.push(Held::Wait(fence as usize, value));
+                held.push(Held::Wait(crate::fence::FenceRef::hold(fence), value));
             }
             behind
         };
@@ -883,7 +899,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(windows, feature = "diagnostics"))]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -926,6 +942,13 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    #[cfg(windows)]
+    let token = if planes > 0 {
+        // SAFETY: a positive plane count supplies the first plane.
+        unsafe { plane_parameters.as_ref() }.map(|plane| plane.token)
+    } else {
+        None
+    };
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
@@ -987,7 +1010,7 @@ extern "system" fn present(
             })
         };
         let texture = base_res.and_then(take_copy);
-        let overlay = (planes > 1 && !plane_parameters.is_null())
+        let overlay = (planes > 1 && !plane_parameters.is_null() && crate::compose::on())
             .then(|| overlay_resource(plane_parameters))
             .flatten()
             .filter(|&over_res| base_res != Some(over_res))
@@ -997,7 +1020,7 @@ extern "system" fn present(
             this,
             texture.map(|(_, copy, state)| (copy, state)),
             overlay.map(|(_, copy, state)| (copy, state)),
-            Shown { frame, resource },
+            Shown { frame, resource, token },
         );
         called.end();
         #[cfg(feature = "diagnostics")]
@@ -1018,7 +1041,7 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let overlay = (planes > 1)
+        let overlay = (planes > 1 && crate::compose::on())
             .then(|| overlay_resource(plane_parameters))
             .flatten()
             .filter(|&over_res| over_res != resource)
@@ -1033,7 +1056,7 @@ extern "system" fn present(
             texture,
             state,
             overlay.as_ref().map(|(_, tex, st)| (*tex, *st)),
-            Shown { frame, resource: resource as usize },
+            Shown { frame, resource: resource as usize, token },
         );
         crate::resource::host_transition(resource, state);
         if let Some((over_res, _, over_state)) = overlay {
@@ -1059,6 +1082,18 @@ fn frame_ends() {
             behind::leave();
         }
     });
+    if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
+        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            crate::cores::settle();
+        }
+    }
+    if let Some(on) = crate::ab::pick("VICTORY_CACHE_CORES") {
+        static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+            crate::cores::settle();
+        }
+    }
 }
 
 /// The frame a present shows, and the title's resource it shows.
@@ -1067,6 +1102,7 @@ fn frame_ends() {
 struct Shown {
     frame: u64,
     resource: usize,
+    token: Option<u64>,
 }
 
 /// Shows `texture` (with optional `overlay` plane blended over it) in our window.
@@ -1080,7 +1116,7 @@ fn show_planes(
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present_planes(texture, state, overlay, what.frame);
+    let shown = host.present_planes(texture, state, overlay, what.frame, what.token);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
@@ -1335,7 +1371,7 @@ mod tests {
 
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
-        let (start, end) = (0xd0419_6698, 0xd0419_6690);
+        let (start, end) = (0xd_0419_6698, 0xd_0419_6690);
         assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
         assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
         assert_eq!(as_loaded(5, start, 100), 1);

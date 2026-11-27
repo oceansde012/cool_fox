@@ -22,6 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -56,7 +57,7 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
         .any(|s| s.stage == "compute" && s.container.windows(name.len()).any(|w| w == name))
 }
 
-fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
+fn left_out(shaders: &[Arc<Shader>], skip_hashes: &[String]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
         let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
@@ -80,6 +81,9 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     });
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
+    }
+    if super::skipped_in_list(shaders, skip_hashes).is_some() {
+        return Some("skipped by VICTORY_SKIP_PIPELINES");
     }
     None
 }
@@ -108,6 +112,14 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+        Self::new_with_skip_hashes(shaders, graphics, super::skip_hashes())
+    }
+
+    fn new_with_skip_hashes(
+        shaders: Vec<Arc<Shader>>,
+        graphics: Option<Box<GraphicsState>>,
+        skip_hashes: &[String],
+    ) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
             key.update(s.stage.as_bytes());
@@ -118,7 +130,7 @@ impl Pending {
         let screen = (graphics.as_ref().is_some_and(|g| g.screen_pass())
             && shaders.iter().all(|s| s.stage != "mesh"))
             || scene_input;
-        let left_out = left_out(&shaders);
+        let left_out = left_out(&shaders, skip_hashes);
         Pending {
             screen,
             scene_input,
@@ -138,11 +150,22 @@ impl Pending {
     }
 
     fn make(&self) {
-        self.made.get_or_init(|| {
+        self.make_with(|| {
+            let _building = crate::timeline::span("pipeline: build a host pipeline");
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
+        });
+    }
+
+    fn make_with(&self, build: impl FnOnce() -> Option<HostPipeline>) {
+        self.made.get_or_init(|| match catch_unwind(AssertUnwindSafe(build)) {
+            Ok(pipeline) => pipeline,
+            Err(_) => {
+                tracing::warn!(key = self.key, shaders = ?self.shaders, "host pipeline build panicked");
+                None
+            }
         });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -150,13 +173,13 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Reports why a host pipeline was left out, is pending, or failed to build.
+/// Returns `None` when the host pipeline is ready.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(p.left_out.unwrap_or("being made").into()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -298,6 +321,7 @@ fn wait(p: &Pending, frame: u64) {
     if left.is_zero() {
         return;
     }
+    let waiting = crate::timeline::span("pipeline: first use waits for a host pipeline");
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -310,6 +334,7 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    waiting.end();
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
             ms = waited.as_millis() as u64,
@@ -501,6 +526,7 @@ fn workers() -> bool {
             let screens_only = i >= workers;
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
+                .stack_size(victory_shader::emit::PIPELINE_STACK)
                 .spawn(move || {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
@@ -558,6 +584,42 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panicking_pipeline_is_refused_and_the_worker_continues() {
+        let failed = Arc::new(Pending::new(Vec::new(), None));
+        let next = Arc::new(Pending::new(Vec::new(), None));
+        let failed_job = Arc::clone(&failed);
+        let next_job = Arc::clone(&next);
+        std::thread::spawn(move || {
+            failed_job.make_with(|| panic!("synthetic pipeline build panic"));
+            next_job.make_with(|| None);
+        })
+        .join()
+        .expect("the pipeline worker should survive");
+
+        assert!(matches!(failed.made.get(), Some(None)));
+        assert!(matches!(next.made.get(), Some(None)));
+        let mut rebuilt = false;
+        failed.make_with(|| {
+            rebuilt = true;
+            None
+        });
+        assert!(!rebuilt);
+    }
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn missing_distinguishes_omitted_and_pending_pipelines() {
+        let reason = "ray activation shader without BVH, left out";
+        let mut omitted = Pending::new(Vec::new(), None);
+        omitted.left_out = Some(reason);
+        assert_eq!(missing(&omitted).as_deref(), Some(reason));
+
+        let pending = Pending::new(Vec::new(), None);
+        pending.queue_state.store(MAKING, Ordering::Relaxed);
+        assert_eq!(missing(&pending).as_deref(), Some("being made"));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
@@ -659,5 +721,50 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn skipped_hash_leaves_pipeline_unqueued_and_unmatched_queues_normally() {
+        let shader = |hash: &str| {
+            Arc::new(Shader {
+                stage: "compute",
+                hash: hash.to_owned(),
+                container: Vec::new(),
+                ambient: None,
+                probe: None,
+                translated: OnceLock::from(None),
+            })
+        };
+        let skips = super::super::parse_skip_hashes("32ed072b9f845048");
+
+        let skipped = Arc::new(Pending::new_with_skip_hashes(
+            vec![shader("32ed072b9f845048")],
+            None,
+            &skips,
+        ));
+        assert_eq!(skipped.left_out, Some("skipped by VICTORY_SKIP_PIPELINES"));
+        early(&skipped);
+        assert!(ready(&skipped).is_none());
+        assert_eq!(skipped.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        assert!(skipped.made.get().is_none());
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(
+            missing(&skipped).as_deref(),
+            Some("skipped by VICTORY_SKIP_PIPELINES")
+        );
+
+        let normal = Arc::new(Pending::new_with_skip_hashes(
+            vec![shader("0011223344556677")],
+            None,
+            &skips,
+        ));
+        assert_eq!(normal.left_out, None);
+        assert!(ready(&normal).is_none());
+        assert_ne!(normal.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        let started = Instant::now();
+        while normal.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::yield_now();
+        }
+        assert!(matches!(normal.made.get(), Some(None)));
     }
 }

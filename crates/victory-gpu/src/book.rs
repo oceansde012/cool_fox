@@ -242,9 +242,21 @@ fn viewable(format: i32) -> Option<i32> {
     })
 }
 
+/// The address of `texture` as its descriptor has it (its first level's),
+/// if the book is kept.
+pub(crate) fn address(texture: &ID3D12Resource) -> Option<u64> {
+    if !on() {
+        return None;
+    }
+    // SAFETY: a live resource.
+    let desc = unsafe { texture.GetDesc() };
+    texture_address(texture, &desc)
+}
+
 /// The address of a texture: the base its descriptor has.
 fn texture_address(texture: &ID3D12Resource, desc: &D3D12_RESOURCE_DESC) -> Option<u64> {
-    struct Slot(ID3D12DescriptorHeap, usize);
+    // The heap is held, not read: it keeps the slot's descriptors alive.
+    struct Slot(#[allow(dead_code)] ID3D12DescriptorHeap, usize);
     // SAFETY: a descriptor heap, used under the lock.
     unsafe impl Send for Slot {}
     static SLOT: Mutex<Option<Slot>> = Mutex::new(None);
@@ -701,7 +713,7 @@ mod tests {
             ..Default::default()
         };
         // SAFETY: a valid description.
-        let texture = unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON) };
+        let texture = unsafe { crate::pool::texture(&host.device, &desc, D3D12_RESOURCE_STATE_COMMON, true) };
         if let Some(texture) = texture {
             let at = texture_address(&texture, &desc);
             println!("address {at:x?}");

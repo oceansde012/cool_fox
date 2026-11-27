@@ -98,8 +98,10 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
         // the loader maps the copy away from its preferred base (Wine always
         // does for DYNAMIC_BASE images), and the loader then reads callbacks
         // from there. Make that entry a no-op.
-        let field_rva = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
-        for (entry, target) in dir64_relocations(&bytes, &info) {
+        let field_rva = tls.directory_rva
+            .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+            .ok_or(PrepareError::Patch("TLS callback field RVA overflow"))?;
+        for (entry, target) in dir64_relocations(&bytes, &info)? {
             if target == field_rva {
                 write_u16(&mut bytes, entry, 0)?; // IMAGE_REL_BASED_ABSOLUTE
             }
@@ -117,43 +119,69 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
 /// Every `IMAGE_REL_BASED_DIR64` base relocation: (file offset of its entry,
-/// RVA it patches). Empty if the image has no readable relocation table.
-fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
+/// RVA it patches). Reject malformed tables rather than returning partial fixups.
+fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Result<Vec<(usize, u32)>, PrepareError> {
+    let invalid = || PrepareError::Patch("invalid base relocation directory");
+    let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
+        return Ok(Vec::new());
+    };
+    let rva = layout::read_u32(bytes, d).ok_or_else(invalid)?;
+    let size = layout::read_u32(bytes, d + 4).ok_or_else(invalid)?;
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    if rva == 0 || rva.checked_add(size).is_none() {
+        return Err(invalid());
+    }
+    let start = info.rva_to_file_offset(rva).ok_or_else(invalid)? as usize;
+    let backed = info.sections.iter().any(|s| {
+        let Some(delta) = rva.checked_sub(s.rva) else {
+            return false;
+        };
+        let limit = if s.virtual_size == 0 {
+            s.file_size
+        } else {
+            s.virtual_size.min(s.file_size)
+        };
+        s.file_offset.checked_add(delta) == Some(start as u32)
+            && delta.checked_add(size).is_some_and(|end| end <= limit)
+    });
+    if !backed {
+        return Err(invalid());
+    }
+    let end = start.checked_add(size as usize).ok_or_else(invalid)?;
+    let table = bytes.get(start..end).ok_or_else(invalid)?;
+    let mut entries = parse_dir64_blocks(table)?;
+    for (offset, _) in &mut entries {
+        *offset += start;
+    }
+    Ok(entries)
+}
+
+fn parse_dir64_blocks(mut table: &[u8]) -> Result<Vec<(usize, u32)>, PrepareError> {
     const DIR64: u16 = 10;
     let mut out = Vec::new();
-    let Some(d) = layout::data_directory_offset(bytes, dir::BASERELOC) else {
-        return out;
-    };
-    let (Some(rva), Some(size)) = (layout::read_u32(bytes, d), layout::read_u32(bytes, d + 4))
-    else {
-        return out;
-    };
-    let Some(start) = info.rva_to_file_offset(rva).filter(|_| size != 0) else {
-        return out;
-    };
-    let (mut at, end) = (start as usize, start as usize + size as usize);
-    while at + 8 <= end {
-        let (Some(page), Some(block)) =
-            (layout::read_u32(bytes, at), layout::read_u32(bytes, at + 4))
-        else {
-            break;
-        };
-        let block = block as usize;
-        if block < 8 || at + block > end {
-            break;
+    let mut at = 0;
+    while !table.is_empty() {
+        let page = layout::read_u32(table, 0)
+            .ok_or(PrepareError::Patch("truncated base relocation header"))?;
+        let block = layout::read_u32(table, 4)
+            .ok_or(PrepareError::Patch("truncated base relocation header"))? as usize;
+        if block < 8 || !block.is_multiple_of(2) || block > table.len() {
+            return Err(PrepareError::Patch("invalid base relocation block size"));
         }
-        for entry in (at + 8..at + block).step_by(2) {
-            let Some(e) = bytes.get(entry..entry + 2) else {
-                break;
-            };
-            let e = u16::from_le_bytes([e[0], e[1]]);
-            if e >> 12 == DIR64 {
-                out.push((entry, page + u32::from(e & 0xFFF)));
+        for (i, entry) in table[8..block].chunks_exact(2).enumerate() {
+            let entry = u16::from_le_bytes([entry[0], entry[1]]);
+            if entry >> 12 == DIR64 {
+                let target = page.checked_add(u32::from(entry & 0xfff))
+                    .ok_or(PrepareError::Patch("base relocation target RVA overflow"))?;
+                out.push((at + 8 + i * 2, target));
             }
         }
         at += block;
+        table = &table[block..];
     }
-    out
+    Ok(out)
 }
 
 fn write_u16(bytes: &mut [u8], at: usize, v: u16) -> Result<(), PrepareError> {
@@ -194,6 +222,7 @@ mod tests {
             let field = tls.directory_rva + layout::TLS64_ADDRESS_OF_CALLBACKS as u32;
             assert!(
                 dir64_relocations(&prepared.bytes, &patched)
+                    .unwrap()
                     .iter()
                     .all(|&(_, target)| target != field),
                 "the cleared callback pointer must not be relocated"
@@ -271,6 +300,112 @@ mod tests {
             assigned, 0,
             "the process executable already owns TLS slot zero"
         );
+    }
+
+    fn relocation_block(page: u32, size: u32, entries: &[u16]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&page.to_le_bytes());
+        bytes.extend_from_slice(&size.to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn relocation_blocks_keep_dir64_offsets() {
+        let mut bytes = relocation_block(0x1000, 12, &[0xa010, 0]);
+        bytes.extend(relocation_block(0x2000, 12, &[0xa020, 0]));
+        assert_eq!(
+            parse_dir64_blocks(&bytes).unwrap(),
+            vec![(8, 0x1010), (20, 0x2020)]
+        );
+        assert!(parse_dir64_blocks(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_relocation_blocks_are_rejected() {
+        for size in [0, 7, 9, 14, u32::MAX] {
+            assert!(parse_dir64_blocks(&relocation_block(0x1000, size, &[0xa010, 0])).is_err());
+        }
+        let block = relocation_block(0x1000, 12, &[0xa010, 0]);
+        for len in 1..block.len() {
+            assert!(parse_dir64_blocks(&block[..len]).is_err());
+        }
+        assert!(parse_dir64_blocks(&relocation_block(u32::MAX, 12, &[0xa001, 0])).is_err());
+        let mut bytes = block;
+        bytes.extend([0; 4]);
+        assert!(parse_dir64_blocks(&bytes).is_err());
+    }
+
+    fn relocation_directory_fixture(
+        file_size: u32,
+        virtual_size: u32,
+        directory_offset: u32,
+    ) -> (Vec<u8>, ImageInfo, usize) {
+        let mut bytes = vec![0u8; 0x200 + file_size as usize];
+        bytes[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        let opt = 0x58;
+        write_u32(&mut bytes, opt + layout::OPT_NUMBER_OF_RVA_AND_SIZES, 16).unwrap();
+        let d = layout::data_directory_offset(&bytes, dir::BASERELOC).unwrap();
+        write_u32(&mut bytes, d, 0x1000 + directory_offset).unwrap();
+        write_u32(&mut bytes, d + 4, 12).unwrap();
+        let start = 0x200 + directory_offset as usize;
+        bytes[start..start + 12].copy_from_slice(&relocation_block(0x1000, 12, &[0xa008, 0]));
+        let info = ImageInfo {
+            machine: 0x8664,
+            characteristics: 0,
+            timestamp: 0,
+            subsystem: 0,
+            dll_characteristics: 0,
+            image_base: 0,
+            size_of_image: 0x2000,
+            entry_rva: 0,
+            stack_reserve: 0,
+            stack_commit: 0,
+            sections: vec![victory_pe::SectionInfo {
+                name: ".reloc".into(),
+                rva: 0x1000,
+                virtual_size,
+                file_offset: 0x200,
+                file_size,
+                characteristics: 0,
+            }],
+            imports: Vec::new(),
+            delay_imports: Vec::new(),
+            exports: Vec::new(),
+            tls: None,
+            has_relocations: true,
+            has_exception_table: false,
+            has_load_config: false,
+            codeview: None,
+        };
+        (bytes, info, d)
+    }
+
+    #[test]
+    fn relocation_directory_may_end_at_the_file_backed_section_boundary() {
+        // The final ABSOLUTE entry pads the block to 12 bytes. Exercise both
+        // a section with raw file padding and one whose data ends at EOF.
+        for (virtual_size, entry_offset) in [(0x1fc, 0x3f8), (0x200, 0x3fc)] {
+            let (bytes, info, _) =
+                relocation_directory_fixture(0x200, virtual_size, virtual_size - 12);
+            assert_eq!(
+                dir64_relocations(&bytes, &info).unwrap(),
+                vec![(entry_offset, 0x1008)]
+            );
+        }
+    }
+
+    #[test]
+    fn relocation_directory_must_be_file_backed() {
+        let (mut bytes, info, d) = relocation_directory_fixture(16, 16, 0);
+        assert_eq!(dir64_relocations(&bytes, &info).unwrap(), vec![(0x208, 0x1008)]);
+        assert!(dir64_relocations(&bytes[..0x20b], &info).is_err());
+        write_u32(&mut bytes, d + 4, 20).unwrap();
+        assert!(dir64_relocations(&bytes, &info).is_err());
+        write_u32(&mut bytes, d, u32::MAX - 3).unwrap();
+        assert!(dir64_relocations(&bytes, &info).is_err());
     }
 
     #[test]

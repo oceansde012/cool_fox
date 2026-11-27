@@ -27,6 +27,8 @@ const ALLOWED_NAMES: &[&str] = &[
     "LICENSE-MIT",
     "LICENSE-APACHE",
 ];
+// The benchmark documentation still goes through every content check below.
+const ALLOWED_DOCUMENTATION: &[&str] = &["docs/.nojekyll", "docs/index.html"];
 
 /// Paths explicitly exempted, with a reason. Keep this empty if at all possible.
 const EXCEPTIONS: &[(&str, &str)] = &[(
@@ -89,7 +91,7 @@ pub fn run(root: &Path, staged: bool) -> Result<()> {
     )
 }
 
-fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
+pub(crate) fn list_files(root: &Path, staged: bool) -> Result<Vec<String>> {
     let git = |args: &[&str]| -> Result<Option<Vec<String>>> {
         let out = Command::new("git")
             .args(args)
@@ -149,6 +151,7 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     let name = path.rsplit('/').next().unwrap_or(path);
     let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
     let allowed = ALLOWED_NAMES.contains(&name)
+        || ALLOWED_DOCUMENTATION.contains(&path)
         || ext
             .as_deref()
             .is_some_and(|e| ALLOWED_EXTENSIONS.contains(&e));
@@ -223,7 +226,7 @@ fn longest_hex_literal_run(content: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::check;
+    use super::{MAX_FILE_SIZE, check};
 
     /// Enforces the policy wherever tests run, even in clones without the hook.
     #[test]
@@ -239,6 +242,17 @@ mod tests {
     }
 
     #[test]
+    fn documentation_paths_keep_the_content_checks() {
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg"/>"#;
+        for path in super::ALLOWED_DOCUMENTATION {
+            assert!(check(path, b"original documentation").is_empty());
+            assert!(!check(path, b"DDS \0").is_empty());
+        }
+        assert!(!check("docs/charts/profile-frame-rate.svg", svg).is_empty());
+        assert!(!check("docs/unrelated.js", b"let data = 0;").is_empty());
+    }
+
+    #[test]
     fn rejects_game_like_files() {
         assert!(!check("assets/tex.dds", b"DDS \x7c\0\0\0").is_empty());
         assert!(
@@ -249,9 +263,16 @@ mod tests {
             !check("data.bin", b"hello").is_empty(),
             "extension not allowed"
         );
-        assert!(
-            !check("a.rs", &vec![b'a'; 600 * 1024]).is_empty(),
-            "too big"
+    }
+
+    #[test]
+    fn file_size_is_checked_independently_of_embedded_data() {
+        let mut content = vec![b' '; MAX_FILE_SIZE];
+        assert!(check("a.rs", &content).is_empty());
+        content.push(b' ');
+        assert_eq!(
+            check("a.rs", &content),
+            [format!("{} bytes exceeds the {MAX_FILE_SIZE}-byte limit", content.len())]
         );
     }
 

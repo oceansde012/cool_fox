@@ -1,12 +1,14 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events waiting for it. The title and our
+//! queues can both signal them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
+#[cfg(not(windows))]
+use crate::object::E_NOTIMPL;
+use crate::object::{self, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 pub(crate) const FENCE_IIDS: [Iid; 5] = [
@@ -42,6 +44,37 @@ struct Fence {
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
     unsafe { &*this.cast::<Fence>() }
+}
+
+/// Keeps a fence alive until the queue finishes using it.
+#[cfg(windows)]
+#[derive(PartialEq, Eq)]
+pub(crate) struct FenceRef(usize);
+
+#[cfg(windows)]
+impl FenceRef {
+    pub(crate) fn hold(this: This) -> Self {
+        object::add_ref(this);
+        Self(this as usize)
+    }
+
+    pub(crate) fn as_this(&self) -> This {
+        self.0 as This
+    }
+}
+
+#[cfg(windows)]
+impl Clone for FenceRef {
+    fn clone(&self) -> Self {
+        Self::hold(self.as_this())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.as_this());
+    }
 }
 
 pub(crate) extern "system" fn create(
@@ -104,53 +137,61 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::timeline::told("an event asked for", this as usize, value);
     if event.is_null() {
-        // With submissions sent to the card and not waited for
-        // (`crate::host::late`) the signal may be behind them: they are
-        // settled, which sets it.
+        drop(waiters);
         #[cfg(windows)]
-        if crate::host::late() {
-            drop(waiters);
-            crate::queue::before_sync();
-            crate::host::settle_for_fence();
-            if fence.value.load(Ordering::Acquire) >= value {
-                return S_OK;
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
-            loop {
-                let current = fence.value.load(Ordering::Acquire);
-                if current >= value {
-                    return S_OK;
-                }
-                let now = std::time::Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                let ms = (deadline - now).as_millis().min(10) as u32;
-                // SAFETY: wait on the atomic u64 until woken by WakeByAddressAll or timeout.
-                unsafe {
-                    windows_sys::Win32::System::Threading::WaitOnAddress(
-                        (&raw const fence.value).cast(),
-                        (&raw const current).cast(),
-                        size_of::<u64>(),
-                        ms.max(1),
-                    );
-                }
-                crate::queue::release_held(false);
-            }
-            if fence.value.load(Ordering::Acquire) >= value {
-                return S_OK;
-            }
-            tracing::warn!(value, "blocking fence wait timed out");
-            return E_NOTIMPL;
-        }
-        // shortcut: a null event means "block until reached"; nothing can
-        // reach it while no GPU work runs, so fail instead of hanging.
-        tracing::warn!(value, "blocking fence wait not implemented");
+        return wait_for_value(fence, value);
+        #[cfg(not(windows))]
         return E_NOTIMPL;
     }
     waiters.push((value, event as usize));
     S_OK
 }
+
+#[cfg(windows)]
+fn wait_for_value(fence: &Fence, value: u64) -> HRESULT {
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::System::Threading::WaitOnAddress;
+
+    // A queued signal can be behind GPU work whose completion has been deferred.
+    if crate::host::late() {
+        crate::queue::before_sync();
+        crate::host::settle_for_fence();
+    }
+    const REPORT_EVERY: Duration = Duration::from_secs(2);
+    let mut next_report = Instant::now() + REPORT_EVERY;
+    loop {
+        let current = fence.value.load(Ordering::Acquire);
+        if current >= value {
+            return S_OK;
+        }
+        let now = Instant::now();
+        if now >= next_report {
+            // SAFETY: querying a live host device for its removal reason.
+            if let Some(host) = crate::host::made_host()
+                && let Err(error) = unsafe { host.device.GetDeviceRemovedReason() }
+            {
+                return error.code().0;
+            }
+            tracing::debug!(current, value, "waiting for a fence value");
+            next_report = now + REPORT_EVERY;
+        }
+        // Raw writes to the fence's GPU address can change it without waking
+        // any waiters, so reread the value even when there is no notification.
+        // SAFETY: both pointers refer to aligned, live u64 values.
+        unsafe {
+            WaitOnAddress(
+                (&raw const fence.value).cast(),
+                (&raw const current).cast(),
+                size_of::<u64>(),
+                10,
+            );
+        }
+        if fence.value.load(Ordering::Acquire) < value {
+            crate::queue::release_held(false);
+        }
+    }
+}
+
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
@@ -211,6 +252,19 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn queued_references_keep_the_fence_alive_after_release() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let queued = FenceRef::hold(f);
+        let waiting = queued.clone();
+        assert_eq!(release(f), 2);
+        drop(waiting);
+        set(queued.as_this(), 5);
+        assert_eq!(completed(queued.as_this()), 5);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn signals_set_waiting_events() {
         use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
         use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -232,7 +286,7 @@ mod tests {
         assert_eq!(wait(f, 5, event), S_OK, "already reached");
         // SAFETY: as above.
         assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_OBJECT_0);
-        assert_eq!(wait(f, 9, std::ptr::null_mut()), E_NOTIMPL);
+        assert_eq!(wait(f, 5, std::ptr::null_mut()), S_OK);
         // The title reads the value at the fence's address.
         let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
         // SAFETY: the fence's value.
@@ -240,6 +294,24 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn null_event_waits_for_a_signal_past_the_old_timeout() {
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 1, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        let pending = FenceRef::hold(f);
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                signal(pending.as_this(), 5);
+            });
+            let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+            assert_eq!(wait(f, 5, std::ptr::null_mut()), S_OK);
+        });
+        assert_eq!(completed(f), 5);
+        assert_eq!(release(f), 0);
     }
 
     #[test]

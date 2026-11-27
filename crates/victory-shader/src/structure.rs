@@ -1444,6 +1444,43 @@ mod tests {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
     }
 
+    /// A pixel program that writes only through atomics ends with `exp null
+    /// done vm`, after a loop that leaves through `s_andn2 X, X, exec` and its
+    /// SCC on its own exit mask. Taken for a discard's "no live lane is left"
+    /// test, the back edge would be taken by every lane, which then runs the
+    /// loop to its limit (upstream #2306 measured 203 ms a draw on an RTX
+    /// 5090). The back edge is taken by the lanes not done.
+    #[test]
+    fn a_loop_exit_to_a_null_export_keeps_its_exit_test() {
+        let words = [
+            0xBE89_037E, // s_mov_b32 s9, exec_lo
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0xBF82_0001, // s_branch -> body
+            0xBEFE_0308, // header: s_mov_b32 exec_lo, s8
+            0x4A02_0281, // body: v_add_nc_u32 v1, 1, v1
+            0x7DA2_0283, // v_cmpx_lt_u32 exec, 3, v1 (the lanes done)
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF85_FFFB, // s_cbranch_scc1 -> header
+            0xBEFE_0309, // s_mov_b32 exec_lo, s9
+            0xF800_1890, // exp null done vm
+            0x0000_0000,
+            S_ENDPGM,
+        ];
+        let p = build(&words, false);
+        let s = structure(&p).unwrap();
+        let back = p
+            .blocks
+            .iter()
+            .position(|b| b.insts.last().is_some_and(|i| i.name() == "s_cbranch_scc1"))
+            .unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[back] else {
+            panic!("{:?}", s.exits)
+        };
+        assert_ne!(when, Bool::TRUE);
+        assert_ne!(when, Bool::FALSE);
+    }
+
     /// The search of [`Bools::meet`] with every case split made anew, as it
     /// was before [`Meets`].
     fn meet_anew(b: &Bools, mut all: Vec<(Bool, bool)>, budget: &mut usize) -> bool {

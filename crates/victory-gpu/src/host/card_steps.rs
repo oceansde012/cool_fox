@@ -148,16 +148,12 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
                         copy: false,
                     }));
                 }
-                for &i in &flight.order {
-                    for &(_, at, [row, rows, pitch]) in &flight.lists[i].host().deferred().backs {
-                        out.push(Writer {
-                            shadow: None,
-                            from: at,
-                            to: at + rows.saturating_sub(1) * pitch + row,
-                            copy: false,
-                        });
-                    }
-                }
+                out.extend(flight.texture_back_ranges.iter().map(|&(from, to)| Writer {
+                    shadow: None,
+                    from,
+                    to,
+                    copy: false,
+                }));
                 out.extend(flight.own.iter().flat_map(Taken::copied));
             }
             Late::Write(at, _, bytes) => out.push(Writer {
@@ -452,7 +448,7 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     from: *at,
                     to: *at + *len,
                 },
-                Step::Run(_) => Does::Run,
+                Step::RawCopy { .. } => Does::Run,
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
@@ -668,8 +664,11 @@ impl Host {
             }
             (line.written.clone(), copies(&line))
         };
+        let looked = crate::timeline::span("steps on the card: whether in the way");
         blocked_by(&written, runs, false)?;
-        let taken = if copied_read(&copies, runs) {
+        let read = copied_read(&copies, runs);
+        looked.end();
+        let taken = if read {
             Err("a copy done on the card is read through another host copy")
         } else {
             self.take_steps(&written, runs)
@@ -915,6 +914,18 @@ pub(super) fn log(frames: f64) {
     );
     #[cfg(feature = "diagnostics")]
     {
+        let r: Vec<f64> = place::READERS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+        if r.iter().any(|&n| n > 0.0) {
+            tracing::info!(
+                "what a copy at its place writes, found read on the CPU behind it, per frame (looks, all threads): {:.2} by \
+                 another such copy, {:.2} by a buffer copy, {:.2} by a fill, {:.2} by a texture, {:.2} by a step of ours",
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4]
+            );
+        }
         let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
         let mut noted: Vec<_> = noted.into_iter().collect();
         noted.sort_unstable_by_key(|(_, e)| std::cmp::Reverse(e.0));
@@ -1296,7 +1307,7 @@ mod tests {
             let c = host.new_list().unwrap();
             c.defer_copy((start + 1_200_000) as *mut u8, (start + HALF + 100) as *const u8, 1500);
             c.close();
-            let number = host.execute_own(&c);
+            let (number, _) = host.execute_own(&c);
             settle_now(WHY_SYNC);
             assert!(FINISHED.load(Ordering::Acquire) >= number);
             let wanted: Vec<u8> = (0..2000)
