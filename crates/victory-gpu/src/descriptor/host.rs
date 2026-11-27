@@ -851,32 +851,57 @@ pub(crate) fn remapped(at: usize, len: usize) {
     }
 }
 
-/// Queues a changed range and returns the number of entries compacted.
+/// `VICTORY_TEXTURE_CHANGE_COMPACT=1`: a full queue of changed ranges is
+/// compacted, so the next texture pass still finds every change (Vice-Tay
+/// #137, fixes stale textures). Unset: a full queue is dropped, as before.
+fn texture_change_compact() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CHANGE_COMPACT").is_some_and(|v| v == "1"))
+}
+
+/// Queues a changed range and returns the number of entries compacted
+/// (or dropped, with the switch off).
 fn remember_texture_change(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64) -> usize {
+    remember_texture_change_as(ranges, start, end, texture_change_compact())
+}
+
+fn remember_texture_change_as(ranges: &mut Vec<(u64, u64)>, start: u64, end: u64, compact: bool) -> usize {
     if let Some(last) = ranges.last_mut()
         && last.1 == start
     {
         last.1 = end;
         return 0;
     }
-    let mut compacted = 0;
-    if ranges.len() >= MAX_PENDING_TEXTURE_CHANGES {
-        compacted = ranges.len();
-        join(ranges);
-        if ranges.len() > MAX_PENDING_TEXTURE_CHANGES / 2 {
-            // Cover pairs of neighboring ranges so the next texture pass
-            // can still find every change without growing the queue.
-            let pairs = ranges.len().div_ceil(2);
-            for pair in 0..pairs {
-                let first = 2 * pair;
-                let last = (first + 1).min(ranges.len() - 1);
-                ranges[pair] = (ranges[first].0, ranges[last].1);
+    if compact {
+        let mut compacted = 0;
+        if ranges.len() >= MAX_PENDING_TEXTURE_CHANGES {
+            compacted = ranges.len();
+            join(ranges);
+            if ranges.len() > MAX_PENDING_TEXTURE_CHANGES / 2 {
+                // Cover pairs of neighboring ranges so the next texture pass
+                // can still find every change without growing the queue.
+                let pairs = ranges.len().div_ceil(2);
+                for pair in 0..pairs {
+                    let first = 2 * pair;
+                    let last = (first + 1).min(ranges.len() - 1);
+                    ranges[pair] = (ranges[first].0, ranges[last].1);
+                }
+                ranges.truncate(pairs);
             }
-            ranges.truncate(pairs);
         }
+        ranges.push((start, end));
+        compacted
+    } else if ranges.len() >= MAX_PENDING_TEXTURE_CHANGES {
+        // No pass runs (no shader that picks textures by index is bound):
+        // the slots there are looked at when they are due, as before.
+        let dropped = ranges.len();
+        ranges.clear();
+        ranges.push((start, end));
+        dropped
+    } else {
+        ranges.push((start, end));
+        0
     }
-    ranges.push((start, end));
-    compacted
 }
 
 /// Ranges of memory, those that touch made one (DexNom/VIctory 921d8d3b:
@@ -5595,7 +5620,7 @@ mod tests {
         let mut pending = Vec::new();
         let mut compacted = 0;
         for i in (0..count).rev() {
-            compacted += remember_texture_change(&mut pending, i * 4, i * 4 + 1);
+            compacted += remember_texture_change_as(&mut pending, i * 4, i * 4 + 1, true);
         }
         assert_eq!(compacted, MAX_PENDING_TEXTURE_CHANGES);
         assert!(pending.len() <= MAX_PENDING_TEXTURE_CHANGES / 2 + 3);
@@ -5606,6 +5631,18 @@ mod tests {
             let at = pending.partition_point(|&(lo, _)| lo <= start);
             assert!(at > 0 && pending[at - 1].1 > start, "the change at {start} was lost");
         }
+    }
+
+    #[test]
+    fn pending_texture_changes_clear_a_full_queue_when_compact_is_off() {
+        let mut pending = Vec::new();
+        let mut dropped = 0;
+        for i in 0..=MAX_PENDING_TEXTURE_CHANGES as u64 {
+            dropped += remember_texture_change_as(&mut pending, i * 4, i * 4 + 1, false);
+        }
+        assert_eq!(dropped, MAX_PENDING_TEXTURE_CHANGES);
+        let last = MAX_PENDING_TEXTURE_CHANGES as u64 * 4;
+        assert_eq!(pending, vec![(last, last + 1)]);
     }
 
     /// Memory the runtime maps under a slot's texture makes the slot due

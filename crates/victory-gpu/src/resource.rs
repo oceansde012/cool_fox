@@ -3801,6 +3801,7 @@ mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn alias_after_title_upload_copies_the_gpu_atlas() {
+        crate::texture::FORCE_ALIAS_AFTER_UPLOAD.store(true, std::sync::atomic::Ordering::Relaxed);
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Graphics::Direct3D12::*;
 
