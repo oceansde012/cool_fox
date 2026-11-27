@@ -286,21 +286,56 @@ pub fn builder_bounds() -> bool {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass but the last one below (63).
+/// - unset: the default base passes (63).
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one),
 ///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   (not on unless asked),
+///   128 extended algebraic/bitwise/shift/compare/select folds and canonical
+///   comparison reuse/facts (not on unless asked),
+///   256 alias-aware private-global forwarding, shared-memory load reuse, and
+///   overwritten-store elimination (not on unless asked),
+///   512 pure loop-invariant code motion for guaranteed loop blocks and
+///   in-bounds constant-table loads (not on unless asked),
+///   1024 adjacent and read-after-read redundant barrier elimination (not on
+///   unless asked),
+///   2048 speculative loop-invariant hoisting of non-trapping ALU and pure
+///   math out of conditional loop blocks (not on unless asked: `4095` is
+///   every pass).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.with(std::cell::Cell::get) {
+        return passes & bitcode::opt::ALL;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with `shader_opt()` overridden to `passes` on the current thread
+/// (tests only; restores the previous override on unwind).
+#[cfg(test)]
+pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SHADER_OPT.with(|c| c.set(self.0));
+        }
+    }
+    let prev = TEST_SHADER_OPT.with(|c| c.replace(Some(passes)));
+    let _guard = Reset(prev);
+    f()
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -1275,11 +1310,21 @@ mod tests {
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
         assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(all, 4095, "every pass including opt-in passes and WIDE");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("128")), super::bitcode::opt::EXT_FOLD);
+        assert_eq!(parse_shader_opt(Some("256")), super::bitcode::opt::MEM_FWD);
+        assert_eq!(parse_shader_opt(Some("512")), super::bitcode::opt::LICM);
+        assert_eq!(parse_shader_opt(Some("1024")), super::bitcode::opt::BARRIERS);
+        assert_eq!(parse_shader_opt(Some("2048")), super::bitcode::opt::SPEC_LICM);
+        assert_eq!(
+            parse_shader_opt(Some("4031")),
+            all & !super::bitcode::opt::WIDE
+        );
+        assert_eq!(parse_shader_opt(Some("4095")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
