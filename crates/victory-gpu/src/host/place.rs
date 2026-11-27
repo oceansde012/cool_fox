@@ -261,6 +261,24 @@ impl HostList {
         true
     }
 
+    /// Puts the first `len` bytes of `from` (a buffer the card reads) over
+    /// title memory at `dst` in its host copy `to`, at this place of the list,
+    /// as a shader's write: a clear of an unordered access view of a buffer.
+    pub(crate) fn place_fill(&self, to: &std::sync::Arc<Shadow>, dst: u64, len: u64, from: &ID3D12Resource) {
+        let Some(host) = host() else { return };
+        // What the title's CPU wrote around it so far goes first.
+        to.refresh(self, dst, len);
+        // SAFETY: an open list; live buffers (the list holds `from`), the
+        // range inside both.
+        unsafe {
+            wait_for_all(host, &self.list);
+            self.list.CopyBufferRegion(&to.buffer, to.offset(dst), from, 0, len);
+            wait_for_all(host, &self.list);
+        }
+        to.cleared(self, dst, len);
+        self.changed_something();
+    }
+
     /// For a copy of `[src, src + len)` into a texture: a buffer (readable by
     /// copies) that holds what shaders wrote there, at this place of the list.
     /// `None` where shaders do not write it.

@@ -3106,8 +3106,19 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
-        self.written.store(true, Ordering::Relaxed);
         self.writers.fetch_or(if WRITER_LANDS.get() { BY_OTHERS } else { BY_UNLANDED }, Ordering::Relaxed);
+        self.cleared(list, address, len);
+    }
+
+    /// [`Shadow::gpu_writes`] of a clear of a view of the copy: landed as any
+    /// write, but no writer of its own for [`Shadow::not_landed`]. Scratch
+    /// that only shaders `VICTORY_LAND_NOT` names write (FSR4's 21 MB block,
+    /// cleared once when the world begins) stays on the card after it.
+    pub(crate) fn cleared(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.place.is_some() {
+            return;
+        }
+        self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
     }
