@@ -2818,16 +2818,22 @@ pub(crate) fn let_go_idle() {
             return;
         }
         let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
-        let idle: Vec<(u64, u64)> = map
-            .iter()
-            .filter(|(_, s)| {
-                Arc::strong_count(s) == 1
-                    && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        idle.into_iter().filter_map(|key| map.remove(&key)).collect()
+        let idle = |s: &Arc<Shadow>| {
+            Arc::strong_count(s) == 1
+                && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                && crate::host::references(&s.buffer) == 1
+        };
+        let keys: Vec<_> = map.iter().filter(|(_, s)| idle(s)).map(|(key, _)| *key).collect();
+        if lookup_cache_enabled() && !keys.is_empty() {
+            lookup_tables_changed();
+            // Recheck holders after invalidation: a successful cache hit has
+            // upgraded its weak reference before checking the generation.
+            keys.into_iter().filter_map(|key| {
+                if map.get(&key).is_some_and(&idle) { map.remove(&key) } else { None }
+            }).collect()
+        } else {
+            keys.into_iter().filter_map(|key| map.remove(&key)).collect()
+        }
     };
     if !gone.is_empty() {
         let (went, bytes) = (gone.len(), gone.iter().map(|s| s.len).sum::<u64>());
@@ -4762,6 +4768,9 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
     let map = BUFFERS.write().unwrap_or_else(|e| e.into_inner());
     // What threads remember of it ([`FOUND`]) is of before.
     BUFFERS_CHANGED.fetch_add(1, Ordering::SeqCst);
+    if lookup_cache_enabled() {
+        lookup_tables_changed();
+    }
     map
 }
 
@@ -4824,13 +4833,17 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    if lookup_cache_enabled() {
+        lookup_tables_changed();
+    }
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
@@ -4859,6 +4872,9 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        if lookup_cache_enabled() {
+            lookup_tables_changed();
+        }
         let keys: Vec<(u64, u64)> = map
             .range((at.saturating_sub(WINDOW), 0)..(end, 0))
             .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
@@ -4930,7 +4946,116 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
     buffers_read().range(..=(address, usize::MAX)).rev().take(64).find(|(_, e)| e.end >= end).and_then(|(_, e)| e.shadow.clone())
 }
 
+// Removals are counted before and insertions after the change, under the
+// table write lock. Hits upgrade their weak reference and check again.
+static LOOKUP_TABLES_CHANGED: AtomicU64 = AtomicU64::new(0);
+
+fn lookup_tables_changed() {
+    LOOKUP_TABLES_CHANGED.fetch_add(1, Ordering::SeqCst);
+}
+
+const LOOKUP_CACHE_LIMIT: usize = 8192;
+type LookupCache = std::collections::HashMap<(u64, u64, bool), std::sync::Weak<Shadow>>;
+thread_local! {
+    static LOOKUP_CACHE: std::cell::RefCell<(u64, LookupCache)> = std::cell::RefCell::new((u64::MAX, LookupCache::new()));
+}
+
+fn lookup_cache_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("VICTORY_LOOKUP_CACHE").as_deref() == Ok("1"))
+}
+
+#[cfg(test)]
+mod lookup_cache_tests {
+    use super::*;
+
+    #[test]
+    fn registration_and_removal_invalidate_cached_answers() {
+        if !lookup_cache_enabled() {
+            return;
+        }
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let before = LOOKUP_TABLES_CHANGED.load(Ordering::SeqCst);
+        register(resource, start, 8);
+        let registered = LOOKUP_TABLES_CHANGED.load(Ordering::SeqCst);
+        assert_ne!(before, registered);
+        register(resource, start, 8);
+        let replaced = LOOKUP_TABLES_CHANGED.load(Ordering::SeqCst);
+        assert_ne!(registered, replaced);
+        unregister(resource, start);
+        assert_ne!(replaced, LOOKUP_TABLES_CHANGED.load(Ordering::SeqCst));
+    }
+
+    /// Exercise an actual remembered answer while the previous copy remains
+    /// alive: a weak reference alone cannot detect replacement in the table.
+    #[test]
+    fn cached_answer_is_not_reused_after_buffer_re_registration() {
+        if !lookup_cache_enabled() {
+            eprintln!("lookup-cache test skipped: VICTORY_LOOKUP_CACHE is not enabled");
+            return;
+        }
+        if host().is_none() {
+            eprintln!("lookup-cache test skipped: no D3D12 host device");
+            return;
+        }
+        let slot = Box::new([0u64; 8]);
+        let start = slot.as_ptr() as u64;
+        let resource = start as usize;
+        register(resource, start, 64);
+        let first = lookup(start, 8, false).expect("registered buffer has a host copy");
+        let cached = lookup(start, 8, false).expect("second lookup has a host copy");
+        assert!(Arc::ptr_eq(&first, &cached));
+        // Initial creation may invalidate the generation, so populate the
+        // cache after that creation, then verify the next hit is remembered.
+        let hit = lookup(start, 8, false).expect("cache hit has a host copy");
+        assert!(Arc::ptr_eq(&first, &hit));
+        LOOKUP_CACHE.with(|cache| assert!(cache.borrow().1.contains_key(&(start, 8, false))));
+        register(resource, start, 64);
+        let replacement = lookup(start, 8, false).expect("replacement has a host copy");
+        assert!(!Arc::ptr_eq(&first, &replacement), "a live stale copy must not be reused");
+        unregister(resource, start);
+        eprintln!("lookup-cache re-registration exercised on a D3D12 host device");
+    }
+}
+
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    if !lookup_cache_enabled() {
+        return lookup_tables(address, len, any);
+    }
+    let generation = LOOKUP_TABLES_CHANGED.load(Ordering::SeqCst);
+    let cached = LOOKUP_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != generation {
+            cache.1.clear();
+            cache.0 = generation;
+        }
+        cache.1.get(&(address, len, any)).and_then(std::sync::Weak::upgrade)
+    });
+    if let Some(shadow) = cached {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if LOOKUP_TABLES_CHANGED.load(Ordering::SeqCst) == generation {
+            if shadow.window {
+                note_window(&shadow, address, address.saturating_add(len.max(1)), len <= 1);
+            }
+            return Some(shadow);
+        }
+    }
+    let shadow = lookup_tables(address, len, any)?;
+    LOOKUP_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 == generation && LOOKUP_TABLES_CHANGED.load(Ordering::SeqCst) == generation {
+            if cache.1.len() >= LOOKUP_CACHE_LIMIT {
+                cache.1.clear();
+            }
+            cache.1.insert((address, len, any), Arc::downgrade(&shadow));
+        }
+    });
+    Some(shadow)
+}
+
+fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
@@ -5236,26 +5361,27 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
+fn note_window(shadow: &Shadow, address: u64, end: u64, unsized_ask: bool) {
+    // (Read first: the lines are shared by all recording threads.)
+    let now = crate::host::moment();
+    if shadow.used.load(Ordering::Relaxed) != now {
+        shadow.used.store(now, Ordering::Relaxed);
+    }
+    if shadow.asked[0].load(Ordering::Relaxed) > address {
+        shadow.asked[0].fetch_min(address, Ordering::Relaxed);
+    }
+    if shadow.asked[1].load(Ordering::Relaxed) < end {
+        shadow.asked[1].fetch_max(end, Ordering::Relaxed);
+    }
+    if unsized_ask {
+        shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    // Under the lock, with the handing out: see `let_go_idle`.
-    let note = |shadow: &Shadow| {
-        // (Read first: the lines are shared by all recording threads.)
-        let now = crate::host::moment();
-        if shadow.used.load(Ordering::Relaxed) != now {
-            shadow.used.store(now, Ordering::Relaxed);
-        }
-        if shadow.asked[0].load(Ordering::Relaxed) > address {
-            shadow.asked[0].fetch_min(address, Ordering::Relaxed);
-        }
-        if shadow.asked[1].load(Ordering::Relaxed) < end {
-            shadow.asked[1].fetch_max(end, Ordering::Relaxed);
-        }
-        if unsized_ask {
-            shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
-        }
-    };
+    let note = |shadow: &Shadow| note_window(shadow, address, end, unsized_ask);
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
@@ -5287,6 +5413,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        if lookup_cache_enabled() { lookup_tables_changed(); }
         return Some(shadow);
     }
     // One buffer in the card's memory, filled by the CPU through the bus.
@@ -5300,6 +5427,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
+        if lookup_cache_enabled() { lookup_tables_changed(); }
         return Some(shadow);
     }
     let (buffer, data) = host()?.shared_buffer(len)?;
@@ -5337,6 +5465,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
+    if lookup_cache_enabled() { lookup_tables_changed(); }
     Some(shadow)
 }
 
