@@ -69,6 +69,69 @@ pub(crate) fn skip_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP").is_some_and(|v| v == "1"))
 }
 
+/// Copies left on the card (`VICTORY_LAND_NOT=<lengths>`, hex, comma
+/// separated; unset: none): what shaders write in a host copy of one of these
+/// lengths is not fetched into title memory, except in the 64 KiB pieces the
+/// title has sent bytes up into within the last [`SENT_FRAMES`] frames
+/// ([`title_sent`]), which land as before. For memory only shaders use,
+/// which the title's code neither reads nor writes after it set it up (the
+/// title writes all of each at the load): the card's side is the one that
+/// counts, and the title's lists find it there. In this title the upscaler
+/// chain's 0x1412200 bytes (21 MB fetched a frame) and three buffers shaders
+/// fill (0x2d00000, 0x5265c0, 0x1cc000: 14 MB a frame; the first of them
+/// has a piece or two sent up now and then, which keep landing): n-ab-land,
+/// -3.0 and -2.6 ms a frame, -5.6 together, the same draws a frame.
+pub(crate) fn left_on_card(span: (u64, u64), offset: usize) -> bool {
+    listed(span.1)
+        && sent()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(span.0, (offset >> 16) as u32))
+            .is_none_or(|&at| crate::frame::current().saturating_sub(at) > SENT_FRAMES)
+}
+
+/// How long a piece of [`left_on_card`]'s copies the title sent up keeps
+/// landing: about ten seconds.
+const SENT_FRAMES: u64 = 300;
+
+/// Offsets `ranges` of the copy of `span` were sent up: their pieces land
+/// for a while ([`left_on_card`]).
+pub(crate) fn title_sent(span: (u64, u64), ranges: &[(usize, usize)]) {
+    if !listed(span.1) {
+        return;
+    }
+    let now = crate::frame::current();
+    let mut sent = sent().lock().unwrap_or_else(|e| e.into_inner());
+    for &(from, to) in ranges.iter().filter(|r| r.0 < r.1) {
+        for p in (from >> 16) as u32..=((to - 1) >> 16) as u32 {
+            sent.insert((span.0, p), now);
+        }
+    }
+}
+
+fn listed(len: u64) -> bool {
+    static LIST: OnceLock<Vec<u64>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        let list: Vec<u64> = std::env::var("VICTORY_LAND_NOT")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok())
+            .collect();
+        if !list.is_empty() {
+            tracing::info!(?list, "host copies of these lengths stay on the card, but for pieces the title sends up (VICTORY_LAND_NOT)");
+        }
+        list
+    });
+    !list.is_empty() && list.contains(&len)
+}
+
+/// Of [`left_on_card`]'s copies, the pieces the title sent up: (title
+/// address, piece) → the frame it last did.
+fn sent() -> &'static Mutex<std::collections::HashMap<(u64, u32), u64>> {
+    static SENT: OnceLock<Mutex<std::collections::HashMap<(u64, u32), u64>>> = OnceLock::new();
+    SENT.get_or_init(Default::default)
+}
+
 /// Since the last frame-rate line; microseconds first.
 pub(crate) mod stat {
     /// Which pieces to fetch; their list recorded and sent.
