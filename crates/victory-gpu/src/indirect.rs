@@ -882,6 +882,49 @@ void main() {
         }
     }
 
+    /// The timestamps around our compares (`host::card_pass_time`): a pair
+    /// taken, written around a compare of some pieces and resolved, gives
+    /// the ticks between them once the list has run; a pair handed out
+    /// again since gives nothing.
+    #[test]
+    fn warp_card_stamps_time_a_compare() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let Some(mut stamps) = crate::host::CardStamps::make(&warp.device) else {
+            panic!("the timestamps must be made on WARP");
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECES: u32 = 16;
+        let size = (64usize << 10) * PIECES as usize;
+        let (_now, _, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, _, differs_gpu) = warp.shared_buffer(4 * u64::from(PIECES));
+        let n = stamps.take();
+        // SAFETY: our open list on the harness's direct queue, live buffers,
+        // the compare's own root signature.
+        unsafe {
+            stamps.begin(&warp.list, n);
+            warp.list.SetComputeRootSignature(&compare.root);
+            warp.list.SetPipelineState(&compare.pso);
+            let constants = [0u32, 0, size as u32, PIECES, 0, 1];
+            warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+            warp.list.Dispatch(PIECES, 1, 1);
+            stamps.end(&warp.list, n);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run.
+        assert!(unsafe { stamps.ticks(n) }.is_some(), "the pair gives its ticks");
+        for _ in 0..crate::host::CardStamps::PAIRS {
+            stamps.take();
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { stamps.ticks(n) }, None, "a pair handed out again gives nothing");
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed
