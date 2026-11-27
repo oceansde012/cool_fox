@@ -7610,6 +7610,20 @@ fn split_line(frames: f64) {
         s[2] / 1048576.0,
         s[3],
     );
+    crate::watch::stamp_line(frames);
+    let c: Vec<f64> = crate::shadow::SKIP_CHECKED.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    if c[0] > 0.0 {
+        tracing::info!(
+            "refreshes left out as copying nothing, checked per frame (VICTORY_REFRESH_CHECK=1): {:.0}, {:.1} MB compared, {:.1} blocks \
+             found differing, {:.2} said stale; {:.1} left out by stamps where the journal would not have, {:.2} of them differing",
+            c[0],
+            c[1] / 1048576.0,
+            c[2],
+            c[3],
+            c[4],
+            c[5],
+        );
+    }
     tracing::info!(
         "the pass over the heap's views per frame: {:.1} ms looking at slots, {:.1} their copies' spans and refreshes, {:.1} textures; the \
          first two beside the recording (VICTORY_HEAP_PASS_ASIDE), {:.1} ms waited for at the lists' close",
@@ -7698,6 +7712,10 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+    /// With stamps ([`crate::watch::stamps_on`]): the submission's standing
+    /// asking, by which a refresh its copy's stamp holds is left out
+    /// ([`crate::shadow::Shadow::fresh`]).
+    fresh: Option<crate::watch::Standing>,
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -7921,6 +7939,12 @@ fn wide_textures() -> bool {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
+        // (Ahead of the table: with stamps nearly all of them are fresh.)
+        if let Some(standing) = &self.fresh
+            && shadow.fresh(address, len, standing)
+        {
+            return;
+        }
         let key = std::sync::Arc::as_ptr(shadow) as usize;
         if self.ahead.get(&key).is_some_and(|&(from, to)| from <= address && end <= to) {
             return;
@@ -7999,6 +8023,9 @@ impl Batch {
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut due = Vec::new();
         let mut touches = Vec::new();
+        // Refreshes their copies' stamps say are fresh are not gathered at
+        // all (`VICTORY_REFRESH_STAMPS`), here nor in the lists' steps.
+        let fresh = crate::watch::stamps_on().then(crate::watch::standing);
         for (n, list) in runs.iter().enumerate() {
             if parts.contains(&n) {
                 touches.push(Touch::Part);
@@ -8007,6 +8034,11 @@ impl Batch {
             for step in &list.deferred().copies {
                 match step {
                     Step::Refresh(shadow, at, len) => {
+                        if let Some(standing) = &fresh
+                            && shadow.fresh(*at, *len, standing)
+                        {
+                            continue;
+                        }
                         let key = std::sync::Arc::as_ptr(shadow) as usize;
                         if key != last {
                             copies.entry(key).or_insert_with(|| shadow.clone());
@@ -8029,6 +8061,7 @@ impl Batch {
             .filter_map(|(key, from, to)| Some((copies.remove(&key)?, from, to)))
             .collect();
         self.front = true;
+        self.fresh = fresh;
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
@@ -10016,15 +10049,21 @@ mod refresh_tests {
         }
     }
 
+    // Held by what asks as a submission does: one at a time, as submissions
+    // are.
+    use crate::watch::SUBMITTING as ONE;
+
     /// Prepares as a submission does: one asking for all the ranges, the
     /// refreshes in several flushes, the asking's end.
     fn submission(ranges: &[(Arc<Shadow>, usize, usize)], flushes: usize) {
-        // One at a time, as submissions are.
-        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let asked: Vec<(usize, usize)> = ranges.iter().filter(|r| !r.0.unwatched()).map(|r| (r.1, r.1 + r.2)).collect();
         crate::watch::ask_once(&asked);
-        let mut batch = Batch::default();
+        let mut batch = Batch {
+            // (As `Batch::refresh_front` sets it.)
+            fresh: crate::watch::stamps_on().then(crate::watch::standing),
+            ..Batch::default()
+        };
         for part in ranges.chunks(ranges.len().div_ceil(flushes).max(1)) {
             for (shadow, at, len) in part {
                 batch.add(shadow, *at, *len);
@@ -10040,10 +10079,22 @@ mod refresh_tests {
     /// title memory holds.
     #[test]
     fn refreshed_ranges_hold_title_memory() {
+        refreshed_ranges(0x1234_5678_9ABC_DEF1);
+    }
+
+    /// The same, with the refreshes that copies' stamps say are fresh left
+    /// out (`VICTORY_REFRESH_STAMPS`).
+    #[test]
+    fn refreshed_ranges_hold_title_memory_with_stamps() {
+        crate::watch::STAMPS_FORCED.store(true, std::sync::atomic::Ordering::Relaxed);
+        refreshed_ranges(0x0F1E_2D3C_4B5A_6978);
+    }
+
+    fn refreshed_ranges(seed: u64) {
         // SAFETY (all blocks): title memory and copies of the test's own,
         // written by this thread and, in `Batch::flush`, by the threads that
         // refresh, which are done when it returns.
-        let mut random = Random(0x1234_5678_9ABC_DEF1);
+        let mut random = Random(seed);
         const LEN: usize = 24 * PAGE;
         let regions = [title(LEN, false), title(LEN, true)];
         let mut copies = Vec::new();
@@ -10382,6 +10433,91 @@ mod refresh_tests {
             copy.take_dirty();
         }
         println!("VICTORY_LIGHT_REFRESH {}: best {best:.3} ms", crate::watch::light());
+    }
+
+    /// Stamps (`VICTORY_REFRESH_STAMPS`): once a look found nothing new in a
+    /// copy, its refreshes are left out with nothing asked; what the title
+    /// writes, what is landed, a title copy of ours, each ends that until
+    /// the copy took it; and a refresh left out keeps what shaders wrote.
+    #[test]
+    fn refreshes_left_out_by_stamps_hold_title_memory() {
+        crate::watch::STAMPS_FORCED.store(true, std::sync::atomic::Ordering::Relaxed);
+        for view in [false, true] {
+            const LEN: usize = 4 * PAGE;
+            let region = title(LEN, view);
+            // SAFETY (all blocks): the test's own memory.
+            unsafe { std::ptr::write_bytes(region as *mut u8, 1, LEN) };
+            let data = memory(LEN);
+            let copy = Shadow::unbacked(region as u64, data, LEN as u64, false);
+            let whole = [(copy.clone(), region, LEN)];
+            let same = |from: usize, to: usize| unsafe {
+                std::slice::from_raw_parts((region + from) as *const u8, to - from) == std::slice::from_raw_parts(data.add(from), to - from)
+            };
+            // Whether a refresh of it would be left out now, by a submission's
+            // asking (again if a test beside ended it).
+            let fresh = || {
+                (0..100).any(|_| {
+                    let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+                    crate::watch::ask_once(&[(region, region + LEN)]);
+                    let fresh = copy.fresh(region, LEN, &crate::watch::standing());
+                    crate::watch::ask_once_end();
+                    fresh
+                })
+            };
+            let settle = || {
+                for _ in 0..3 {
+                    submission(&whole, 1);
+                }
+                assert!(same(0, LEN), "view {view}");
+                assert!(fresh(), "view {view}: never stamped");
+            };
+            settle();
+            // The title writes.
+            unsafe { ((region + 2 * PAGE + 5) as *mut u8).write_volatile(9) };
+            assert!(!fresh(), "view {view}: the title wrote");
+            submission(&whole, 1);
+            assert!(same(0, LEN), "view {view}: after the title wrote");
+            settle();
+            // What shaders wrote is landed.
+            let was: Vec<u8> = (0..16).map(|i| unsafe { ((region + PAGE + 64 + i) as *const u8).read() }).collect();
+            Shadow::put(region + PAGE + 64, &was, &[7; 16]);
+            assert!(!fresh(), "view {view}: landed");
+            submission(&whole, 1);
+            assert!(same(0, LEN), "view {view}: after the landing");
+            settle();
+            // A title copy of ours while the submission's asking stands: the
+            // note takes the stamp. (Again if a test beside ended the asking
+            // before it. View memory is not asked about: the asking stands
+            // by write-watched memory beside it.)
+            let mut told = false;
+            let watched = title(PAGE, false);
+            for round in 0..100 {
+                if round > 0 {
+                    settle();
+                }
+                let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+                crate::watch::ask_once(&[(region, region + LEN), (watched, watched + PAGE)]);
+                unsafe { std::ptr::write_bytes((region + 3 * PAGE + 10) as *mut u8, 5 + round as u8, 4) };
+                crate::watch::wrote(region + 3 * PAGE + 10, 4);
+                told = !copy.stamped(0, LEN);
+                crate::watch::ask_once_end();
+                if told {
+                    break;
+                }
+            }
+            assert!(told, "view {view}: our copy was not told");
+            submission(&whole, 1);
+            assert!(same(0, LEN), "view {view}: after our copy");
+            settle();
+            // Shaders write a range of the copy: left out, the refresh keeps
+            // their bytes, and the title's as they are beside them.
+            copy.writing(region + PAGE, 64);
+            unsafe { std::ptr::write_bytes(data.add(PAGE), 3, 64) };
+            assert!(fresh(), "view {view}: nothing new for shader writes");
+            submission(&whole, 1);
+            assert!(unsafe { std::slice::from_raw_parts(data.add(PAGE), 64) }.iter().all(|&b| b == 3));
+            assert!(same(0, PAGE) && same(PAGE + 64, LEN), "view {view}: beside shader writes");
+        }
     }
 
     /// A range nothing wrote is known to be as it was, at its ends too, and

@@ -59,6 +59,9 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        if !self.holders.is_empty() {
+            self.unstamp(page);
+        }
         let before = self.written.insert(page, now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
@@ -71,6 +74,36 @@ impl Journal {
             }
         }
         before
+    }
+
+    /// Before a note of `page`: the stamps of the copies that hold it lose
+    /// what they say of it ([`Stamp`]).
+    fn unstamp(&self, page: usize) {
+        use std::sync::atomic::Ordering::{Relaxed, Release};
+        let Some(holders) = self.holders.get(&page) else {
+            return;
+        };
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        for holder in holders {
+            // SAFETY: a stamp is in the index from its registration to its
+            // copy's drop, which takes it out under this lock first.
+            let stamp = unsafe { &*holder.stamp };
+            let word = stamp.word.load(Relaxed);
+            if word == 0 {
+                continue;
+            }
+            // The page's bytes as offsets of the copy (its first page may
+            // begin before the copy).
+            let (lo, hi) = ((page * PAGE).saturating_sub(holder.base), (page + 1) * PAGE - holder.base);
+            let (from, to) = Stamp::unpack(word);
+            if from < hi && lo < to {
+                stamp.word.store(0, Release);
+                STAMPS[1].fetch_add(1, Relaxed);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        STAMPS[4].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
     }
 
     /// The parts of `page` written by an asking after `taken`.
@@ -185,6 +218,225 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Page number → the stamps of the copies that hold it ([`Stamp`]):
+    /// a note of the page takes from each what it said of the page.
+    holders: Holders,
+}
+
+type Holders = std::collections::HashMap<usize, Vec<Holder>, std::hash::BuildHasherDefault<PageHash>>;
+
+/// A copy's stamp in [`Journal::holders`], and the title address its
+/// offsets count from.
+struct Holder {
+    stamp: *const Stamp,
+    base: usize,
+}
+
+// SAFETY: the stamp is atomics, read and written by any thread; it is taken
+// out of the index before its copy is dropped ([`stamp_unregister`]).
+unsafe impl Send for Holder {}
+// SAFETY: as above.
+unsafe impl Sync for Holder {}
+
+/// What of a host copy (offsets `[from, to)`) is known to hold every write
+/// of the title's memory there that the journal holds, packed `from << 32 |
+/// to`; 0 for nothing (`VICTORY_REFRESH_STAMPS`, [`stamps_on`]).
+///
+/// A look that found nothing new ([`nothing_new`]) sets it, under the
+/// journal's lock, once the copy is registered ([`stamp_register`]); every
+/// note of a page it holds clears it, under the same lock
+/// ([`Journal::unstamp`]), before the note is in. So while it is set no
+/// note came for its bytes since that look, and a refresh of a range inside
+/// it would find nothing new as that look did, if the journal is whole for
+/// the range now: the submission's standing asking holds it
+/// ([`Standing::holds`]), or its blocks are known by their bits
+/// ([`published_now`]). That is asked anew at each use.
+#[derive(Default)]
+pub(crate) struct Stamp {
+    word: std::sync::atomic::AtomicU64,
+    registered: std::sync::atomic::AtomicBool,
+}
+
+impl Stamp {
+    fn pack(from: usize, to: usize) -> u64 {
+        (from as u64) << 32 | to as u64
+    }
+
+    fn unpack(word: u64) -> (usize, usize) {
+        ((word >> 32) as usize, (word & 0xffff_ffff) as usize)
+    }
+
+    /// Whether the copy is in the index.
+    pub(crate) fn registered(&self) -> bool {
+        self.registered.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether offsets `[from, to)` lie in what the stamp holds.
+    pub(crate) fn covers(&self, from: usize, to: usize) -> bool {
+        let word = self.word.load(std::sync::atomic::Ordering::Acquire);
+        let (f, t) = Stamp::unpack(word);
+        word != 0 && f <= from && to <= t
+    }
+
+    /// Offsets `[from, to)` were found to hold everything: with the
+    /// journal's lock held, so that no note comes between the look and
+    /// this. Joined to what it holds if they touch (no note came for that
+    /// either, or it would be 0), else instead of it.
+    fn extend(&self, from: usize, to: usize) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
+        if from >= to || !self.registered.load(Acquire) {
+            return;
+        }
+        let mut was = self.word.load(Acquire);
+        loop {
+            let (f, t) = Stamp::unpack(was);
+            let now = if was != 0 && f <= to && from <= t { Stamp::pack(f.min(from), t.max(to)) } else { Stamp::pack(from, to) };
+            if now == was {
+                return;
+            }
+            match self.word.compare_exchange_weak(was, now, AcqRel, Acquire) {
+                Ok(_) => {
+                    STAMPS[2].fetch_add(1, Relaxed);
+                    return;
+                }
+                Err(there) => was = there,
+            }
+        }
+    }
+}
+
+/// The most bytes of a copy that is stamped: its offsets fit the stamp, and
+/// bigger copies (the title's 174 MB heap) are refreshed a part at a time
+/// and written somewhere nearly always.
+pub(crate) const STAMP_MOST: usize = 64 << 20;
+
+/// Since the last frame line: refreshes skipped by their stamps, stamps
+/// cleared by notes, stamps set or widened, copies registered, and the
+/// nanoseconds of clearing under the journal's write lock.
+pub(crate) static STAMPS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// A copy of `[start, end)` whose stamp is `stamp` goes into the index: from
+/// the next look that finds nothing new on, it is stamped. The stamp stays
+/// where it is until [`stamp_unregister`].
+pub(crate) fn stamp_register(stamp: &Stamp, start: usize, end: usize) {
+    if start >= end || end - start > STAMP_MOST {
+        return;
+    }
+    let mut j = journal_mut();
+    if stamp.registered.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    for page in start / PAGE..end.div_ceil(PAGE) {
+        j.holders.entry(page).or_default().push(Holder { stamp: std::ptr::from_ref(stamp), base: start });
+    }
+    stamp.registered.store(true, std::sync::atomic::Ordering::Release);
+    STAMPS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The copy of `[start, end)` whose stamp is `stamp` is going: out of the
+/// index.
+pub(crate) fn stamp_unregister(stamp: &Stamp, start: usize, end: usize) {
+    if !stamp.registered() {
+        return;
+    }
+    let mut j = journal_mut();
+    for page in start / PAGE..end.div_ceil(PAGE) {
+        let gone = j.holders.get_mut(&page).is_some_and(|holders| {
+            holders.retain(|h| !std::ptr::eq(h.stamp, stamp));
+            holders.is_empty()
+        });
+        if gone {
+            j.holders.remove(&page);
+        }
+    }
+    stamp.word.store(0, std::sync::atomic::Ordering::Release);
+    stamp.registered.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Whether copies keep stamps (`VICTORY_REFRESH_STAMPS=1`, or the switch
+/// named in `VICTORY_AB`: kept in both phases, so that they hold when the
+/// switch comes on). Needs the light refreshes.
+pub(crate) fn stamps_armed() -> bool {
+    #[cfg(test)]
+    if STAMPS_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        return light();
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        let named = crate::ab::bit("VICTORY_REFRESH_STAMPS").is_some();
+        #[cfg(not(feature = "diagnostics"))]
+        let named = false;
+        light() && (named || crate::switch::on("VICTORY_REFRESH_STAMPS"))
+    })
+}
+
+/// Tests that need stamps whatever the environment says.
+#[cfg(test)]
+pub(crate) static STAMPS_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Held by tests while they ask as a submission does ([`ask_once`] to
+/// [`ask_once_end`]): submissions ask one at a time (the submission lock),
+/// tests on many threads.
+#[cfg(test)]
+pub(crate) static SUBMITTING: Mutex<()> = Mutex::new(());
+
+/// Whether a submission's refreshes that their copies' stamps say are
+/// fresh are skipped now ([`Stamp`]; off unless armed, [`stamps_armed`]).
+///
+/// Of some 10,500 refreshes a frame in the Series S cell, 9,000-9,500 copy
+/// nothing; finding that out was some 2.3 ms a frame of the submitting
+/// thread (run parts-now-prof1, timeline parts-now-tl1): the steps
+/// gathered into tables, then a look at the journal for each.
+pub(crate) fn stamps_on() -> bool {
+    if !stamps_armed() {
+        return false;
+    }
+    #[cfg(test)]
+    if STAMPS_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_REFRESH_STAMPS") {
+        return on;
+    }
+    true
+}
+
+/// The number of the submission's standing asking ([`ask_once`]) while it
+/// stands, else 0: set and cleared with [`Journal::kept`], under the
+/// journal's write lock.
+static STANDING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What the submission's standing asking holds, as it stood when taken
+/// ([`standing`]).
+pub(crate) struct Standing {
+    id: u64,
+    ranges: Vec<(usize, usize)>,
+}
+
+/// The standing asking, for a submission's refreshes ([`Stamp`]).
+pub(crate) fn standing() -> Standing {
+    let j = journal();
+    let id = STANDING.load(std::sync::atomic::Ordering::Acquire);
+    if !j.kept || id == 0 {
+        return Standing { id: 0, ranges: Vec::new() };
+    }
+    Standing { id, ranges: j.ahead.ranges.clone() }
+}
+
+impl Standing {
+    /// Whether the asking still stands and holds `[start, end)`: then the
+    /// journal holds every write the kernel had of it when it was made.
+    pub(crate) fn holds(&self, start: usize, end: usize) -> bool {
+        if self.id == 0 || STANDING.load(std::sync::atomic::Ordering::Acquire) != self.id {
+            return false;
+        }
+        let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+        // (Kept as `Ahead` keeps them: by their first pages, ends rising.)
+        let past = self.ranges.partition_point(|&(s, _)| s <= first);
+        past != 0 && self.ranges[past - 1].1 >= last
+    }
 }
 
 /// The page ranges of [`Journal::ahead`] that no other one holds, by their
@@ -264,6 +516,7 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     ahead: Ahead::new(),
     ahead_asked: 0,
     kept: false,
+    holders: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
 });
 
 fn journal() -> std::sync::RwLockReadGuard<'static, Journal> {
@@ -762,6 +1015,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    STANDING.store(if j.kept { now } else { 0 }, std::sync::atomic::Ordering::Release);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -771,6 +1025,7 @@ pub(crate) fn ask_once_end() {
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        STANDING.store(0, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -921,7 +1176,10 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// taken whole, or 0) does not hold, as [`writes`] would answer with nothing
 /// asked: the submission's asking covers the range, or its blocks are known
 /// by their bits. `false` if something would have to be asked.
-pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64) -> bool {
+///
+/// `stamp`: the copy's stamp and the title address its offsets count from,
+/// which takes the range if the answer is yes ([`Stamp`]).
+pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64], ranged: u64, stamp: Option<(&Stamp, usize)>) -> bool {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // The bits first, then the journal, as in `writes`.
     let known = published(start, end);
@@ -936,8 +1194,49 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
     let Some(taken) = first.checked_sub(base).and_then(|from| copied.get(from..last - base)) else {
         return false;
     };
-    (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first, last).all(|(page, write)| write <= taken[page - first].max(ranged))
+    let same = (ranged != 0 || taken.iter().all(|&at| at != 0))
+        && j.written.range(first, last).all(|(page, write)| write <= taken[page - first].max(ranged));
+    // (The journal's lock still held: no note in between.)
+    if same && let Some((stamp, at)) = stamp {
+        stamp.extend(start - at, end - at);
+    }
+    drop(j);
+    same
+}
+
+/// Whether nothing of `[start, end)` can have been written since an asking
+/// noted it in the journal, by the blocks' bits ([`PUBLISHED`]).
+pub(crate) fn published_now(start: usize, end: usize) -> bool {
+    published(start, end)
+}
+
+/// Diagnostics: the asking that last found `page` written (0: none).
+pub(crate) fn last_write(page: usize) -> u64 {
+    journal().written.range(page, page + 1).next().map_or(0, |(_, write)| write)
+}
+
+/// The line of the stamps ([`STAMPS`]), per frame.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn stamp_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !stamps_armed() {
+        return;
+    }
+    let s: Vec<f64> = STAMPS.iter().map(|n| n.swap(0, Relaxed) as f64 / frames).collect();
+    let (pages, entries) = {
+        let j = journal();
+        (j.holders.len(), j.holders.values().map(Vec::len).sum::<usize>())
+    };
+    tracing::info!(
+        "refresh stamps per frame (VICTORY_REFRESH_STAMPS {}): {:.0} refreshes skipped, {:.0} stamps cleared by notes ({:.3} ms \
+         of it under the journal's write lock), {:.0} set or widened, {:.1} copies registered; {pages} pages, {entries} stamps in the index",
+        if stamps_on() { "on" } else { "off" },
+        s[0],
+        s[1],
+        s[4] / 1e6,
+        s[2],
+        s[3],
+    );
 }
 
 impl Tracked {
@@ -3308,6 +3607,7 @@ mod parts_tests {
             ahead: Ahead::new(),
             ahead_asked: 0,
             kept: false,
+            holders: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
         };
         assert_eq!(j.parts_since(7, 0), WHOLE);
         assert_eq!(j.note(7, WHOLE, 3), 0);
@@ -3378,6 +3678,66 @@ mod parts_tests {
         }
         assert_eq!(written.range(5, 5).count(), 0);
     }
+
+    /// A note of a page takes from a copy's stamp what the stamp said, if
+    /// the stamp holds some of the page's bytes, and leaves other stamps
+    /// (and the same stamp, of other bytes) alone. (Invariant 1.)
+    #[test]
+    fn a_note_takes_from_a_stamp_only_what_it_touches() {
+        let [one, two]: [&'static Stamp; 2] = [Box::leak(Box::default()), Box::leak(Box::default())];
+        let mut j = Journal {
+            written: Written::new(),
+            parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+            ahead: Ahead::new(),
+            ahead_asked: 0,
+            kept: false,
+            holders: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        };
+        // A copy that begins inside page 10 and ends inside page 13, and one
+        // of pages 20 to 22.
+        let (a, b) = (10 * PAGE + 0x100, 20 * PAGE);
+        for (stamp, base, pages) in [(one, a, 10..14), (two, b, 20..23)] {
+            for page in pages {
+                j.holders.entry(page).or_default().push(Holder { stamp: std::ptr::from_ref(stamp), base });
+            }
+            stamp.registered.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let set = |stamp: &Stamp, from: usize, to: usize| stamp.word.store(Stamp::pack(from, to), std::sync::atomic::Ordering::Relaxed);
+        set(one, 0, 3 * PAGE);
+        set(two, PAGE, 2 * PAGE);
+        j.note(22, WHOLE, 5);
+        assert!(two.covers(PAGE, 2 * PAGE), "page 22 is beside its bytes");
+        j.note(30, WHOLE, 6);
+        assert!(one.covers(0, 3 * PAGE) && two.covers(PAGE, 2 * PAGE), "a page nobody holds");
+        j.note(21, 0b1, 7);
+        assert!(!two.covers(PAGE, PAGE + 1), "a part of page 21");
+        j.note(10, WHOLE, 8);
+        assert!(!one.covers(0, 1), "the copy's first page, which begins before it");
+        // Bytes of its last page only: the page before them is beside them.
+        set(one, 3 * PAGE - 0x100, 3 * PAGE + 16);
+        j.note(12, WHOLE, 9);
+        assert!(one.covers(3 * PAGE - 0x100, 3 * PAGE + 16));
+        j.note(13, WHOLE, 10);
+        assert!(!one.covers(3 * PAGE - 0x100, 3 * PAGE));
+    }
+
+    /// A stamp joins what it holds to a range that touches it, and else
+    /// holds the newer; it takes nothing while its copy is not registered.
+    #[test]
+    fn a_stamp_joins_ranges_that_touch() {
+        let stamp = Stamp::default();
+        stamp.extend(0, 100);
+        assert!(!stamp.covers(0, 1), "not registered");
+        stamp.registered.store(true, std::sync::atomic::Ordering::Relaxed);
+        stamp.extend(0, 100);
+        stamp.extend(100, 300);
+        assert!(stamp.covers(0, 300));
+        stamp.extend(50, 60);
+        assert!(stamp.covers(0, 300));
+        stamp.extend(400, 500);
+        assert!(stamp.covers(400, 500) && !stamp.covers(0, 1));
+        assert!(!stamp.covers(399, 401));
+    }
 }
 
 #[cfg(test)]
@@ -3387,6 +3747,212 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    /// A look at `[start, end)` as a copy beginning at `copy` (on a page
+    /// line), whose pages were taken at `copied`, makes it ([`nothing_new`],
+    /// which stamps on a yes).
+    fn look(stamp: &Stamp, copy: usize, start: usize, end: usize, copied: &[u64]) -> bool {
+        nothing_new(start, end, copy / PAGE, copied, 0, Some((stamp, copy)))
+    }
+
+    /// The submission's asking of `[start, end)`, made until it stands (a
+    /// test beside may end it): the number it stands at.
+    fn standing_asking(start: usize, end: usize) -> u64 {
+        for _ in 0..1000 {
+            ask_once(&[(start, end)]);
+            if let Some((now, _)) = asked(start, end) {
+                return now;
+            }
+            std::thread::yield_now();
+        }
+        panic!("the asking never stood");
+    }
+
+    /// Invariant 2: a look that found nothing new stamps under the journal's
+    /// lock, so a note that comes while looks go on is never followed by a
+    /// stamp of what it noted (the copy did not take the page again, so no
+    /// later look finds it the same either). In view memory, known by its
+    /// bits: submissions' askings (`ask_once`) are made one at a time, and
+    /// other tests make theirs.
+    #[test]
+    fn a_note_beside_looks_leaves_no_stamp_of_its_page() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const PAGES: usize = 4;
+        let (section, p, other) = two_views(PAGES * BLOCK);
+        let (start, end) = (p, p + PAGES * PAGE);
+        let stamp: &'static Stamp = Box::leak(Box::default());
+        stamp_register(stamp, start, end);
+        // The asking the copy took each page at: only ever raised, so a look
+        // that reads some old and some new sees no page newer than it is.
+        let copied: [std::sync::atomic::AtomicU64; PAGES] = Default::default();
+        let take = |now: u64| copied.iter().for_each(|c| c.store(now, Ordering::Relaxed));
+        let stop = AtomicBool::new(false);
+        // Also when an assertion fails here.
+        struct Stop<'a>(&'a AtomicBool);
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        std::thread::scope(|s| {
+            let _stop = Stop(&stop);
+            for t in 0..2 {
+                let (copied, stop) = (&copied, &stop);
+                s.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let copied = copied.each_ref().map(|c| c.load(Ordering::Relaxed));
+                        let (from, to) = if t == 0 { (start, end) } else { (start + PAGE + 100, end - 100) };
+                        look(stamp, start, from, to, &copied);
+                        // (Not so often that nobody else gets the journal.)
+                        std::thread::yield_now();
+                    }
+                });
+            }
+            // The copy takes all of it: the asking that guards it, then one
+            // that finds it clean, whose number the copy took it at.
+            let took = || {
+                writes(start, end, true).expect("a view");
+                writes(start, end, true).expect("a view").0
+            };
+            for round in 0..40 {
+                take(took());
+                let mut stamped = false;
+                for _ in 0..100_000 {
+                    if stamp.covers(0, PAGES * PAGE) {
+                        stamped = true;
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+                assert!(stamped, "round {round}: never stamped");
+                let k = round % PAGES;
+                // The title writes the page (the fault opens it), and the
+                // next asking notes it.
+                // SAFETY: the test's view, opened by the handler.
+                unsafe { ((p + k * PAGE + 64) as *mut u8).write_volatile(round as u8) };
+                let (now, told) = writes(start, end, true).expect("a view");
+                let page = (k * PAGE, (k + 1) * PAGE);
+                assert!(
+                    !stamp.covers(page.0, page.0 + 1),
+                    "round {round}: page {k} stamped after its note: stamp {:?}, told {told:?} at {now}, copied {:?}, published {}",
+                    Stamp::unpack(stamp.word.load(Ordering::Relaxed)),
+                    copied.each_ref().map(|c| c.load(Ordering::Relaxed)),
+                    published(start, end),
+                );
+                for _ in 0..200 {
+                    std::thread::yield_now();
+                }
+                assert!(
+                    !stamp.covers(page.0, page.1),
+                    "round {round}: page {k} stamped again with nothing taken: stamp {:?}, journal {:?}, copied {:?}",
+                    Stamp::unpack(stamp.word.load(Ordering::Relaxed)),
+                    (0..PAGES).map(|i| journal().written.get(start / PAGE + i)).collect::<Vec<_>>(),
+                    copied.each_ref().map(|c| c.load(Ordering::Relaxed)),
+                );
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        stamp_unregister(stamp, start, end);
+        drop_views(section, &[p, other], PAGES * BLOCK);
+    }
+
+    /// Invariant 5: a copy's stamp leaves the index when unregistered, and
+    /// says nothing after.
+    #[test]
+    fn an_unregistered_stamp_is_out_of_the_index() {
+        let stamp: &'static Stamp = Box::leak(Box::default());
+        // Far from any test's memory.
+        let (start, end) = ((1 << 45) + 3 * PAGE + 10, (1 << 45) + 6 * PAGE);
+        stamp_register(stamp, start, end);
+        assert!(stamp.registered());
+        let ours = |page: usize| journal().holders.get(&page).is_some_and(|h| h.iter().any(|h| std::ptr::eq(h.stamp, stamp)));
+        assert!((start / PAGE..end.div_ceil(PAGE)).all(ours));
+        stamp.extend(0, 100);
+        stamp_unregister(stamp, start, end);
+        assert!(!stamp.registered() && !stamp.covers(0, 1));
+        assert!(!(start / PAGE..end.div_ceil(PAGE)).any(ours));
+        // A copy too big for a stamp is never registered.
+        stamp_register(stamp, start, start + STAMP_MOST + 1);
+        assert!(!stamp.registered());
+    }
+
+    /// Invariant 4, write-watched memory: what the standing asking holds is
+    /// known while it stands, and not once it ends (a step of ours wrote
+    /// title memory where nobody told the journal).
+    #[test]
+    fn the_standing_asking_holds_its_ranges_until_it_ends() {
+        // SAFETY: a write-watched allocation of the test's, never given back.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        let mut held = false;
+        for _ in 0..1000 {
+            let _one = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
+            ask_once(&[(p, p + 2 * PAGE)]);
+            let standing = standing();
+            if !standing.holds(p, p + 2 * PAGE) {
+                // (A test beside ended it.)
+                continue;
+            }
+            assert!(!standing.holds(p, p + 3 * PAGE), "more than was asked");
+            ask_once_end();
+            assert!(!standing.holds(p, p + PAGE), "the asking ended");
+            held = true;
+            break;
+        }
+        assert!(held);
+    }
+
+    /// Invariants 1 and 4 for view memory: a copy's stamp of a guarded view
+    /// is known by the blocks' bits; a write through another view of the
+    /// same pages takes the bits, and the next asking's note the stamp; so
+    /// do our own writes told at the other view, and what is landed there
+    /// beside the guards.
+    #[test]
+    fn writes_through_another_view_take_a_stamps_freshness() {
+        const SIZE: usize = 2 * BLOCK;
+        let (section, one, two) = two_views(SIZE);
+        let stamp: &'static Stamp = Box::leak(Box::default());
+        stamp_register(stamp, two, two + SIZE);
+        let cleared = || stamp.word.load(std::sync::atomic::Ordering::Relaxed) == 0;
+        // The copy of `two` takes it, and a look stamps it.
+        let take = || {
+            writes(two, two + SIZE, true).expect("a view");
+            let (now, _) = writes(two, two + SIZE, true).expect("a view");
+            assert!(published(two, two + SIZE));
+            assert!(look(stamp, two, two, two + SIZE, &[now, now]));
+            assert!(stamp.covers(0, SIZE) && published_now(two, two + SIZE));
+        };
+        take();
+        // The title writes through the other view: the bits go at once.
+        // SAFETY: the other view, opened by the handler.
+        unsafe { ((one + BLOCK + 8) as *mut u8).write(1) };
+        assert!(!published_now(two + BLOCK, two + SIZE), "the write opened every view");
+        // The next asking notes it, and that takes the stamp.
+        writes(two, two + SIZE, true).expect("a view");
+        assert!(cleared());
+        take();
+        // What shaders wrote, landed beside the guards at the other view.
+        landed_beside(&[one / 4096 + 3], &[(one + 3 * 4096, 16)]);
+        assert!(cleared());
+        take();
+        // A title copy of ours at the other view while an asking stands.
+        let mut told = false;
+        for _ in 0..1000 {
+            // SAFETY: a write-watched allocation of the test's, kept.
+            let w = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as usize;
+            let _one = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
+            standing_asking(w, w + PAGE);
+            wrote(one + BLOCK + 100, 8);
+            ask_once_end();
+            if cleared() {
+                told = true;
+                break;
+            }
+        }
+        assert!(told, "never noted at the other view");
+        stamp_unregister(stamp, two, two + SIZE);
+        drop_views(section, &[one, two], SIZE);
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

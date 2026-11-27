@@ -48,6 +48,9 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// What of the copy is known to hold every write the journal holds
+    /// ([`crate::watch::Stamp`], [`Shadow::fresh`]).
+    stamp: crate::watch::Stamp,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -2621,8 +2624,39 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame line, with `VICTORY_REFRESH_CHECK=1`: refreshes left
+/// out that were checked ([`Shadow::skip_check`]), the bytes compared, blocks
+/// found differing (the first time in a row), blocks said stale; refreshes
+/// left out by a stamp where the journal would not have ([`Skip::StampAlone`]),
+/// and those of them that differed.
+pub(crate) static SKIP_CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// What left a refresh out, for [`Shadow::skip_check`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Skip {
+    /// The journal ([`Shadow::nothing_new`]), as without stamps.
+    Journal,
+    /// The copy's stamp, and the journal would have too.
+    StampAndJournal,
+    /// The copy's stamp, where the journal would have refreshed (or asked).
+    StampAlone,
+}
+
+impl Skip {
+    /// One in so many of the skips the journal makes too is checked.
+    const SAMPLE: usize = 16;
+}
+
+/// `VICTORY_REFRESH_CHECK=1`.
+fn refresh_checking() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // (Out of the journal's index before its memory goes.)
+        crate::watch::stamp_unregister(&self.stamp, self.start as usize, (self.start + self.len) as usize);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -3151,6 +3185,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            stamp: Default::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3928,7 +3963,20 @@ impl Shadow {
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
-    pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+    ///
+    /// With stamps ([`crate::watch::stamps_armed`]) a yes stamps the range
+    /// ([`Shadow::fresh`]); the first yes puts the copy in the journal's
+    /// index of stamps instead.
+    pub(crate) fn nothing_new(self: &Arc<Self>, address: usize, len: usize) -> bool {
+        let same = self.looks_same(address, len);
+        if same {
+            self.skip_check(address, len, Skip::Journal);
+        }
+        same
+    }
+
+    /// [`Shadow::nothing_new`], unchecked.
+    fn looks_same(self: &Arc<Self>, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -3944,8 +3992,13 @@ impl Shadow {
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
+        let stamps = crate::watch::stamps_armed();
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to), stamps.then_some((&self.stamp, start)));
+        drop(copied);
+        if same && stamps && !self.stamp.registered() {
+            crate::watch::stamp_register(&self.stamp, start, end);
+        }
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3953,6 +4006,197 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
+    }
+
+    /// Whether a refresh of `[address, address + len)` is known to copy
+    /// nothing by the copy's stamp alone (`VICTORY_REFRESH_STAMPS`): the
+    /// stamp holds the range, so no note of the journal came for it since a
+    /// look found nothing new there; and the journal is whole for the range
+    /// now, by the submission's standing asking (`standing`, write-watched
+    /// memory) or by the blocks' bits (view memory), as that look asks.
+    /// No lock is taken and nothing is asked.
+    pub(crate) fn fresh(self: &Arc<Self>, address: usize, len: usize, standing: &crate::watch::Standing) -> bool {
+        if self.place.is_some() {
+            return true;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return true;
+        }
+        if !self.stamp.covers(from - start, to - start) {
+            return false;
+        }
+        let known = match self.watched.load(Ordering::Relaxed) {
+            1 => standing.holds(from, to),
+            GUARDED => crate::watch::published_now(from, to),
+            _ => false,
+        };
+        if known {
+            crate::watch::STAMPS[0].fetch_add(1, Ordering::Relaxed);
+            if refresh_checking() {
+                // Whether the journal says so too, as without stamps.
+                let journal = self.looks_same(address, len);
+                self.skip_check(address, len, if journal { Skip::StampAndJournal } else { Skip::StampAlone });
+            }
+        }
+        known
+    }
+
+    /// Whether the copy's stamp holds offsets `[from, to)`.
+    #[cfg(test)]
+    pub(crate) fn stamped(&self, from: usize, to: usize) -> bool {
+        self.stamp.covers(from, to)
+    }
+
+    /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): a refresh of
+    /// `[address, address + len)` is left out as known to copy nothing (by
+    /// the journal, [`Shadow::nothing_new`], or by the copy's stamp,
+    /// [`Shadow::fresh`], `kind`). The copy's bytes there, but for ranges
+    /// shaders may be writing, are compared with title memory (a megabyte at
+    /// most, a part that moves on each time beyond that; of a window the CPU
+    /// maps in the card's memory, a sample; of the skips the journal would
+    /// make as well, one in [`Skip::SAMPLE`]). A 64 KiB block of the copy
+    /// that differs at three such looks with none between that found it the
+    /// same was changed with nothing to tell of it: said. One that differs
+    /// once is a write of the title's after the submission's asking, which
+    /// the next one finds.
+    fn skip_check(&self, address: usize, len: usize, kind: Skip) {
+        use std::collections::HashMap;
+        if !refresh_checking() {
+            return;
+        }
+        const MOST: usize = 1 << 20;
+        static TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SAMPLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // Per copy, its blocks found differing: at how many looks in a row.
+        static DIFFERING: Mutex<Option<HashMap<u64, HashMap<usize, u32>>>> = Mutex::new(None);
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let (from, to) = (address.max(start), (address + len).min(start + self.len as usize));
+        if from >= to || self.place.is_some() {
+            return;
+        }
+        if kind == Skip::StampAlone {
+            SKIP_CHECKED[4].fetch_add(1, Ordering::Relaxed);
+        } else if !SAMPLED.fetch_add(1, Ordering::Relaxed).is_multiple_of(Skip::SAMPLE) {
+            return;
+        }
+        let (from, to) = if to - from > MOST {
+            let at = from + TURN.fetch_add(MOST, Ordering::Relaxed) % (to - from - MOST + 1);
+            (at, at + MOST)
+        } else {
+            (from, to)
+        };
+        let mut busy: Vec<(usize, usize)> =
+            self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, e)| a < to && e > from).collect();
+        busy.sort_unstable();
+        let runs_pending = !busy.is_empty();
+        // The runs outside shader writes.
+        let mut runs = Vec::new();
+        let mut at = from;
+        for (a, e) in busy {
+            if a > at {
+                runs.push((at, a));
+            }
+            at = at.max(e);
+        }
+        if at < to {
+            runs.push((at, to));
+        }
+        // A window in the card's memory that the CPU maps (resizable BAR) is
+        // read over the bus, uncached: of it the first 64 bytes of each 4 KiB.
+        let (step, sample) = if self.mapped { (4096, 64) } else { (PAGE, PAGE) };
+        let (mut same, mut differ) = (Vec::new(), Vec::new());
+        TITLE.with_borrow_mut(|title| {
+            for (a, e) in runs {
+                let mut at = a;
+                while at < e {
+                    let next = ((at / step + 1) * step).min(e);
+                    let n = (next - at).min(sample);
+                    title.resize(n, 0);
+                    if crate::host::read_into(at as *const u8, &mut title[..n]) {
+                        // SAFETY: `[at, next)` lies in the copy, inside its
+                        // mapping; no shader's range holds it.
+                        let held = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                        SKIP_CHECKED[1].fetch_add(n as u64, Ordering::Relaxed);
+                        if held == &title[..n] { same.push(at / PAGE) } else { differ.push((at / PAGE, at, first_difference(held, &title[..n]))) }
+                    }
+                    at = next;
+                }
+            }
+        });
+        SKIP_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+        // (A sampled block once, differing if any sample of it differs.)
+        differ.dedup_by_key(|d| d.0);
+        same.dedup();
+        same.retain(|block| !differ.iter().any(|d| d.0 == *block));
+        if same.is_empty() && differ.is_empty() {
+            return;
+        }
+        let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(Default::default);
+        let blocks = map.entry(self.id).or_default();
+        for block in same {
+            blocks.remove(&block);
+        }
+        if kind == Skip::StampAlone && !differ.is_empty() {
+            SKIP_CHECKED[5].fetch_add(1, Ordering::Relaxed);
+            // Whether the journal knew of a write the copy had not taken
+            // (then the stamp was wrong) or not (the title wrote after the
+            // submission's asking, which the next one finds).
+            static TOLD: AtomicU64 = AtomicU64::new(0);
+            if TOLD.fetch_add(1, Ordering::Relaxed) < 32 {
+                let (block, at, first) = differ[0];
+                let taken = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get(block - start / PAGE).copied();
+                tracing::info!(
+                    copy = self.id,
+                    copy_start = format_args!("{start:#x}"),
+                    copy_bytes = self.len,
+                    refreshed = format_args!("{from:#x}..{to:#x}"),
+                    address = format_args!("{at:#x}"),
+                    first_difference = ?first.map(|d| format!("{:#x}", at + d)),
+                    journal = crate::watch::last_write(block),
+                    taken,
+                    ranged = self.ranged(from, to),
+                    shader_writes = runs_pending,
+                    "a refresh left out by its stamp alone differed from title memory (VICTORY_REFRESH_CHECK=1)"
+                );
+            }
+        }
+        for (block, at, first) in differ {
+            let times = blocks.entry(block).or_insert(0);
+            *times += 1;
+            if *times == 1 {
+                SKIP_CHECKED[2].fetch_add(1, Ordering::Relaxed);
+            }
+            if *times == 3 {
+                SKIP_CHECKED[3].fetch_add(1, Ordering::Relaxed);
+                let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+                if said <= 64 || said.is_power_of_two() {
+                    tracing::warn!(
+                        said,
+                        skipped_by = ?kind,
+                        copy = self.id,
+                        copy_start = format_args!("{start:#x}"),
+                        copy_bytes = self.len,
+                        address = format_args!("{at:#x}"),
+                        first_difference = ?first.map(|d| format!("{:#x}", at + d)),
+                        stamped = self.stamp.registered(),
+                        watched = self.watched.load(Ordering::Relaxed),
+                        on_the_card = self.card.is_some(),
+                        window = self.window,
+                        "a refresh left out as copying nothing left a host copy stale, three times in a row (VICTORY_REFRESH_CHECK=1)"
+                    );
+                }
+            }
+        }
+        if blocks.is_empty() {
+            map.remove(&self.id);
+        }
     }
 
     /// The latest asking after which a range that holds `[from, to)` was
