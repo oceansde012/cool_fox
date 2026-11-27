@@ -34,6 +34,8 @@
 //!   (LDS) load reuse without store-to-load forwarding across lanes.
 //! - [`LICM`]: opt-in pure loop-invariant code motion hoisting non-trapping
 //!   invariants out of natural loops to dominating preheaders.
+//! - [`BARRIERS`]: opt-in adjacent covered and bounded read-after-read
+//!   `dx.op.barrier` elimination within a block.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -76,8 +78,10 @@ pub const EXT_FOLD: u32 = 128;
 pub const MEM_FWD: u32 = 256;
 /// Opt-in pure loop-invariant code motion.
 pub const LICM: u32 = 512;
+/// Opt-in adjacent and read-after-read redundant barrier elimination.
+pub const BARRIERS: u32 = 1024;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM | BARRIERS;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: the original default passes
@@ -266,6 +270,185 @@ struct PrivateVals {
     dyn_vals: HashMap<(u32, V, Ty), V>,
 }
 
+/// Intra-block `dx.op.barrier` tracking for [`BARRIERS`]: eliminates both
+/// immediately adjacent covered barriers and read-after-read barriers between
+/// non-escaping LDS (`space == 3`) loads when bounded on the left by a covering
+/// group+TGSM barrier (`mode & 9 == 9`) and on the right by either a covering
+/// group+TGSM barrier or `Term::Ret` (when `mid_mode` has no UAV fence bits),
+/// with no intervening stores, atomics, resource/wave calls, or branches.
+#[derive(Default)]
+struct BarrierState {
+    /// Mode of the last barrier when no memory or lane op has run since it.
+    adj: Option<u64>,
+    rar: RarState,
+}
+
+#[derive(Default, Clone, Copy)]
+enum RarState {
+    #[default]
+    None,
+    /// Saw `B_anchor(anchor_mode)` with `(anchor_mode & 9) == 9`.
+    AfterAnchor {
+        anchor_mode: u64,
+        saw_lds_load: bool,
+    },
+    /// Saw `B_anchor -> [>=1 LDS load] -> B_mid(mid_mode)` at `kept[mid_pos]`.
+    AfterMid {
+        anchor_mode: u64,
+        mid_mode: u64,
+        mid_pos: usize,
+        saw_lds_load: bool,
+    },
+    /// Saw `B_anchor -> [>=1 LDS load] -> B_mid -> [>=1 LDS load]` where
+    /// `(mid_mode & 1) != 0` and `mid_mode` has no UAV fence bits, followed
+    /// only by non-atomic UAV or stage-output stores; drops `B_mid` if the
+    /// block terminates in `Term::Ret`.
+    TailBeforeRet {
+        mid_pos: usize,
+    },
+}
+
+impl BarrierState {
+    fn reset(&mut self) {
+        self.adj = None;
+        self.rar = RarState::None;
+    }
+
+    fn on_load(&mut self, root: PtrRoot) {
+        self.adj = None;
+        match root {
+            PtrRoot::ConstGlobal(_) | PtrRoot::PrivateGlobal(_) => {}
+            PtrRoot::SharedGlobal(_) => match &mut self.rar {
+                RarState::AfterAnchor { saw_lds_load, .. }
+                | RarState::AfterMid { saw_lds_load, .. } => *saw_lds_load = true,
+                RarState::TailBeforeRet { .. } | RarState::None => {}
+            },
+            PtrRoot::Unknown => self.rar = RarState::None,
+        }
+    }
+
+    fn on_non_lds_sink_store(&mut self) {
+        self.adj = None;
+        self.rar = match self.rar {
+            RarState::AfterMid {
+                mid_mode,
+                mid_pos,
+                saw_lds_load: true,
+                ..
+            } if (mid_mode & 1) != 0 && mid_mode & !(1 | 8) == 0 => {
+                RarState::TailBeforeRet { mid_pos }
+            }
+            RarState::TailBeforeRet { mid_pos } => RarState::TailBeforeRet { mid_pos },
+            _ => RarState::None,
+        };
+    }
+
+    /// Processes a void `dx.op.barrier` call with optional constant `mode`.
+    /// Returns `true` if this barrier itself is redundant (adjacent covered)
+    /// and should be skipped; marks any dropped earlier read-after-read
+    /// barrier in `kept` as `u32::MAX`.
+    fn on_barrier(
+        &mut self,
+        mode: Option<u64>,
+        kept: &mut [u32],
+        dropped_kept: &mut bool,
+        changed: &mut bool,
+    ) -> bool {
+        if let (Some(prev), Some(m)) = (self.adj, mode)
+            && (prev & m) == m
+        {
+            *changed = true;
+            return true;
+        }
+        if let Some(m) = mode {
+            let next_pos = kept.len();
+            self.rar = match self.rar {
+                RarState::AfterAnchor {
+                    anchor_mode,
+                    saw_lds_load: true,
+                } if (m & 9) != 0 && (anchor_mode & m) == m => RarState::AfterMid {
+                    anchor_mode,
+                    mid_mode: m,
+                    mid_pos: next_pos,
+                    saw_lds_load: false,
+                },
+                RarState::AfterMid {
+                    anchor_mode,
+                    mid_mode,
+                    mid_pos,
+                    saw_lds_load: true,
+                } => {
+                    if (m & 9) == 9 && (m & mid_mode) == mid_mode {
+                        kept[mid_pos] = u32::MAX;
+                        *dropped_kept = true;
+                        *changed = true;
+                        if (anchor_mode & m) == m {
+                            RarState::AfterMid {
+                                anchor_mode,
+                                mid_mode: m,
+                                mid_pos: next_pos,
+                                saw_lds_load: false,
+                            }
+                        } else {
+                            RarState::AfterAnchor {
+                                anchor_mode: m,
+                                saw_lds_load: false,
+                            }
+                        }
+                    } else if (mid_mode & 9) == 9
+                        && (m & 9) != 0
+                        && (mid_mode & m) == m
+                    {
+                        RarState::AfterMid {
+                            anchor_mode: mid_mode,
+                            mid_mode: m,
+                            mid_pos: next_pos,
+                            saw_lds_load: false,
+                        }
+                    } else if (m & 9) == 9 {
+                        RarState::AfterAnchor {
+                            anchor_mode: m,
+                            saw_lds_load: false,
+                        }
+                    } else {
+                        RarState::None
+                    }
+                }
+                _ if (m & 9) == 9 => RarState::AfterAnchor {
+                    anchor_mode: m,
+                    saw_lds_load: false,
+                },
+                _ => RarState::None,
+            };
+            self.adj = Some(m);
+        } else {
+            self.reset();
+        }
+        false
+    }
+
+    fn on_ret(&self, kept: &mut [u32], dropped_kept: &mut bool, changed: &mut bool) {
+        match self.rar {
+            RarState::AfterMid {
+                mid_mode,
+                mid_pos,
+                saw_lds_load: true,
+                ..
+            } if (mid_mode & 1) != 0 && mid_mode & !(1 | 8) == 0 => {
+                kept[mid_pos] = u32::MAX;
+                *dropped_kept = true;
+                *changed = true;
+            }
+            RarState::TailBeforeRet { mid_pos } => {
+                kept[mid_pos] = u32::MAX;
+                *dropped_kept = true;
+                *changed = true;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// A natural loop detected via the dominator tree.
 struct NaturalLoop {
     header: usize,
@@ -373,14 +556,14 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM | BARRIERS) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), a branch
             // that goes one way leaves blocks with one way in, and LICM
             // exposes hoisted pure values to REUSE/FOLD outside the loop.
             for _ in 0..4 {
                 let mut changed = false;
-                if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD) != 0 {
+                if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | BARRIERS) != 0 {
                     changed |= self.merge(passes);
                 }
                 if passes & (FOLD | EXT_FOLD) != 0 {
@@ -1568,17 +1751,19 @@ impl Module {
         })
     }
 
-    /// [`FOLD`], [`EXT_FOLD`], [`REUSE`], [`FACTS`], [`LOADS`] and [`MEM_FWD`]:
-    /// one walk over the dominator tree. Returns whether anything changed.
+    /// [`FOLD`], [`EXT_FOLD`], [`REUSE`], [`FACTS`], [`LOADS`], [`MEM_FWD`]
+    /// and [`BARRIERS`]: one walk over the dominator tree. Returns whether
+    /// anything changed.
     fn merge(&mut self, passes: u32) -> bool {
         if self.blocks.is_empty() {
             return false;
         }
         let ext_fold = passes & EXT_FOLD != 0;
         let mem_fwd = passes & MEM_FWD != 0;
+        let barriers_on = passes & BARRIERS != 0;
         let effects = self.effects();
         let tree = self.dominator_tree();
-        let escaped = if mem_fwd {
+        let escaped = if mem_fwd || barriers_on {
             self.escaped_globals(&tree.order)
         } else {
             Vec::new()
@@ -1706,6 +1891,7 @@ impl Module {
             } else {
                 PrivateVals::default()
             };
+            let mut barriers = BarrierState::default();
             let mut dropped_kept = false;
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
@@ -1805,9 +1991,71 @@ impl Module {
                     if class == Effect::Writes {
                         read.clear();
                     }
+                    if barriers_on {
+                        match self.insts[i as usize].op.clone() {
+                            Op::Load(_) if class == Effect::Pure => {
+                                barriers.on_load(PtrRoot::ConstGlobal(0));
+                            }
+                            Op::Load(ptr) => {
+                                let (root, _) = self.trace_ptr(ptr, &escaped);
+                                barriers.on_load(root);
+                            }
+                            Op::Store(..)
+                            | Op::AtomicRmw(..)
+                            | Op::CmpXchg(..)
+                            | Op::Phi(_) => barriers.reset(),
+                            Op::Call(f, args) => match class {
+                                Effect::Reads | Effect::Lanes => barriers.reset(),
+                                Effect::Pure => {
+                                    if self.funcs[f as usize].attr != Some(Attr::ReadNone) {
+                                        barriers.reset();
+                                    }
+                                }
+                                Effect::Writes => match write_kind(&self.funcs[f as usize]) {
+                                    WriteKind::Barrier => {
+                                        let mode = if args.len() == 2
+                                            && self.int_k(args[0]).is_some_and(|(_, op)| op == 80)
+                                        {
+                                            self.int_k(args[1]).map(|(_, m)| m)
+                                        } else {
+                                            None
+                                        };
+                                        if self.is_void(self.insts[i as usize].ty) {
+                                            if barriers.on_barrier(
+                                                mode,
+                                                &mut kept,
+                                                &mut dropped_kept,
+                                                &mut changed,
+                                            ) {
+                                                continue;
+                                            }
+                                        } else {
+                                            barriers.reset();
+                                        }
+                                    }
+                                    WriteKind::OutputOnly => barriers.on_non_lds_sink_store(),
+                                    WriteKind::ResourceMemory => {
+                                        let name = self.funcs[f as usize]
+                                            .name
+                                            .strip_prefix("dx.op.")
+                                            .unwrap_or(&self.funcs[f as usize].name);
+                                        if name.starts_with("atomic") {
+                                            barriers.reset();
+                                        } else {
+                                            barriers.on_non_lds_sink_store();
+                                        }
+                                    }
+                                    WriteKind::All => barriers.reset(),
+                                },
+                            },
+                            _ => {}
+                        }
+                    }
                 } else {
                     match self.insts[i as usize].op.clone() {
-                        Op::Load(_) if class == Effect::Pure => {}
+                        Op::Load(_) if class == Effect::Pure => {
+                            barriers.on_load(PtrRoot::ConstGlobal(0));
+                        }
                         Op::Load(ptr) => {
                             let val_ty = self.insts[i as usize].ty;
                             let (root, raw_path) = self.trace_ptr(ptr, &escaped);
@@ -1888,6 +2136,7 @@ impl Module {
                                 }
                                 PtrRoot::ConstGlobal(_) => {}
                             }
+                            barriers.on_load(root);
                         }
                         Op::Store(ptr, val) => {
                             let val_ty = self.type_of(val);
@@ -1917,6 +2166,7 @@ impl Module {
                                         let pos = kept.len();
                                         kept.push(i);
                                         pending_const_stores.insert(slot, pos);
+                                        barriers.reset();
                                         continue;
                                     }
                                     PtrPath::Dynamic => {
@@ -1938,6 +2188,7 @@ impl Module {
                                         let pos = kept.len();
                                         kept.push(i);
                                         pending_dyn_stores.insert(slot, pos);
+                                        barriers.reset();
                                         continue;
                                     }
                                 },
@@ -1958,6 +2209,7 @@ impl Module {
                                         let pos = kept.len();
                                         kept.push(i);
                                         pending_const_stores.insert(slot, pos);
+                                        barriers.reset();
                                         continue;
                                     }
                                     PtrPath::Dynamic => {
@@ -1974,6 +2226,7 @@ impl Module {
                                         let pos = kept.len();
                                         kept.push(i);
                                         pending_dyn_stores.insert(slot, pos);
+                                        barriers.reset();
                                         continue;
                                     }
                                 },
@@ -1981,6 +2234,7 @@ impl Module {
                                     unknown_loads.clear();
                                 }
                             }
+                            barriers.reset();
                         }
                         Op::AtomicRmw(_, ptr, _) | Op::CmpXchg(ptr, _, _) => {
                             let (root, _) = self.trace_ptr(ptr, &escaped);
@@ -2001,6 +2255,7 @@ impl Module {
                                     unknown_loads.clear();
                                 }
                             }
+                            barriers.reset();
                         }
                         Op::Call(f, args) => match class {
                             Effect::Reads => {
@@ -2012,6 +2267,7 @@ impl Module {
                                     }
                                     read_mem.insert(key, V::Inst(i));
                                 }
+                                barriers.reset();
                             }
                             Effect::Lanes => {
                                 if let Some(key) = self.key(i, ext_fold) {
@@ -2022,6 +2278,7 @@ impl Module {
                                     }
                                     read_lanes.insert(key, V::Inst(i));
                                 }
+                                barriers.reset();
                             }
                             Effect::Writes => match write_kind(&self.funcs[f as usize]) {
                                 WriteKind::Barrier => {
@@ -2032,6 +2289,18 @@ impl Module {
                                     } else {
                                         None
                                     };
+                                    if barriers_on && self.is_void(self.insts[i as usize].ty) {
+                                        if barriers.on_barrier(
+                                            mode,
+                                            &mut kept,
+                                            &mut dropped_kept,
+                                            &mut changed,
+                                        ) {
+                                            continue;
+                                        }
+                                    } else {
+                                        barriers.reset();
+                                    }
                                     let touches_lds = mode.is_none_or(|m| m & (1 | 8) != 0);
                                     let touches_uav = mode.is_none_or(|m| m & (1 | 2 | 4) != 0);
                                     if touches_lds {
@@ -2049,9 +2318,18 @@ impl Module {
                                         read_mem.clear();
                                     }
                                 }
-                                WriteKind::OutputOnly => {}
+                                WriteKind::OutputOnly => barriers.on_non_lds_sink_store(),
                                 WriteKind::ResourceMemory => {
                                     read_mem.clear();
+                                    let name = self.funcs[f as usize]
+                                        .name
+                                        .strip_prefix("dx.op.")
+                                        .unwrap_or(&self.funcs[f as usize].name);
+                                    if name.starts_with("atomic") {
+                                        barriers.reset();
+                                    } else {
+                                        barriers.on_non_lds_sink_store();
+                                    }
                                 }
                                 WriteKind::All => {
                                     let is_discard = self.funcs[f as usize]
@@ -2069,14 +2347,23 @@ impl Module {
                                     if !is_discard {
                                         priv_vals = PrivateVals::default();
                                     }
+                                    barriers.reset();
                                 }
                             },
-                            Effect::Pure => {}
+                            Effect::Pure => {
+                                if self.funcs[f as usize].attr != Some(Attr::ReadNone) {
+                                    barriers.reset();
+                                }
+                            }
                         },
+                        Op::Phi(_) => barriers.reset(),
                         _ => {}
                     }
                 }
                 kept.push(i);
+            }
+            if barriers_on && matches!(self.blocks[b].term, Some(Term::Ret)) {
+                barriers.on_ret(&mut kept, &mut dropped_kept, &mut changed);
             }
             if dropped_kept {
                 kept.retain(|&id| id != u32::MAX);
@@ -3662,9 +3949,10 @@ mod tests {
                 LOADS,
                 MEM_FWD,
                 LICM,
+                BARRIERS,
                 FOLD | FACTS,
                 FOLD | EXT_FOLD | FACTS,
-                LOADS | MEM_FWD | LICM,
+                LOADS | MEM_FWD | LICM | BARRIERS,
                 FOLD | EXT_FOLD | REUSE | DEAD,
                 ALL,
             ] {
@@ -4870,6 +5158,366 @@ mod tests {
             assert!(
                 k.m.blocks[k.b].body.contains(&inst_id(ld_ok)),
                 "provably in-bounds ConstGlobal GEP load must hoist"
+            );
+            k.m.write();
+        }
+    }
+
+    #[test]
+    fn adjacent_redundant_barrier_elimination_and_negative_controls() {
+        let mut k = kit();
+        let (i32t, void) = (k.m.int(32), k.m.void());
+        let bty = k.m.func_ty(void, vec![i32t, i32t]);
+        k.m.ptr(bty);
+        let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+        let arr = k.m.array(4, i32t);
+        let lds = k.m.global("lds", arr, 3);
+        let (k0, k1, k8, k9, k11, k80) = (
+            k.m.i32(0),
+            k.m.i32(1),
+            k.m.i32(8),
+            k.m.i32(9),
+            k.m.i32(11),
+            k.m.i32(80),
+        );
+        let x = k.m.call(k.b, k.reads, vec![k0, k1]);
+        // 1) barrier(11) then pure arithmetic then barrier(9): 11 covers 9 -> drop second.
+        k.m.call(k.b, barrier, vec![k80, k11]);
+        let pure_sum = k.m.bin(k.b, Bin::Add, x, k1);
+        k.m.call(k.b, barrier, vec![k80, k9]);
+        // 2) LDS load resets adjacency -> next barrier(9) MUST stay.
+        let p0 = k.m.element(k.b, lds, k0);
+        let lv = k.m.load(k.b, p0);
+        k.m.call(k.b, barrier, vec![k80, k9]);
+        // 3) barrier(9) then barrier(11): 9 does NOT cover bit 2 -> keep barrier(11).
+        k.m.call(k.b, barrier, vec![k80, k11]);
+        // 4) barrier(11) again immediately -> dropped.
+        k.m.call(k.b, barrier, vec![k80, k11]);
+        // 5) Negative control: fence-only (8) then sync-only (1) does NOT cover (9).
+        k.m.store(k.b, p0, pure_sum);
+        k.m.call(k.b, barrier, vec![k80, k8]);
+        k.m.call(k.b, barrier, vec![k80, k1]);
+        k.m.call(k.b, barrier, vec![k80, k9]);
+        k.m.call(k.b, k.writes, vec![lv, pure_sum]);
+        let next = k.m.new_block();
+        k.m.terminate(k.b, Term::Br(next));
+        // 6) Barrier in a different block MUST stay even with no ops between.
+        k.m.call(next, barrier, vec![k80, k9]);
+        k.m.terminate(next, Term::Ret);
+
+        k.m.optimise(BARRIERS);
+        let barrier_modes = |b: usize| -> Vec<u64> {
+            k.m.blocks[b]
+                .body
+                .iter()
+                .filter_map(|&id| match &k.m.insts[id as usize].op {
+                    Op::Call(f, args) if k.m.funcs[*f as usize].name == "dx.op.barrier" => {
+                        k.m.int_k(args[1]).map(|(_, m)| m)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(
+            barrier_modes(k.b),
+            vec![11, 9, 11, 8, 1, 9],
+            "only strictly covered adjacent barriers should drop"
+        );
+        assert_eq!(barrier_modes(next), vec![9], "cross-block barrier must stay");
+        k.m.write();
+    }
+
+    #[test]
+    fn read_after_read_barrier_coalescing_and_soundness_negatives() {
+        let trace_lds_ops = |m: &Module, b: usize| -> String {
+            m.blocks[b]
+                .body
+                .iter()
+                .filter_map(|&id| match &m.insts[id as usize].op {
+                    Op::Call(f, _) if m.funcs[*f as usize].name == "dx.op.barrier" => Some('B'),
+                    Op::Load(_) => Some('R'),
+                    Op::Store(..) => Some('W'),
+                    Op::AtomicRmw(..) | Op::CmpXchg(..) => Some('A'),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // 1) Positive: `write -> read -> read -> overwrite -> read` cuts 5 -> 4 barriers
+        //    under `BARRIERS`, `DEFAULT | BARRIERS`, and `ALL` (`BWBRBRBWBR` -> `BWBRRBWBR`).
+        for passes in [BARRIERS, DEFAULT | BARRIERS, ALL] {
+            let mut k = kit();
+            let (i32t, void) = (k.m.int(32), k.m.void());
+            let bty = k.m.func_ty(void, vec![i32t, i32t]);
+            k.m.ptr(bty);
+            let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+            let arr = k.m.array(8, i32t);
+            let lds = k.m.global("lds", arr, 3);
+            let (k0, k1, k9, k80) = (k.m.i32(0), k.m.i32(1), k.m.i32(9), k.m.i32(80));
+            let v0 = k.m.call(k.b, k.reads, vec![k0, k1]);
+            let p0 = k.m.element(k.b, lds, k0);
+            let p1 = k.m.element(k.b, lds, k1);
+
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, v0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r1 = k.m.load(k.b, p1);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r2 = k.m.load(k.b, p0);
+            let next_v = k.m.bin(k.b, Bin::Add, r1, k1);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, next_v);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r3 = k.m.load(k.b, p1);
+            k.m.call(k.b, k.writes, vec![r1, r2]);
+            k.m.call(k.b, k.writes, vec![r3, k0]);
+            k.m.terminate(k.b, Term::Ret);
+
+            assert_eq!(trace_lds_ops(&k.m, k.b), "BWBRBRBWBR");
+            k.m.optimise(passes);
+            assert_eq!(
+                trace_lds_ops(&k.m, k.b),
+                "BWBRRBWBR",
+                "middle read-after-read barrier must drop while write barriers stay (passes={passes})"
+            );
+            k.m.write();
+        }
+
+        // 2) Positive: 3 consecutive reads separated by pure ALU, `ReadNone` call,
+        //    and non-escaping `PrivateGlobal` load coalesce 5 -> 3 barriers.
+        {
+            let mut k = kit();
+            let (i32t, void) = (k.m.int(32), k.m.void());
+            let bty = k.m.func_ty(void, vec![i32t, i32t]);
+            k.m.ptr(bty);
+            let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+            let arr = k.m.array(8, i32t);
+            let lds = k.m.global("lds", arr, 3);
+            let priv_g = k.m.global("priv_g", arr, 0);
+            let (k0, k1, k2, k9, k80) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(2),
+                k.m.i32(9),
+                k.m.i32(80),
+            );
+            let v0 = k.m.call(k.b, k.reads, vec![k0, k1]);
+            let p0 = k.m.element(k.b, lds, k0);
+            let p1 = k.m.element(k.b, lds, k1);
+            let p2 = k.m.element(k.b, lds, k2);
+            let priv0 = k.m.element(k.b, priv_g, k0);
+            k.m.store(k.b, priv0, v0);
+
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, v0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r1 = k.m.load(k.b, p0);
+            let alu = k.m.bin(k.b, Bin::Xor, r1, k2);
+            let pure_c = k.m.call(k.b, k.pure, vec![alu, k1]);
+            let priv_ld = k.m.load(k.b, priv0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r2 = k.m.load(k.b, p1);
+            let alu2 = k.m.bin(k.b, Bin::Add, pure_c, priv_ld);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r3 = k.m.load(k.b, p2);
+            let sum = k.m.bin(k.b, Bin::Add, r2, r3);
+            let sum = k.m.bin(k.b, Bin::Add, sum, alu2);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, sum);
+            k.m.terminate(k.b, Term::Ret);
+
+            k.m.optimise(BARRIERS);
+            assert_eq!(trace_lds_ops(&k.m, k.b), "WBWBRRRRBW");
+            k.m.write();
+        }
+
+        // 3) Positive: end-of-shader `write -> read -> read -> bufferStore -> Ret`
+        //    (no trailing LDS overwrite) drops the middle barrier (`3 -> 2`, `BWBRR`).
+        {
+            let mut k = kit();
+            let (i32t, void) = (k.m.int(32), k.m.void());
+            let bty = k.m.func_ty(void, vec![i32t, i32t]);
+            k.m.ptr(bty);
+            let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+            let arr = k.m.array(4, i32t);
+            let lds = k.m.global("lds", arr, 3);
+            let (k0, k1, k9, k80) = (k.m.i32(0), k.m.i32(1), k.m.i32(9), k.m.i32(80));
+            let v0 = k.m.call(k.b, k.reads, vec![k0, k1]);
+            let p0 = k.m.element(k.b, lds, k0);
+            let p1 = k.m.element(k.b, lds, k1);
+
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, v0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r1 = k.m.load(k.b, p0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r2 = k.m.load(k.b, p1);
+            k.m.call(k.b, k.writes, vec![r1, r2]);
+            k.m.terminate(k.b, Term::Ret);
+
+            assert_eq!(trace_lds_ops(&k.m, k.b), "BWBRBR");
+            k.m.optimise(BARRIERS);
+            assert_eq!(trace_lds_ops(&k.m, k.b), "BWBRR");
+            k.m.write();
+        }
+
+        // 4) Negative: `write -> read -> write -> read` MUST keep all 4 barriers (`BWBRBWBR`).
+        {
+            let mut k = kit();
+            let (i32t, void) = (k.m.int(32), k.m.void());
+            let bty = k.m.func_ty(void, vec![i32t, i32t]);
+            k.m.ptr(bty);
+            let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+            let arr = k.m.array(4, i32t);
+            let lds = k.m.global("lds", arr, 3);
+            let (k0, k1, k9, k80) = (k.m.i32(0), k.m.i32(1), k.m.i32(9), k.m.i32(80));
+            let v0 = k.m.call(k.b, k.reads, vec![k0, k1]);
+            let p0 = k.m.element(k.b, lds, k0);
+            let p1 = k.m.element(k.b, lds, k1);
+
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, v0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r1 = k.m.load(k.b, p1);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, r1);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r2 = k.m.load(k.b, p1);
+            k.m.call(k.b, k.writes, vec![r1, r2]);
+            k.m.terminate(k.b, Term::Ret);
+
+            k.m.optimise(ALL);
+            assert_eq!(trace_lds_ops(&k.m, k.b), "BWBRBWBR");
+            k.m.write();
+        }
+
+        // 5) Negative: intervening LDS `AtomicRmw`, `CmpXchg`, UAV `atomicBinOp`,
+        //    `bufferLoad`, `bufferStore`, or `waveReadLaneFirst` between reads MUST keep barriers.
+        for kind in 0..6 {
+            let mut k = kit();
+            let (i32t, void) = (k.m.int(32), k.m.void());
+            let bty = k.m.func_ty(void, vec![i32t, i32t]);
+            k.m.ptr(bty);
+            let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+            let fty_i32 = k.m.func_ty(i32t, vec![i32t, i32t]);
+            k.m.ptr(fty_i32);
+            let uav_atomic =
+                k.m.function("dx.op.atomicBinOp.i32", fty_i32, Some(Attr::NoUnwind), false);
+            let wave_op = k.m.function(
+                "dx.op.waveReadLaneFirst.i32",
+                fty_i32,
+                Some(Attr::NoUnwind),
+                false,
+            );
+            let arr = k.m.array(4, i32t);
+            let lds = k.m.global("lds", arr, 3);
+            let (k0, k1, k2, k9, k80) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(2),
+                k.m.i32(9),
+                k.m.i32(80),
+            );
+            let v0 = k.m.call(k.b, k.reads, vec![k0, k1]);
+            let p0 = k.m.element(k.b, lds, k0);
+            let p1 = k.m.element(k.b, lds, k1);
+            let p2 = k.m.element(k.b, lds, k2);
+
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, v0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r1 = k.m.load(k.b, p1);
+            let side = match kind {
+                0 => k.m.atomic(k.b, crate::emit::bitcode::Rmw::Add, p2, k1),
+                1 => k.m.cmpxchg(k.b, p2, k0, k1),
+                2 => k.m.call(k.b, uav_atomic, vec![r1, k1]),
+                3 => k.m.call(k.b, k.reads, vec![r1, k2]),
+                4 => {
+                    k.m.call(k.b, k.writes, vec![r1, k2]);
+                    r1
+                }
+                _ => k.m.call(k.b, wave_op, vec![r1, k0]),
+            };
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r2 = k.m.load(k.b, p0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.store(k.b, p0, side);
+            k.m.call(k.b, k.writes, vec![r1, r2]);
+            k.m.terminate(k.b, Term::Ret);
+
+            let count_barriers = |m: &Module| -> usize {
+                m.blocks[k.b]
+                    .body
+                    .iter()
+                    .filter(|&&id| {
+                        matches!(
+                            &m.insts[id as usize].op,
+                            Op::Call(f, _) if m.funcs[*f as usize].name == "dx.op.barrier"
+                        )
+                    })
+                    .count()
+            };
+            assert_eq!(count_barriers(&k.m), 4);
+            k.m.optimise(ALL);
+            assert_eq!(
+                count_barriers(&k.m),
+                4,
+                "intervening side-effect/lane op kind={kind} must preserve all 4 barriers"
+            );
+            k.m.write();
+        }
+
+        // 6) Negative: WAR hazard across a branch MUST keep `B2(9)`.
+        //    Also verifies cross-block reads (`Br`) and fence-only `barrier(8)` keep barriers.
+        {
+            let mut k = kit();
+            let (i32t, void) = (k.m.int(32), k.m.void());
+            let bty = k.m.func_ty(void, vec![i32t, i32t]);
+            k.m.ptr(bty);
+            let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+            let arr = k.m.array(4, i32t);
+            let lds = k.m.global("lds", arr, 3);
+            let (k0, k1, k8, k9, k80) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(8),
+                k.m.i32(9),
+                k.m.i32(80),
+            );
+            let v0 = k.m.call(k.b, k.reads, vec![k0, k1]);
+            let cond = k.m.cmp(k.b, pred::EQ, v0, k1);
+            let p0 = k.m.element(k.b, lds, k0);
+            let p1 = k.m.element(k.b, lds, k1);
+
+            // Fence-only mode 8 without thread-group sync bit 1: must keep all three `barrier(8)`.
+            k.m.call(k.b, barrier, vec![k80, k8]);
+            let f1 = k.m.load(k.b, p0);
+            k.m.call(k.b, barrier, vec![k80, k8]);
+            let f2 = k.m.load(k.b, p1);
+            k.m.call(k.b, barrier, vec![k80, k8]);
+
+            // WAR across branch: B2 protects R1(p0) from the un-barriered store to p0 in `then_blk`.
+            k.m.store(k.b, p0, v0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r1 = k.m.load(k.b, p0);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let r2 = k.m.load(k.b, p1);
+            let (then_blk, exit_blk) = (k.m.new_block(), k.m.new_block());
+            k.m.terminate(k.b, Term::CondBr(cond, then_blk, exit_blk));
+
+            let sum = k.m.bin(then_blk, Bin::Add, r1, r2);
+            k.m.store(then_blk, p0, sum);
+            k.m.terminate(then_blk, Term::Br(exit_blk));
+
+            let out_f = k.m.bin(exit_blk, Bin::Add, f1, f2);
+            k.m.call(exit_blk, k.writes, vec![out_f, r2]);
+            k.m.terminate(exit_blk, Term::Ret);
+
+            k.m.optimise(ALL);
+            assert_eq!(
+                trace_lds_ops(&k.m, k.b),
+                "BRBRBWBRBR",
+                "fence-only barriers and branch-exiting WAR barrier must stay intact"
             );
             k.m.write();
         }
