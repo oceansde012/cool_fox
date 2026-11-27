@@ -743,8 +743,26 @@ pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
     CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
 }
 
+/// Vice-Tay 876a02f: ranges joined in their own storage
+/// (`VICTORY_RANGES_REUSE=1`; off: a new vector, as before).
+fn ranges_reuse() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_RANGES_REUSE"))
+}
+
 /// Ranges in order, those that overlap or touch as one.
 fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if !ranges_reuse() {
+        ranges.sort();
+        let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (from, to) in ranges {
+            match out.last_mut() {
+                Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                _ => out.push((from, to)),
+            }
+        }
+        return out;
+    }
     if ranges.len() < 2 {
         return ranges;
     }
@@ -1359,12 +1377,39 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
         .map(|i| chunk * DIFF_CHUNK + i)
 }
 
+/// A thread's first byte in [`Shadow::differing`]: `at` back to its piece's
+/// start. Fixed (Vice-Tay 21ec811, fxceless #1407): a piece that begins
+/// before the copy no longer wraps and drops the first part
+/// (`VICTORY_COMPARE_FIRST_PIECE=1`; off: as before).
+fn piece_cut(at: usize, start: usize, from: usize, fixed: bool) -> usize {
+    if fixed {
+        at.saturating_sub((start + at) % PIECE).max(from)
+    } else {
+        (at - (start + at) % PIECE).max(from)
+    }
+}
+
+fn compare_first_piece() -> bool {
+    #[cfg(test)]
+    if FIRST_PIECE_IN_TEST.with(std::cell::Cell::get) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_COMPARE_FIRST_PIECE"))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FIRST_PIECE_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(test)]
 mod difference_tests {
     use super::{PIECE, Shadow, first_difference, last_difference};
 
     #[test]
     fn parallel_compare_includes_the_first_partial_piece() {
+        super::FIRST_PIECE_IN_TEST.with(|v| v.set(true));
         const LEN: usize = 48 << 20;
         const START: u64 = 0x0012_3456_8000;
         let before = vec![0u8; LEN];
@@ -1528,6 +1573,13 @@ fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
+/// Vice-Tay d60fc84: wake only the helpers the jobs can use
+/// (`VICTORY_WIDE_NOTIFY_FEW=1`; off: every helper, as before).
+fn wide_notify_few() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WIDE_NOTIFY_FEW"))
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1593,15 +1645,19 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    // The calling thread also drains the queue. Wake helpers only for the
-    // jobs it can share; a busy helper checks for more work before sleeping.
-    let helpers = job_count - 1;
-    if helpers >= workers.thread_count {
-        workers.more.notify_all();
-    } else {
-        for _ in 0..helpers {
-            workers.more.notify_one();
+    if wide_notify_few() {
+        // The calling thread also drains the queue. Wake helpers only for the
+        // jobs it can share; a busy helper checks for more work before sleeping.
+        let helpers = job_count - 1;
+        if helpers >= workers.thread_count {
+            workers.more.notify_all();
+        } else {
+            for _ in 0..helpers {
+                workers.more.notify_one();
+            }
         }
+    } else {
+        workers.more.notify_all();
     }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
@@ -2248,7 +2304,8 @@ unsafe fn word_runs_avx2(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
 /// In session play-1125-1724 a frame had 190,000 runs in 400 pages, each
 /// a copy of a few bytes of its own.
 fn under_fused() -> bool {
-    crate::toggled!("VICTORY_UNDER_FUSED")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_UNDER_FUSED"))
 }
 
 /// [`word_runs`], and every 32-byte block of `held` in which a word differs
@@ -3512,7 +3569,7 @@ impl Shadow {
             }
             let at = from + (to - from) / threads * i;
             // The first piece can begin before the copy.
-            at.saturating_sub((start + at) % PIECE).max(from)
+            piece_cut(at, start, from, compare_first_piece())
         };
         let scan = &scan;
         std::thread::scope(|s| {
@@ -3779,13 +3836,14 @@ impl Shadow {
             let mut changed: Vec<(usize, usize)> = Vec::new();
             let (mut runs_in, mut bytes_in) = (0u64, 0u64);
             for (i, runs) in done.into_iter().enumerate() {
-                let Some(mut runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
+                let Some(runs) = runs.into_inner().unwrap_or_else(|e| e.into_inner()) else {
                     continue;
                 };
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 runs_in += runs.len() as u64;
                 bytes_in += runs.iter().map(|r| r.1 as u64).sum::<u64>();
-                if self.card.is_some() {
+                if self.card.is_some() && ranges_reuse() {
+                    let mut runs = runs;
                     let page_offset = lo - start;
                     for (from, to) in &mut runs {
                         *from += page_offset;
@@ -3796,6 +3854,8 @@ impl Shadow {
                     } else {
                         changed.append(&mut runs);
                     }
+                } else if self.card.is_some() {
+                    changed.extend(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
                 }
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes

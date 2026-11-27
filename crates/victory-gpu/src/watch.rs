@@ -2542,12 +2542,19 @@ fn open(g: &Guards, start: usize, end: usize) -> usize {
 
 /// [`open`]; `given`: the blocks of the page's views, for a fault opening one
 /// block with the lock shared, which holds their claims ([`open_faulted`]).
+/// Vice-Tay 3c7ad08 (fxceless #1400): one unaliased block opened without a
+/// range list (`VICTORY_GUARD_ONE_FAST=1`; off: as before).
+fn guard_one_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_GUARD_ONE_FAST"))
+}
+
 fn open_given(g: &Guards, start: usize, end: usize, given: Option<&[usize]>) -> usize {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
     if first >= last {
         return 0;
     }
-    if first + 1 == last {
+    if guard_one_fast() && first + 1 == last {
         let protected = g.protected.contains(first);
         if !g.aliased.contains(first) {
             if protected {

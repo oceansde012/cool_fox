@@ -4361,8 +4361,11 @@ impl Host {
                         // it: codec-d/cool_fox 641835a4.)
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
                             let raw = shadow.buffer.as_raw();
-                            if !transitioned.contains(&raw) {
-                                transitioned.push(raw);
+                            let one = one_barrier_per_buffer();
+                            if !one || !transitioned.contains(&raw) {
+                                if one {
+                                    transitioned.push(raw);
+                                }
                                 sent.push(transition(
                                     &shadow.buffer,
                                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -10933,3 +10936,10 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+/// codec-d 641835a4 (via Vice-Tay 773d902): one COPY_DEST to shader-resource
+/// transition per card buffer after its copies (`VICTORY_ONE_BARRIER_PER_BUFFER=1`;
+/// off: one per copy, as before).
+fn one_barrier_per_buffer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_ONE_BARRIER_PER_BUFFER"))
+}

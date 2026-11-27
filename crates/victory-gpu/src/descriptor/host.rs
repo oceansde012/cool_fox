@@ -243,7 +243,7 @@ fn spans_quick() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SPANS_QUICK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SPANS_QUICK"))
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
