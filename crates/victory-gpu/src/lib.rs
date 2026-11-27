@@ -46,6 +46,8 @@ mod inplace;
 #[cfg(windows)]
 mod port;
 #[cfg(windows)]
+mod port_journal;
+#[cfg(windows)]
 mod land;
 pub mod list;
 pub mod object;
