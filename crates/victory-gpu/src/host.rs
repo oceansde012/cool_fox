@@ -3038,7 +3038,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     // Where each copy is in it, if shaders may be writing it (none begins to
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
+    let mut places: ByCopy<Option<usize>> = take_places();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
@@ -3055,6 +3055,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
+    give_back_places(places);
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -5563,7 +5564,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = take_batch();
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -5676,6 +5677,7 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
+        if submit_reuse() { give_back_batch(batch); }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -7668,6 +7670,113 @@ struct Batch {
     front: bool,
 }
 
+thread_local! {
+    static SPARE_BATCH: std::cell::RefCell<Option<Batch>> = const { std::cell::RefCell::new(None) };
+    static SPARE_PLACES: std::cell::RefCell<Option<ByCopy<Option<usize>>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn submit_reuse() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SUBMIT_REUSE"))
+}
+
+fn take_batch() -> Batch {
+    if submit_reuse()
+        && let Some(batch) = SPARE_BATCH.with(|spare| spare.borrow_mut().take())
+    {
+        return batch;
+    }
+    Batch::default()
+}
+
+fn give_back_batch(mut batch: Batch) {
+    if !submit_reuse() {
+        return;
+    }
+    batch.clear_for_reuse();
+    if batch.refreshes.capacity() > 1 << 16 {
+        batch.refreshes.shrink_to(1 << 16);
+    }
+    if batch.due.capacity() > 1 << 16 {
+        batch.due.shrink_to(1 << 16);
+    }
+    if batch.placed.capacity() > 1 << 16 {
+        batch.placed.shrink_to(1 << 16);
+    }
+    if batch.fills.capacity() > 1 << 16 {
+        batch.fills.shrink_to(1 << 16);
+    }
+    if batch.index.capacity() > 1 << 15 {
+        batch.index.shrink_to(1 << 15);
+    }
+    if batch.textures.capacity() > 1 << 15 {
+        batch.textures.shrink_to(1 << 15);
+    }
+    if batch.ahead.capacity() > 1 << 15 {
+        batch.ahead.shrink_to(1 << 15);
+    }
+    SPARE_BATCH.with(|spare| {
+        *spare.borrow_mut() = Some(batch);
+    });
+}
+
+fn take_places() -> ByCopy<Option<usize>> {
+    if submit_reuse()
+        && let Some(mut places) = SPARE_PLACES.with(|spare| spare.borrow_mut().take())
+    {
+        places.clear();
+        return places;
+    }
+    ByCopy::default()
+}
+
+fn give_back_places(mut places: ByCopy<Option<usize>>) {
+    if !submit_reuse() {
+        return;
+    }
+    places.clear();
+    if places.capacity() > 1 << 15 {
+        places.shrink_to(1 << 15);
+    }
+    SPARE_PLACES.with(|spare| {
+        *spare.borrow_mut() = Some(places);
+    });
+}
+
+impl Batch {
+    fn clear_for_reuse(&mut self) {
+        self.refreshes.clear();
+        self.index.clear();
+        self.textures.clear();
+        self.due.clear();
+        self.placed.clear();
+        self.fills.clear();
+        self.ahead.clear();
+        self.front = false;
+    }
+}
+
+#[cfg(test)]
+mod submit_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn cleared_batch_equals_default() {
+        let mut batch = Batch::default();
+        batch.fills.push((1, 2, 3));
+        batch.ahead.insert(1, (4, 5));
+        batch.clear_for_reuse();
+        assert!(batch.refreshes.is_empty());
+        assert!(batch.index.is_empty());
+        assert!(batch.textures.is_empty());
+        assert!(batch.due.is_empty());
+        assert!(batch.placed.is_empty());
+        assert!(batch.fills.is_empty());
+        assert!(batch.ahead.is_empty());
+        assert!(!batch.front);
+    }
+}
+
 /// Whether the copies that a submission's shaders write are brought up to
 /// date together, on several threads, ahead of its steps
 /// (`VICTORY_REFRESH_AHEAD=0`: each before the step that gives it to them).
@@ -7963,6 +8072,44 @@ impl Batch {
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
     /// submission beginning at each of `parts`.
+    /// `VICTORY_REFRESH_SKIP_EMPTY=1`: refreshes known to copy nothing are
+    /// told so first, whatever their number, before the write watch is asked
+    /// ahead and before any thread is woken for the rest.
+    fn refresh_skip_empty() -> bool {
+        static SKIP: OnceLock<bool> = OnceLock::new();
+        *SKIP.get_or_init(|| crate::switch::on("VICTORY_REFRESH_SKIP_EMPTY"))
+    }
+
+    /// The refreshes of `spans` that may copy something; above `few` of them
+    /// told on several threads.
+    fn retain_nothing_new(
+        mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        few: usize,
+    ) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+        if spans.len() <= few {
+            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            return spans;
+        }
+        let len = spans.len();
+        let spans = std::sync::Arc::new(spans);
+        let keep: std::sync::Arc<Vec<std::sync::atomic::AtomicBool>> =
+            std::sync::Arc::new((0..len).map(|_| std::sync::atomic::AtomicBool::new(false)).collect());
+        crate::shadow::wide_each(len.div_ceil(64), {
+            let (spans, keep) = (spans.clone(), keep.clone());
+            move |chunk| {
+                for i in chunk * 64..(chunk * 64 + 64).min(len) {
+                    let (shadow, from, to) = &spans[i];
+                    if !shadow.nothing_new(*from, *to - *from) {
+                        keep[i].store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+        // (`wide_each` returns when every job is done: the clones are gone.)
+        let spans = std::sync::Arc::try_unwrap(spans).unwrap_or_else(|arc| (*arc).clone());
+        spans.into_iter().enumerate().filter(|(i, _)| keep[*i].load(Ordering::Relaxed)).map(|(_, span)| span).collect()
+    }
+
     fn refresh_front(&mut self, runs: &[&HostList], parts: &[usize]) {
         let mut copies: ByCopy<std::sync::Arc<crate::shadow::Shadow>> = ByCopy::default();
         let mut due = Vec::new();
@@ -8012,6 +8159,47 @@ impl Batch {
         // many: then beside the others.
         const FEW: usize = 256;
         let mut spans = spans;
+        if Self::refresh_skip_empty() {
+            #[cfg(feature = "diagnostics")]
+            let all = spans.len();
+            spans = Self::retain_nothing_new(spans, FEW);
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            let ahead = spans.len() > 1;
+            if ahead {
+                let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+                crate::watch::ask_ahead(&ranges);
+            }
+            if spans.len() < 4 && due.is_empty() {
+                for (shadow, from, to) in &spans {
+                    Self::update(shadow, *from, *to);
+                }
+            } else {
+                #[cfg(feature = "diagnostics")]
+                FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
+                crate::shadow::wide_each(spans.len() + due.len(), move |i| {
+                    // The textures first: they are the longer pieces.
+                    let Some(i) = i.checked_sub(due.len()) else {
+                        due[i].refresh();
+                        return;
+                    };
+                    let (shadow, from, to) = &spans[i];
+                    Self::update(shadow, *from, *to);
+                });
+            }
+            if ahead {
+                crate::watch::ask_ahead_done();
+            }
+            // The time counted is the time it took, not the threads' sum.
+            let took = started.elapsed().as_micros() as u64;
+            let summed = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed)).iter().zip(before).map(|(now, was)| now.saturating_sub(was)).collect::<Vec<_>>();
+            PREPARING[2].fetch_sub(summed[1], Ordering::Relaxed);
+            PREPARING[0].fetch_sub(summed[0], Ordering::Relaxed);
+            PREPARING[0].fetch_add(took, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            SPLIT[6].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return;
+        }
         let many = spans.len() > FEW;
         if !many {
             #[cfg(feature = "diagnostics")]
@@ -8170,6 +8358,43 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
+        if Self::refresh_skip_empty() && light {
+            let started = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let all = self.refreshes.len();
+            self.refreshes = Self::retain_nothing_new(std::mem::take(&mut self.refreshes), FEW);
+            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+            let ahead = self.refreshes.len() > 1;
+            if ahead {
+                let started = std::time::Instant::now();
+                let ranges: Vec<(usize, usize)> = self.refreshes.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
+                crate::watch::ask_ahead(&ranges);
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
+            if wide_refresh() && self.refreshes.len() >= 4 {
+                let started = std::time::Instant::now();
+                let before = PREPARING[0].load(Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
+                let refreshes = std::mem::take(&mut self.refreshes);
+                crate::shadow::wide_each(refreshes.len(), move |i| {
+                    let (shadow, from, to) = &refreshes[i];
+                    Self::update(shadow, *from, *to);
+                });
+                let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
+                PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
+            } else {
+                for (shadow, from, to) in self.refreshes.drain(..) {
+                    Self::update(&shadow, from, to);
+                }
+            }
+            if ahead {
+                crate::watch::ask_ahead_done();
+            }
+            return;
+        }
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -8743,10 +8968,12 @@ impl Meter {
         split_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
-            if passes + compares > 0.0 {
+            let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+            if passes + compares + wc_left > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
+                     {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK)",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
