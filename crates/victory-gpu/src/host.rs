@@ -3038,7 +3038,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     // Where each copy is in it, if shaders may be writing it (none begins to
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
-    let mut places: ByCopy<Option<usize>> = ByCopy::default();
+    let mut places: ByCopy<Option<usize>> = take_places();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
@@ -3055,6 +3055,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
+    give_back_places(places);
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -5563,7 +5564,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = take_batch();
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
         // The time a settle of flights takes inside this preparing: the
@@ -5676,6 +5677,7 @@ impl Host {
         for (shadow, at, bytes) in batch.placed.drain(..) {
             shadow.placed_copy(at, &bytes);
         }
+        if submit_reuse() { give_back_batch(batch); }
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
@@ -7666,6 +7668,113 @@ struct Batch {
     /// `ahead` holds everything the submission refreshes
     /// ([`Batch::refresh_front`]).
     front: bool,
+}
+
+thread_local! {
+    static SPARE_BATCH: std::cell::RefCell<Option<Batch>> = const { std::cell::RefCell::new(None) };
+    static SPARE_PLACES: std::cell::RefCell<Option<ByCopy<Option<usize>>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn submit_reuse() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SUBMIT_REUSE"))
+}
+
+fn take_batch() -> Batch {
+    if submit_reuse() {
+        if let Some(batch) = SPARE_BATCH.with(|spare| spare.borrow_mut().take()) {
+            return batch;
+        }
+    }
+    Batch::default()
+}
+
+fn give_back_batch(mut batch: Batch) {
+    if !submit_reuse() {
+        return;
+    }
+    batch.clear_for_reuse();
+    if batch.refreshes.capacity() > 1 << 16 {
+        batch.refreshes.shrink_to(1 << 16);
+    }
+    if batch.due.capacity() > 1 << 16 {
+        batch.due.shrink_to(1 << 16);
+    }
+    if batch.placed.capacity() > 1 << 16 {
+        batch.placed.shrink_to(1 << 16);
+    }
+    if batch.fills.capacity() > 1 << 16 {
+        batch.fills.shrink_to(1 << 16);
+    }
+    if batch.index.capacity() > 1 << 15 {
+        batch.index.shrink_to(1 << 15);
+    }
+    if batch.textures.capacity() > 1 << 15 {
+        batch.textures.shrink_to(1 << 15);
+    }
+    if batch.ahead.capacity() > 1 << 15 {
+        batch.ahead.shrink_to(1 << 15);
+    }
+    SPARE_BATCH.with(|spare| {
+        *spare.borrow_mut() = Some(batch);
+    });
+}
+
+fn take_places() -> ByCopy<Option<usize>> {
+    if submit_reuse() {
+        if let Some(mut places) = SPARE_PLACES.with(|spare| spare.borrow_mut().take()) {
+            places.clear();
+            return places;
+        }
+    }
+    ByCopy::default()
+}
+
+fn give_back_places(mut places: ByCopy<Option<usize>>) {
+    if !submit_reuse() {
+        return;
+    }
+    places.clear();
+    if places.capacity() > 1 << 15 {
+        places.shrink_to(1 << 15);
+    }
+    SPARE_PLACES.with(|spare| {
+        *spare.borrow_mut() = Some(places);
+    });
+}
+
+impl Batch {
+    fn clear_for_reuse(&mut self) {
+        self.refreshes.clear();
+        self.index.clear();
+        self.textures.clear();
+        self.due.clear();
+        self.placed.clear();
+        self.fills.clear();
+        self.ahead.clear();
+        self.front = false;
+    }
+}
+
+#[cfg(test)]
+mod submit_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn cleared_batch_equals_default() {
+        let mut batch = Batch::default();
+        batch.fills.push((1, 2, 3));
+        batch.ahead.insert(1, (4, 5));
+        batch.clear_for_reuse();
+        assert!(batch.refreshes.is_empty());
+        assert!(batch.index.is_empty());
+        assert!(batch.textures.is_empty());
+        assert!(batch.due.is_empty());
+        assert!(batch.placed.is_empty());
+        assert!(batch.fills.is_empty());
+        assert!(batch.ahead.is_empty());
+        assert!(!batch.front);
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
