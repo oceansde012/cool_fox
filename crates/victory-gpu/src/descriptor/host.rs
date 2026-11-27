@@ -212,6 +212,54 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots that may be in `placed` (a slot noted there is put here
+    /// under its lock, and taken out when it is forgotten there; a slot
+    /// another's view made stale stays, which says only "may"): a write of
+    /// any other view needs nothing of `placed` ([`spans_quick`]).
+    spanned: Option<Slots>,
+}
+
+/// Whether a slot's write of no placed texture view leaves `placed` alone
+/// when the slot is not in it ([`HostHeap::spanned`]; `VICTORY_SPANS_QUICK=1`).
+///
+/// Every record the pass over records copied as bytes mirrors went by that
+/// one lock of the heap, from six threads, with the title's own threads and
+/// the texture passes: 4 of the 16 ms a frame the submitting thread waited
+/// for that pass were its threads waiting there (run city4, timeline 113).
+/// What is done is the same: forgetting a slot that is not there does
+/// nothing.
+///
+/// Run heapsync-ab3 (A/B in the street): 13,300 of 13,500 such writes a
+/// frame left it alone; making views 1.7 ms a frame against 2.4, the pass
+/// 11.7-12.0 ms against 13.2-13.8; the picture the same.
+/// Since the last frame line: writes that left `placed` alone
+/// ([`spans_quick`]), writes that took its lock.
+pub(crate) static SPANS_QUICK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(test)]
+thread_local! {
+    static SPANS_QUICK_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn spans_quick() -> bool {
+    #[cfg(test)]
+    if SPANS_QUICK_IN_TEST.get() {
+        return true;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_SPANS_QUICK") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SPANS_QUICK"))
+}
+
+fn track_spans_quick() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::bit("VICTORY_SPANS_QUICK").is_some() {
+        return true;
+    }
+    spans_quick()
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -1665,6 +1713,7 @@ impl HostHeap {
                 }
                 spans
             },
+            spanned: track_spans_quick().then(|| Slots::new((count + extra) as usize)),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2749,8 +2798,21 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        // (Under the slot's lock, as every write of it: whether it is in
+        // `spanned` changes only here.)
+        let in_spans = |index: u32| {
+            let bit = 1u64 << (index % 64);
+            self.spanned.as_ref().and_then(|slots| slots.0.get(index as usize / 64))
+                .is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & bit != 0)
+        };
+        let stale = if placed_view.is_none() && !in_spans(index) && spans_quick() {
+            SPANS_QUICK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
+            if self.spanned.is_some() {
+                SPANS_QUICK[1].fetch_add(1, Relaxed);
+            }
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {
                 Some((start, start.saturating_add(placed.bytes(resource)?), first, held))
@@ -2760,6 +2822,9 @@ impl HostHeap {
                     SPANNED[0].fetch_min(start, Relaxed);
                     SPANNED[1].fetch_max(end, Relaxed);
                     placed.rule = stale_rule();
+                    if let Some(slots) = &self.spanned {
+                        slots.put(index);
+                    }
                     let stale = placed.note(index, start, end, !seen);
                     placed.shows(index, first, held);
                     // (Under the lock of `placed`: a later write of one of
@@ -2768,6 +2833,9 @@ impl HostHeap {
                 }
                 None => {
                     placed.forget(index);
+                    if let Some(slots) = &self.spanned {
+                        slots.remove(index);
+                    }
                     Vec::new()
                 }
             }
@@ -3133,6 +3201,55 @@ impl HostHeap {
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
+    }
+
+    /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
+    /// one) show the constant buffer of `size` bytes at `gpu` of `buffer`
+    /// (title memory in place) with nothing copied: its raw twin a raw view
+    /// of those bytes, which translated shaders read; the slot itself a
+    /// constant buffer view of them where that can be (on 256 bytes), else a
+    /// null one. Whether the twin was made (`false`: the caller copies the
+    /// bytes as before).
+    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+        let Some(host) = host() else { return false };
+        let Some(twin) = self.twin(index) else { return false };
+        // SAFETY: a live buffer.
+        let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+        let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+            return false;
+        };
+        let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
+        if bytes == 0 {
+            return false;
+        }
+        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: (bytes / 4) as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
+            SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
+        };
+        let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
+        // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
+        // zero location makes a null constant buffer view).
+        unsafe {
+            host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
+            self.put(index);
+            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+        }
+        self.twin_made(index, true);
+        self.keep(index, Some(buffer.clone()));
+        true
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -4175,6 +4292,61 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// Renderer port 5 ([`crate::port_cbv`]): the constant buffer of `size` bytes
+/// at `gpu` of `buffer` as a constant buffer view at `at` where it can be (on
+/// 256 bytes; else a null one) and a raw view of its bytes at `twin`, which
+/// translated shaders read. `false` (nothing made): not on 16 bytes.
+fn constant_twinned(
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    size: u32,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+) -> bool {
+    let Some(host) = host() else { return false };
+    // SAFETY: a live buffer.
+    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+        return false;
+    };
+    let room = width - offset;
+    let cbv = if gpu.is_multiple_of(256) && room >= 256 {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: constant_bytes(size).min((room & !255) as u32),
+        }
+    } else {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+    };
+    let bytes = u64::from(constant_bytes(size)).min(room) & !3;
+    // SAFETY: slots of our heaps; the ranges lie in the live buffer.
+    unsafe {
+        host.device.CreateConstantBufferView(Some(&cbv), at);
+        if let Some(twin) = twin {
+            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: offset / 4,
+                        NumElements: (bytes / 4) as u32,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            if bytes == 0 {
+                null_buffer_view(twin);
+            } else {
+                host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+            }
+            crate::port_cbv::twinned();
+        }
+    }
+    true
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4195,6 +4367,12 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            if crate::port_cbv::on() {
+                // Renderer port 5: shaders read constant buffers as raw bytes
+                // through the twin; a constant buffer view there would be read
+                // raw, with no end on AMD.
+                return constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone()));
+            }
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -5675,6 +5853,40 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// A write of no placed texture view forgets the slot in the spans
+    /// whether it goes by their lock or not (`spans_quick`): slots that are
+    /// in them stay marked, also one another's view made stale.
+    #[test]
+    fn writes_of_other_views_leave_the_spans_as_under_their_lock() {
+        use super::SPANS_QUICK_IN_TEST;
+        SPANS_QUICK_IN_TEST.set(true);
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        let marked = |slot: u32| heap.spanned.as_ref().unwrap().all(|_| true).contains(&slot);
+        let at = 0x7fed_0000_0000u64;
+        let view = |address: u64, width: u32| {
+            let mut desc = [0u32; 16];
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, [3, 0, 0, 0, width, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0], desc)
+        };
+        assert!(heap.note_buffer(1, Some(&view(at, 64)), false).is_empty());
+        assert!(marked(1) && !marked(2));
+        // Slot 1 made stale by slot 2: out of `by_slot`, still in `first`.
+        assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [(1, 0)]);
+        assert!(marked(1) && marked(2));
+        assert!(heap.placed.lock().unwrap().first.contains_key(&1));
+        // Written with no view: forgotten, under the lock, and unmarked.
+        assert!(heap.note_buffer(1, None, false).is_empty());
+        assert!(!marked(1) && !heap.placed.lock().unwrap().first.contains_key(&1));
+        // A slot never in the spans: nothing there to change.
+        assert!(heap.note_buffer(3, None, false).is_empty());
+        assert!(heap.note_buffer(2, None, false).is_empty());
+        let spans = heap.placed.lock().unwrap();
+        assert!(spans.by_slot.is_empty() && spans.by_start.is_empty() && spans.first.is_empty());
+        assert!(heap.spanned.as_ref().unwrap().all(|_| true).is_empty());
     }
 
     #[test]

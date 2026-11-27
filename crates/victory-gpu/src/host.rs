@@ -3296,6 +3296,10 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
     (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
 }
 
+/// Since the last frame-rate line, ns of [`stale_under_flights`] looking
+/// through the lists' refreshes for copies shaders may be writing.
+static UNDER_SCAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// With flights in the air, after the submission's write-watch asking:
 /// whether `runs` refresh a range of a host copy that a flight's shaders
 /// may write and that the title wrote since it was last copied. The
@@ -3309,6 +3313,7 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
     // Where each copy is in it, if shaders may be writing it (none begins to
     // while this runs): a frame has 20,000 refreshes of some 4,500 copies.
     let mut places: ByCopy<Option<usize>> = take_places();
+    let scanning = crate::shadow::under_profile().then(std::time::Instant::now);
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step {
@@ -3334,6 +3339,9 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        if let Some(scanning) = scanning {
+            UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
     }
@@ -4017,6 +4025,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     crate::port::log(frames);
+    crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
@@ -4029,6 +4038,23 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+        if crate::shadow::under_profile() {
+            let u = crate::shadow::under_stats().map(|n| n as f64 / frames);
+            let ms = |i: usize| u[i] / 1e6;
+            tracing::info!(
+                "of those, ms a frame: {:.2} finding copies in the lists' refreshes, {:.0} calls: {:.2} asking what was written, {:.2} finding the pages, {:.2} waiting for the locks, {:.2} comparing pages (threads together: {:.2} reading title memory, {:.2} comparing and putting in), {:.2} noting the runs; {:.0} stale pages",
+                UNDER_SCAN.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames,
+                u[9],
+                ms(0),
+                ms(1),
+                ms(2),
+                ms(3),
+                ms(5),
+                ms(6),
+                ms(4),
+                u[8],
+            );
+        }
     }
 }
 
@@ -4912,6 +4938,7 @@ impl Host {
                     // card do them one after the other.
                     let mut sent = Vec::new();
                     let mut transitioned = Vec::new();
+                    let mut transitioned_index = one_barrier_per_buffer().then(std::collections::HashSet::new);
                     if let Some(own) = &own {
                         own.record(self, list, &dirty, |shadow| looks.as_ref().is_some_and(|l| l.hold(shadow)));
                     }
@@ -4931,8 +4958,15 @@ impl Host {
                         traffic::moved(traffic::UP, shadow.span(), ranges.iter().copied());
                         if own.is_none() && before.is_some() && !ranges.is_empty() {
                             let raw = shadow.buffer.as_raw();
-                            if !transitioned.contains(&raw) {
-                                transitioned.push(raw);
+                            let first = match &mut transitioned_index {
+                                Some(index) => index.insert(raw),
+                                None if transitioned.contains(&raw) => false,
+                                None => {
+                                    transitioned.push(raw);
+                                    true
+                                }
+                            };
+                            if first {
                                 sent.push(transition(
                                     &shadow.buffer,
                                     D3D12_RESOURCE_STATE_COPY_DEST,
@@ -6572,9 +6606,11 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         split.part(4);
         stage.next("submit: waiting for the heaps' records");
-        let heaps_began = std::time::Instant::now();
+        let heaps_began = crate::port_journal::tracking().then(std::time::Instant::now);
         drop(heaps_synced);
-        crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        if let Some(heaps_began) = heaps_began {
+            crate::port_journal::heaps_waited(heaps_began.elapsed().as_nanos() as u64, heaps_on);
+        }
         // The slots that waited for a texture's host copy, before the
         // lists that may read them run.
         crate::descriptor::make_waiting();
@@ -8208,6 +8244,7 @@ impl HostList {
         let (mut us, mut bytes) = (std::time::Duration::ZERO, 0u64);
         #[cfg(feature = "diagnostics")]
         let (mut copies, mut refreshes, mut refreshed) = (0u64, 0u64, 0u64);
+        let track_heap_rounds = crate::port_journal::tracking();
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
                 continue;
@@ -8224,7 +8261,7 @@ impl HostList {
                     crate::port::copied(dst, src, len);
                     // Renderer port #7: into a heap's records, the rounds
                     // asked earlier did not see it.
-                    if crate::descriptor::in_shader_heap(dst, len) {
+                    if track_heap_rounds && crate::descriptor::in_shader_heap(dst, len) {
                         crate::port_journal::prep_wrote();
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
@@ -8254,7 +8291,7 @@ impl HostList {
                 }
                 Step::Placed(p) => {
                     let started = std::time::Instant::now();
-                    if crate::descriptor::in_shader_heap(p.dst, p.len) {
+                    if track_heap_rounds && crate::descriptor::in_shader_heap(p.dst, p.len) {
                         crate::port_journal::prep_wrote();
                     }
                     let free = !touches(air, p.src, p.src + p.len) && !touches(air, p.dst, p.dst + p.len);
@@ -8283,7 +8320,9 @@ impl HostList {
                     if matches!(step, Step::Run(_)) {
                         batch.title_written();
                         // (It may write anywhere, a heap's records too.)
-                        crate::port_journal::prep_wrote();
+                        if track_heap_rounds {
+                            crate::port_journal::prep_wrote();
+                        }
                     }
                     let _step = crate::timeline::span("a step of ours");
                     work();
@@ -10120,10 +10159,14 @@ impl Meter {
             };
             let wc_left = crate::shadow::WC_LEFT.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
             if passes + compares + wc_left > 0.0 || !timed.is_empty() {
+                let wc = if wc_left > 0.0 {
+                    format!("; {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK)")
+                } else {
+                    String::new()
+                };
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes; \
-                     {wc_left:.1} MB declared written in write-combined memory left on the card (VICTORY_WC_NO_BACK){timed}",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes{wc}{timed}",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
@@ -12142,4 +12185,11 @@ fn compared_line(frames: f64) {
 fn compare_join() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_JOIN").is_some_and(|v| v == "1"))
+}
+
+/// Index the buffers already transitioned (`VICTORY_ONE_BARRIER_PER_BUFFER=1`).
+/// The baseline also emits one transition per buffer, using a linear scan.
+fn one_barrier_per_buffer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_ONE_BARRIER_PER_BUFFER"))
 }

@@ -381,6 +381,8 @@ pub(crate) fn sync_heaps() {
     let mut spent = [0u64; 3];
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
     let mut kinds = [0u64; 5];
+    let mut job_ns = [0u64; 3];
+    let profile = sync_profile();
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -400,8 +402,10 @@ pub(crate) fn sync_heaps() {
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        let (pages_a_job, records_a_job) = sync_jobs();
+        let phase = profile.then(|| crate::timeline::span("the heaps' records: those that waited"));
+        crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
+            for &index in before.chunks(records_a_job).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
@@ -409,6 +413,9 @@ pub(crate) fn sync_heaps() {
                 }
             }
         });
+        if let Some(phase) = phase {
+            phase.end();
+        }
         let of_tables = of_tables.into_inner();
         tabled += of_tables;
         mirrored += before.len() as u64 - of_tables;
@@ -416,6 +423,7 @@ pub(crate) fn sync_heaps() {
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
+        let phase = profile.then(|| crate::timeline::span("the heaps' records: asking"));
         let taken = if sync_wide() {
             let chunk = 64 * crate::watch::PAGE;
             let chunks = take_chunks(start as usize, end as usize, chunk);
@@ -439,6 +447,9 @@ pub(crate) fn sync_heaps() {
         } else {
             written.take(start as usize, end as usize)
         };
+        if let Some(phase) = phase {
+            phase.end();
+        }
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
@@ -454,18 +465,23 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
-        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
+        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
+        let phase = profile.then(|| crate::timeline::span("the heaps' records: pages read and compared"));
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
+            for &(from, to) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
+                let at = profile.then(std::time::Instant::now);
                 page_bytes.resize(to - from, 0);
                 if !crate::host::read_into(from as *const u8, &mut page_bytes) {
                     continue;
+                }
+                if let Some(at) = at {
+                    out.ns[0] += since(at);
                 }
                 out.pages += 1;
                 out.views += u64::from(crate::watch::guarded(from, to));
@@ -482,9 +498,14 @@ pub(crate) fn sync_heaps() {
                 // Only the records that are not the ones last seen
                 // there (`host::Copied::changes`).
                 changed.clear();
+                let at = profile.then(std::time::Instant::now);
                 // SAFETY: the parts are ranges of the heap apart from one
                 // another, and only records that lie whole in one are its.
                 unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                if let Some(at) = at {
+                    out.ns[1] += since(at);
+                }
+                let at = profile.then(std::time::Instant::now);
                 for &index in &changed {
                     let at = (u64::from(index) - first) as usize * step as usize;
                     let word = |n: usize| {
@@ -527,9 +548,15 @@ pub(crate) fn sync_heaps() {
                         2
                     }] += 1;
                 }
+                if let Some(at) = at {
+                    out.ns[2] += since(at);
+                }
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
         });
+        if let Some(phase) = phase {
+            phase.end();
+        }
         drop(copied);
         for part in found {
             let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -546,14 +573,21 @@ pub(crate) fn sync_heaps() {
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
             }
+            for (ns, n) in job_ns.iter_mut().zip(part.ns) {
+                *ns += n;
+            }
         }
         spent[1] += since(began);
         let began = std::time::Instant::now();
-        crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        let phase = profile.then(|| crate::timeline::span("the heaps' records: made"));
+        crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
+            for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
         });
+        if let Some(phase) = phase {
+            phase.end();
+        }
         spent[2] += since(began);
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
@@ -571,7 +605,48 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
         count.fetch_add(n, Relaxed);
     }
+    if profile {
+        for (count, n) in SYNC_JOBS_NS.iter().zip(job_ns) {
+            count.fetch_add(n, Relaxed);
+        }
+    }
 }
+
+#[cfg(windows)]
+fn sync_profile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_PROFILE"))
+}
+
+/// Of [`sync_heaps`]'s page jobs since the last frame line, on all threads:
+/// nanoseconds reading pages, comparing them with what was last seen, and
+/// sorting out the records that changed.
+#[cfg(windows)]
+static SYNC_JOBS_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Pages and records [`sync_heaps`] gives a thread at a time
+/// (`VICTORY_SYNC_FINE=1`: [`SYNC_PAGES_FINE`] and [`SYNC_AT_A_TIME_FINE`];
+/// otherwise [`SYNC_PAGES`] and [`SYNC_AT_A_TIME`], as before).
+///
+/// A round for a submission finds a dozen pages or so: by eight a job that
+/// was two jobs, on two of the six threads, while the submission waited
+/// for the round (2 to 3.4 ms at a time, run city4).
+#[cfg(windows)]
+fn sync_jobs() -> (usize, usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
+    let picked = crate::ab::pick("VICTORY_SYNC_FINE");
+    #[cfg(not(feature = "diagnostics"))]
+    let picked = None;
+    let fine = picked.unwrap_or_else(|| *ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_FINE")));
+    if fine { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { (SYNC_PAGES, SYNC_AT_A_TIME) }
+}
+
+#[cfg(windows)]
+const SYNC_PAGES_FINE: usize = 2;
+
+#[cfg(windows)]
+const SYNC_AT_A_TIME_FINE: usize = 64;
 
 /// Of those mirrored, since the last frame line: no view, a view of an object,
 /// another, a sampler; waited and no draw came.
@@ -591,6 +666,8 @@ struct SyncPart {
     make: Vec<u32>,
     wait: Vec<u32>,
     kinds: [u64; 5],
+    /// Nanoseconds reading, comparing, sorting out ([`SYNC_JOBS_NS`]).
+    ns: [u64; 3],
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -620,6 +697,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -632,8 +710,22 @@ pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let jobs = [0, 1, 2].map(|i| SYNC_JOBS_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / frames);
+    let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if pages == 0 {
         return;
+    }
+    if sync_profile() || quick.iter().any(|&n| n > 0.0) {
+        tracing::info!(
+            "the heaps' records' jobs per frame (VICTORY_SYNC_FINE={}): on all threads {:.2} ms reading pages, {:.2} comparing, \
+             {:.2} sorting out; writes of slots {:.0} leaving the spans alone (VICTORY_SPANS_QUICK), {:.0} under their lock",
+            u8::from(sync_jobs().0 == SYNC_PAGES_FINE),
+            jobs[0],
+            jobs[1],
+            jobs[2],
+            quick[0],
+            quick[1]
+        );
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \

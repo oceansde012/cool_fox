@@ -126,7 +126,7 @@ pub(crate) fn heaps_waited(ns: u64, on: bool) {
 }
 
 /// Whether the switch is on, or changes in this run (`VICTORY_AB`).
-fn named() -> bool {
+pub(crate) fn tracking() -> bool {
     #[cfg(feature = "diagnostics")]
     if crate::ab::bit("VICTORY_PORT_JOURNAL").is_some() {
         return true;
@@ -136,11 +136,11 @@ fn named() -> bool {
 
 /// Renderer port #7's line of the frame lines, per frame.
 pub(crate) fn line(frames: f64) {
-    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
-    let journal = crate::watch::port_journal_counts();
-    if !named() {
+    if !tracking() {
         return;
     }
+    let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64).collect();
+    let journal = crate::watch::port_journal_counts();
     let f = frames.max(1.0);
     // The heaps' wait per frame, with the switch and without (an A/B line
     // covers both).
