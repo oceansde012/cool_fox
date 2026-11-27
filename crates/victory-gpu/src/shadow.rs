@@ -1467,6 +1467,7 @@ type Job = Box<dyn FnOnce() + Send>;
 struct Workers {
     jobs: Mutex<std::collections::VecDeque<Job>>,
     more: std::sync::Condvar,
+    thread_count: usize,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
 }
@@ -1499,10 +1500,11 @@ fn workers() -> &'static Workers {
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
+        thread_count: wide_threads(),
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
-        for i in 0..wide_threads() {
+        for i in 0..workers.thread_count {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
@@ -1540,7 +1542,8 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let job_count = jobs.len();
+    let left = Arc::new((Mutex::new(job_count), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
@@ -1556,7 +1559,16 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    // The calling thread also drains the queue. Wake helpers only for the
+    // jobs it can share; a busy helper checks for more work before sleeping.
+    let helpers = job_count - 1;
+    if helpers >= workers.thread_count {
+        workers.more.notify_all();
+    } else {
+        for _ in 0..helpers {
+            workers.more.notify_one();
+        }
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
