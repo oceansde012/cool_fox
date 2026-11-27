@@ -434,6 +434,52 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+/// `GROUP_AFFINITY`.
+#[repr(C)]
+pub struct GroupAffinity {
+    mask: usize,
+    group: u16,
+    reserved: [u16; 3],
+}
+
+/// The title pins its threads as on the console: told to the GPU side
+/// (`victory_gpu::title_affinity`), which can keep our own threads off
+/// those processors (`VICTORY_AWAY_CORES`). `VICTORY_TITLE_AFFINITY=0`: the
+/// title's threads are left free to run anywhere (the call succeeds and
+/// changes nothing).
+pub extern "system" fn SetThreadGroupAffinity(
+    thread: *mut c_void,
+    affinity: *const GroupAffinity,
+    previous: *mut GroupAffinity,
+) -> i32 {
+    mod host {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            pub fn SetThreadGroupAffinity(
+                thread: *mut std::ffi::c_void,
+                affinity: *const super::GroupAffinity,
+                previous: *mut super::GroupAffinity,
+            ) -> i32;
+            pub fn GetThreadGroupAffinity(thread: *mut std::ffi::c_void, affinity: *mut super::GroupAffinity) -> i32;
+        }
+    }
+    static FREE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let free = *FREE.get_or_init(|| std::env::var_os("VICTORY_TITLE_AFFINITY").is_some_and(|v| v == "0"));
+    // SAFETY: the title passes its thread's handle, its asked affinity and
+    // room for the one before (or null), as for the real call.
+    unsafe {
+        if let Some(asked) = affinity.as_ref() {
+            #[cfg(windows)]
+            victory_gpu::title_affinity(asked.mask, asked.group);
+            tracing::debug!(mask = format_args!("{:#x}", asked.mask), group = asked.group, free, "the title pins a thread");
+        }
+        if free && !affinity.is_null() {
+            return if previous.is_null() { 1 } else { host::GetThreadGroupAffinity(thread, previous) };
+        }
+        host::SetThreadGroupAffinity(thread, affinity, previous)
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +488,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +516,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(SetThreadGroupAffinity),
         ],
     }
 }
