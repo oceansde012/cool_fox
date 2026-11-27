@@ -343,7 +343,29 @@ pub(crate) fn sync_heaps() {
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
-        let taken = written.take(start as usize, end as usize);
+        let taken = if sync_wide() {
+            let chunk = 64 * crate::watch::PAGE;
+            let chunks = take_chunks(start as usize, end as usize, chunk);
+            if chunks.len() > 2 {
+                let results: Vec<std::sync::Mutex<Vec<(usize, usize)>>> = (0..chunks.len())
+                    .map(|_| std::sync::Mutex::new(Vec::new()))
+                    .collect();
+                crate::land::each_view(true, chunks.len(), &|i| {
+                    let (from, to) = chunks[i];
+                    let mut part = written.take(from, to);
+                    results[i].lock().unwrap().append(&mut part);
+                });
+                let mut taken: Vec<(usize, usize)> = Vec::new();
+                for slot in results {
+                    taken.extend(slot.into_inner().unwrap());
+                }
+                taken
+            } else {
+                written.take(start as usize, end as usize)
+            }
+        } else {
+            written.take(start as usize, end as usize)
+        };
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
@@ -1826,5 +1848,82 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+}
+
+#[cfg(windows)]
+fn sync_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_WIDE"))
+}
+
+fn take_chunks(start: usize, end: usize, chunk: usize) -> Vec<(usize, usize)> {
+    assert!(chunk.is_power_of_two());
+    if start >= end {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut cur = start;
+
+    while cur < end {
+        let rem = cur % chunk;
+        let next = if rem == 0 {
+            cur.saturating_add(chunk)
+        } else {
+            cur.saturating_add(chunk - rem)
+        };
+        let to = next.min(end);
+        ranges.push((cur, to));
+        cur = to;
+    }
+
+    ranges
+}
+
+#[cfg(test)]
+mod take_chunk_tests {
+    use super::take_chunks;
+
+    #[test]
+    fn exact_cover() {
+        assert_eq!(take_chunks(0, 12, 4), vec![(0, 4), (4, 8), (8, 12)]);
+    }
+
+    #[test]
+    fn contiguous() {
+        let ranges = take_chunks(3, 21, 4);
+        assert_eq!(ranges.first().unwrap().0, 3);
+        assert_eq!(ranges.last().unwrap().1, 21);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn aligned_inner_boundaries() {
+        let ranges = take_chunks(3, 21, 4);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1 % 4, 0);
+        }
+    }
+
+    #[test]
+    fn unaligned_ends() {
+        assert_eq!(
+            take_chunks(3, 21, 4),
+            vec![(3, 4), (4, 8), (8, 12), (12, 16), (16, 20), (20, 21)]
+        );
+    }
+
+    #[test]
+    fn single_partial_chunk() {
+        assert_eq!(take_chunks(5, 10, 4096), vec![(5, 10)]);
+    }
+
+    #[test]
+    fn empty() {
+        assert_eq!(take_chunks(10, 10, 4), Vec::new());
+        assert_eq!(take_chunks(11, 10, 4), Vec::new());
     }
 }
