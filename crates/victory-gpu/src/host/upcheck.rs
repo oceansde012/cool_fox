@@ -942,6 +942,95 @@ mod tests {
         assert_eq!(host.log_messages(), None);
     }
 
+    /// Compares of hot pieces only (`VICTORY_CARD_COMPARE_HOT`, `heat`), end
+    /// to end, with the fetch on the copy queue: flights declare the whole
+    /// copy and each writes a byte of its own, in a piece written every time
+    /// (hot after the first) or in one written once (cold: owed, covered
+    /// later). The title writes bytes of its own beside them, which go up
+    /// with the next submission's refresh. While flights are in the air,
+    /// every flight counted finished (`submissions`, set after its landing
+    /// told the title) has its byte in title memory; no title byte is ever
+    /// undone; at the end nothing differs between the card and the CPU's side.
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 VICTORY_CARD_COMPARE_HOT=2 VICTORY_UPCOPY_CHECK=1 and a process of its own"]
+    fn cold_pieces_land_before_their_flight_is_finished() {
+        let Some(host) = host() else {
+            return;
+        };
+        assert!(super::super::heat_on(), "set VICTORY_CARD_COMPARE_HOT=2 (with the relay)");
+        let (title, start, shadow) = title(0x5555, false);
+        let slow = Slow::new(host);
+        let mut lists = Vec::new();
+        // Flight number, where its byte is, the byte; the title's bytes.
+        let mut flights: Vec<(u64, usize, u8)> = Vec::new();
+        let mut own: Vec<(usize, u8)> = Vec::new();
+        let (mut looked, mut early) = (0, Vec::new());
+        let mut look_landed = |title: &[u8], flights: &[(u64, usize, u8)], own: &[(usize, u8)]| {
+            let finished = submissions().1;
+            for &(number, at, value) in flights.iter().filter(|f| f.0 <= finished) {
+                looked += 1;
+                if title[at] != value {
+                    early.push((number, at >> 16));
+                }
+            }
+            for &(at, value) in own {
+                assert_eq!(title[at], value, "the title's byte at {at:#x} is its own");
+            }
+        };
+        const ROUNDS: usize = 40;
+        for round in 0..ROUNDS {
+            let piece = if round % 2 == 0 { 3 } else { 8 + round };
+            let at = (piece << 16) + 64 + round * 8;
+            let value = round as u8 + 1;
+            let list = host.new_list().unwrap();
+            shadow.refresh(&list, start as u64, LEN as u64);
+            shadow.gpu_writes(&list, start as u64, LEN as u64);
+            write(host, &list, &shadow, at, &[value]);
+            if round % 4 == 0 {
+                slow.record(&list, 20);
+            }
+            list.close();
+            host.execute_own(&list);
+            flights.push((submissions().0, at, value));
+            lists.push(list);
+            // The title's own, beside: a piece of a flight in the air.
+            let mine = ((8 + round.saturating_sub(1)) << 16) + 40_000 + round;
+            title[mine] = 0xA0 + round as u8;
+            own.push((mine, 0xA0 + round as u8));
+            look_landed(title, &flights, &own);
+            // Now and then the landings catch up but for the last two flights
+            // (what compares found makes pieces hot), looked at all the time;
+            // and now and then a settle, which has the landing thread cover
+            // what is owed at once.
+            if round % 10 == 9 {
+                settle_now(WHY_SYNC);
+            } else if round % 3 == 2 && flights.len() > 2 {
+                let wanted = flights[flights.len() - 3].0;
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while submissions().1 < wanted && std::time::Instant::now() < until {
+                    look_landed(title, &flights, &own);
+                    std::thread::yield_now();
+                }
+            }
+        }
+        settle_now(WHY_SYNC);
+        look_landed(title, &flights, &own);
+        let [hot, left] = [heat::stat::HOT, heat::stat::LEFT].map(|i| heat::STATS[i].load(Ordering::Relaxed));
+        let covered: u64 = [heat::stat::DUE, heat::stat::SENT, heat::stat::AHEAD, heat::stat::FORCED]
+            .iter()
+            .map(|&i| heat::STATS[i].load(Ordering::Relaxed))
+            .sum();
+        eprintln!(
+            "{looked} looks at finished flights, early: {early:?}; pieces read as hot {hot}, left {left}, covered {covered}; \
+             fetched pieces checked, suspect, put right: {:?}",
+            super::torn::STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect::<Vec<_>>()
+        );
+        assert!(early.is_empty(), "flights finished before their writes were in title memory");
+        assert!(hot > 0 && left > 0 && covered > 0, "the compares read only some pieces");
+        assert_eq!(look(host), Some(0), "nothing differs at rest");
+        assert_eq!(host.log_messages(), None);
+    }
+
     #[test]
     #[ignore = "wants VICTORY_RELAY=2 VICTORY_RELAY_COPY=1 and a process of its own"]
     fn each_submission_reads_its_own_copy_on_the_card() {

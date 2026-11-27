@@ -2694,20 +2694,31 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
 
 /// Whether compares read only the declared pieces found changed lately
 /// ([`heat`], `VICTORY_CARD_COMPARE_HOT=<D>`; off by default). Only with
-/// [`relay`], whose landing thread holds back the flights that owe pieces,
-/// and not with [`relay_copy`], whose fetches run beside later flights (the
-/// covers have not been looked at with that).
+/// [`relay`], whose landing thread holds back the flights that owe pieces.
+///
+/// With [`relay_copy`] too. There a landing's fetch runs at once on the copy
+/// queue, beside whatever the drawing queue is still at, and its merge leaves
+/// out the title's bytes of sends it is not known to run behind
+/// (`CardPlan::sent_as`, `Shadow::card_merge_relay`). A cover's fetch waits for
+/// the cover fence, so it runs behind the cover and the flights before it, but
+/// not behind its submission's own sends, which come after the cover: a cover
+/// is given the sends before them. That it runs beside later flights, which may
+/// be at its pieces, is what every fetch on the copy queue meets
+/// (`VICTORY_FETCH_CHECK`): a piece a later flight writes is that flight's to
+/// look at again, by its compare or by its cover, against the hash the cover
+/// stored.
 fn heat_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = heat::deadline().is_some() && relay() && !relay_copy();
+        let on = heat::deadline().is_some() && relay();
         if heat::deadline().is_some() {
             tracing::info!(
                 on,
                 deadline = heat::deadline(),
                 hot = heat::hot_span(),
+                copy_queue = relay_copy(),
                 "compares of copies in the card's memory read only pieces found changed lately (VICTORY_CARD_COMPARE_HOT; \
-                 needs the relay, not with VICTORY_RELAY_COPY=1)"
+                 needs the relay)"
             );
         }
         on
@@ -4649,8 +4660,13 @@ impl Host {
             for (i, c) in index.into_iter().zip(planned.chosen) {
                 chosen[i] = Some(c);
             }
+            // The cover runs ahead of this submission's sends (`sent_as`), so
+            // of the title's bytes it is known to run behind only the sends
+            // before. A fetch on the copy queue merges by that, and taking
+            // `sent_as` would put this send's bytes, still old on the card,
+            // over the title's (`heat::tests`, the second model).
             if !planned.covers.is_empty()
-                && let Some((value, cover)) = self.card_cover(work, &planned.covers, number, sent_as)
+                && let Some((value, cover)) = self.card_cover(work, &planned.covers, number, sent_as.saturating_sub(1))
             {
                 book.add_cover(value, &planned.covers, cover);
             }
@@ -4938,7 +4954,8 @@ impl Host {
     /// now, in a list of ours put on the queue at once (behind everything
     /// sent so far, ahead of whatever is sent next), storing the hashes it
     /// makes; then the cover fence is signalled. The caller holds
-    /// [`QUEUE_ORDER`] (`sent_as` is its count) and `work`'s lock. Gives the
+    /// [`QUEUE_ORDER`] and `work`'s lock; `sent_as`: the last send of title
+    /// bytes on the queue ahead of the cover ([`heat_on`]). Gives the
     /// fence's value and the plan that lands what the compare flags (with the
     /// first flight that owed one of the pieces); `None` if no piece's copy
     /// is alive (nothing to land). Where the results have no room the pieces
