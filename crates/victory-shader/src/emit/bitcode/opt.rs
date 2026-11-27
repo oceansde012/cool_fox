@@ -33,9 +33,14 @@
 //!   elimination for non-escaping private globals, plus non-aliasing shared
 //!   (LDS) load reuse without store-to-load forwarding across lanes.
 //! - [`LICM`]: opt-in pure loop-invariant code motion hoisting non-trapping
-//!   invariants out of natural loops to dominating preheaders.
+//!   invariants out of guaranteed loop blocks (plus in-bounds constant-table
+//!   loads) to dominating preheaders.
 //! - [`BARRIERS`]: opt-in adjacent covered and bounded read-after-read
 //!   `dx.op.barrier` elimination within a block.
+//! - [`SPEC_LICM`]: opt-in speculative hoisting of non-trapping ALU and pure
+//!   math intrinsics out of conditional (non-guaranteed) loop blocks, kept
+//!   separate from [`LICM`] because hoisting out of cold branches can raise
+//!   register pressure and lower occupancy.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -80,8 +85,18 @@ pub const MEM_FWD: u32 = 256;
 pub const LICM: u32 = 512;
 /// Opt-in adjacent and read-after-read redundant barrier elimination.
 pub const BARRIERS: u32 = 1024;
+/// Opt-in speculative loop-invariant hoisting of non-trapping ALU and pure
+/// math intrinsics out of conditional (non-guaranteed) loop blocks.
+///
+/// Hoisting out of a branch inside a loop runs the expression once per loop
+/// entry even when the branch is not taken and keeps its result live across
+/// the whole loop, which adds register pressure and can hurt occupancy on
+/// register-limited GPUs. Kept separate from [`LICM`] so both can be measured
+/// independently.
+pub const SPEC_LICM: u32 = 2048;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM | BARRIERS;
+pub const MODULE: u32 =
+    DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM | BARRIERS | SPEC_LICM;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: the original default passes
@@ -556,7 +571,10 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM | BARRIERS) != 0 {
+        if passes
+            & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD | LICM | BARRIERS | SPEC_LICM)
+            != 0
+        {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), a branch
             // that goes one way leaves blocks with one way in, and LICM
@@ -569,8 +587,8 @@ impl Module {
                 if passes & (FOLD | EXT_FOLD) != 0 {
                     changed |= self.prune();
                 }
-                if passes & LICM != 0 {
-                    changed |= self.licm();
+                if passes & (LICM | SPEC_LICM) != 0 {
+                    changed |= self.licm(passes & LICM != 0, passes & SPEC_LICM != 0);
                 }
                 if !changed {
                     break;
@@ -1960,7 +1978,7 @@ impl Module {
                     changed = true;
                     continue;
                 }
-                let class = self.class(&effects, i, passes & (MEM_FWD | LICM) != 0);
+                let class = self.class(&effects, i, passes & (MEM_FWD | LICM | SPEC_LICM) != 0);
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i, ext_fold)
@@ -2404,23 +2422,57 @@ impl Module {
         true
     }
 
+    /// Whether a `dx.op.*` name is a pure value-only math intrinsic safe to
+    /// execute speculatively under [`SPEC_LICM`] (never accesses descriptors,
+    /// resources, inputs, or memory, and never traps on any bit pattern).
+    fn is_speculatable_pure_call(name: &str) -> bool {
+        let base = name.split('.').next().unwrap_or(name);
+        matches!(
+            base,
+            "unary"
+                | "unaryBits"
+                | "binary"
+                | "tertiary"
+                | "quaternary"
+                | "isSpecialFloat"
+                | "legacyF16ToF32"
+                | "legacyF32ToF16"
+                | "makeDouble"
+                | "splitDouble"
+                | "dot2"
+                | "dot3"
+                | "dot4"
+        )
+    }
+
     /// Whether instruction `i` inside a loop is pure, non-trapping, and safe to
-    /// hoist to the loop preheader under plain [`LICM`] (`guaranteed`: `i`
-    /// executes on every entry to the loop with the exact same active lanes as
-    /// the preheader, before any `dx.op.discard` or unknown side-effecting
-    /// call).
+    /// hoist to the loop preheader (`guaranteed`: `i` executes on every entry
+    /// to the loop with the exact same active lanes as the preheader, before
+    /// any `dx.op.discard` or unknown side-effecting call).
     ///
-    /// Plain [`LICM`] hoists only from `guaranteed` blocks, plus provably
-    /// in-bounds constant-table loads, so conditional branches inside a loop
-    /// never pay speculative execution or register-pressure costs unless
-    /// requested separately.
-    fn can_hoist(&self, effects: &[Effect], i: u32, guaranteed: bool) -> bool {
+    /// Plain [`LICM`] (`hoist_guaranteed`) hoists only from `guaranteed` blocks
+    /// plus provably in-bounds constant-table loads. [`SPEC_LICM`] (`hoist_spec`)
+    /// additionally allows hoisting non-trapping ALU and pure math intrinsics
+    /// from conditional (`!guaranteed`) loop blocks; that avoids per-iteration
+    /// recomputation when the branch is hot, but executes the expression even
+    /// when the branch is never taken and lengthens live ranges across the loop
+    /// (which can raise register pressure and hurt occupancy). Resource,
+    /// descriptor, and uniformity-sensitive calls never hoist speculatively.
+    fn can_hoist(
+        &self,
+        effects: &[Effect],
+        i: u32,
+        guaranteed: bool,
+        hoist_guaranteed: bool,
+        hoist_spec: bool,
+    ) -> bool {
+        let allow_alu = (guaranteed && hoist_guaranteed) || (!guaranteed && hoist_spec);
         match &self.insts[i as usize].op {
             Op::Bin(Bin::UDiv | Bin::URem, _, rhs) => {
-                guaranteed && self.int_k(*rhs).is_some_and(|(_, k)| k != 0)
+                allow_alu && self.int_k(*rhs).is_some_and(|(_, k)| k != 0)
             }
             Op::Bin(Bin::SDiv, _, rhs) => {
-                guaranteed
+                allow_alu
                     && self
                         .int_k(*rhs)
                         .is_some_and(|(bits, k)| k != 0 && signed(bits, k) != -1)
@@ -2430,13 +2482,27 @@ impl Module {
             | Op::Cmp(..)
             | Op::Select(..)
             | Op::Extract(..)
-            | Op::Gep(..) => guaranteed,
+            | Op::Gep(..) => allow_alu,
             Op::Load(p) => {
                 self.class(effects, i, true) == Effect::Pure
-                    && (guaranteed
-                        || self.is_in_bounds_const_global_ptr(*p, self.insts[i as usize].ty))
+                    && ((guaranteed && hoist_guaranteed)
+                        || ((hoist_guaranteed || hoist_spec)
+                            && self.is_in_bounds_const_global_ptr(*p, self.insts[i as usize].ty)))
             }
-            Op::Call(f, _) => guaranteed && effects[*f as usize] == Effect::Pure,
+            Op::Call(f, _) => {
+                if effects[*f as usize] != Effect::Pure {
+                    return false;
+                }
+                if guaranteed {
+                    return hoist_guaranteed;
+                }
+                if !hoist_spec {
+                    return false;
+                }
+                let name = self.funcs[*f as usize].name.as_str();
+                let name = name.strip_prefix("dx.op.").unwrap_or(name);
+                Self::is_speculatable_pure_call(name)
+            }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) | Op::Phi(_) => false,
         }
     }
@@ -2521,9 +2587,10 @@ impl Module {
         ph
     }
 
-    /// [`LICM`]: hoists pure, non-trapping loop-invariant instructions out of
-    /// natural loops (innermost first) to their dominating preheader.
-    fn licm(&mut self) -> bool {
+    /// [`LICM`] and [`SPEC_LICM`]: hoists pure, non-trapping loop-invariant
+    /// instructions out of natural loops (innermost first) to their dominating
+    /// preheader.
+    fn licm(&mut self, hoist_guaranteed: bool, hoist_spec: bool) -> bool {
         if self.blocks.is_empty() {
             return false;
         }
@@ -2654,7 +2721,7 @@ impl Module {
                             guaranteed = false;
                         }
                         let dom_target = preheader.unwrap_or(entry_pred);
-                        if self.can_hoist(&effects, i, guaranteed)
+                        if self.can_hoist(&effects, i, guaranteed, hoist_guaranteed, hoist_spec)
                             && self.operands_invariant(
                                 i,
                                 &loops[idx].in_loop,
@@ -3949,10 +4016,12 @@ mod tests {
                 LOADS,
                 MEM_FWD,
                 LICM,
+                SPEC_LICM,
+                LICM | SPEC_LICM,
                 BARRIERS,
                 FOLD | FACTS,
                 FOLD | EXT_FOLD | FACTS,
-                LOADS | MEM_FWD | LICM | BARRIERS,
+                LOADS | MEM_FWD | LICM | BARRIERS | SPEC_LICM,
                 FOLD | EXT_FOLD | REUSE | DEAD,
                 ALL,
             ] {
@@ -5521,5 +5590,106 @@ mod tests {
             );
             k.m.write();
         }
+    }
+
+    #[test]
+    fn spec_licm_hoists_conditional_pure_alu_and_math_only_when_bit_2048_is_set() {
+        let inst_id = |v: V| match v {
+            V::Inst(i) => i,
+            _ => panic!("expected V::Inst, got {v:?}"),
+        };
+        let build = || {
+            let mut k = kit();
+            let (i32t, i1t, f32t) = (k.m.int(32), k.m.int(1), k.m.float());
+            let hty = k.m.func_ty(i32t, vec![i32t, i32t, i1t, i1t]);
+            let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+            let uty = k.m.func_ty(f32t, vec![i32t, f32t]);
+            let heap =
+                k.m.function("dx.op.createHandleFromHeap", hty, Some(Attr::ReadNone), false);
+            let cb = k.m.function("dx.op.cbufferLoadLegacy.i32", fty, Some(Attr::ReadOnly), false);
+            let unary = k.m.function("dx.op.unary.f32", uty, Some(Attr::ReadNone), false);
+            let (k0, k1, k4, k13, k59, k218) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(13),
+                k.m.i32(59),
+                k.m.i32(218),
+            );
+            let no = k.m.bool(false);
+            let slot = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let cond_val = k.m.call(k.b, k.reads, vec![k1, k0]);
+            let xf = k.m.cast(k.b, Cast::Bitcast, slot, f32t);
+
+            let (head, guarded, latch, exit) = (
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+            );
+            k.m.terminate(k.b, Term::Br(head));
+            let idx = k.m.phi(head, i32t);
+            let guar_alu = k.m.bin(head, Bin::Add, slot, k1);
+            let has_valid = k.m.cmp(head, pred::NE, cond_val, k0);
+            k.m.terminate(head, Term::CondBr(has_valid, guarded, latch));
+
+            let h_const = k.m.call(guarded, heap, vec![k218, k0, no, no]);
+            let cb_v = k.m.call(guarded, cb, vec![k59, h_const]);
+            let pure_sin = k.m.call(guarded, unary, vec![k13, xf]);
+            let sin_i = k.m.cast(guarded, Cast::Bitcast, pure_sin, i32t);
+            let cond_alu = k.m.bin(guarded, Bin::Add, slot, k4);
+            let s0 = k.m.bin(guarded, Bin::Add, cb_v, sin_i);
+            let s1 = k.m.bin(guarded, Bin::Add, s0, cond_alu);
+            let s2 = k.m.bin(guarded, Bin::Add, s1, guar_alu);
+            k.m.call(guarded, k.writes, vec![idx, s2]);
+            k.m.terminate(guarded, Term::Br(latch));
+
+            let next = k.m.bin(latch, Bin::Add, idx, k1);
+            let more = k.m.cmp(latch, pred::IULT, next, k4);
+            k.m.terminate(latch, Term::CondBr(more, head, exit));
+            k.m.set_phi(idx, vec![(k0, k.b), (next, latch)]);
+            k.m.terminate(exit, Term::Ret);
+            (k.m, k.b, head, guarded, guar_alu, h_const, cb_v, pure_sin, cond_alu)
+        };
+
+        // 1) Plain `LICM` (512): hoists guaranteed `guar_alu`, keeps conditional `pure_sin` & `cond_alu`.
+        let (mut m, entry, head, guarded, guar_alu, h_const, cb_v, pure_sin, cond_alu) = build();
+        m.optimise(LICM);
+        assert!(m.blocks[entry].body.contains(&inst_id(guar_alu)));
+        assert!(!m.blocks[head].body.contains(&inst_id(guar_alu)));
+        for v in [h_const, cb_v, pure_sin, cond_alu] {
+            assert!(
+                m.blocks[guarded].body.contains(&inst_id(v)),
+                "plain LICM (512) must not hoist {v:?} out of conditional block"
+            );
+        }
+        m.write();
+
+        // 2) `SPEC_LICM` (2048) alone: hoists conditional `pure_sin` & `cond_alu`, leaves guaranteed
+        //    `guar_alu` and conditional resource calls in place.
+        let (mut m, entry, head, guarded, guar_alu, h_const, cb_v, pure_sin, cond_alu) = build();
+        m.optimise(SPEC_LICM);
+        assert!(m.blocks[head].body.contains(&inst_id(guar_alu)));
+        assert!(m.blocks[entry].body.contains(&inst_id(pure_sin)));
+        assert!(m.blocks[entry].body.contains(&inst_id(cond_alu)));
+        for v in [h_const, cb_v] {
+            assert!(
+                m.blocks[guarded].body.contains(&inst_id(v)),
+                "SPEC_LICM (2048) must never hoist resource calls {v:?} speculatively"
+            );
+        }
+        m.write();
+
+        // 3) `LICM | SPEC_LICM` (2560): hoists guaranteed `guar_alu` + conditional `pure_sin` & `cond_alu`,
+        //    while keeping resource/CBV calls inside `guarded`.
+        let (mut m, entry, _head, guarded, guar_alu, h_const, cb_v, pure_sin, cond_alu) = build();
+        m.optimise(LICM | SPEC_LICM);
+        for v in [guar_alu, pure_sin, cond_alu] {
+            assert!(m.blocks[entry].body.contains(&inst_id(v)));
+        }
+        for v in [h_const, cb_v] {
+            assert!(m.blocks[guarded].body.contains(&inst_id(v)));
+        }
+        m.write();
     }
 }
