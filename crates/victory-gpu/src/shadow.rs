@@ -129,6 +129,9 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// The copy itself, once it is one of [`CARDED`]: what goes into
+    /// [`TOUCHED`] when `touched` is set.
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -309,8 +312,38 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// The copies in the card's memory, each with the title memory it copies
+/// (from, to).
+static CARDED: Mutex<Vec<(usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(Vec::new());
+
+/// Of [`CARDED`], those whose `touched` was set since [`card_dirty`] last
+/// took them (each once).
+static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// `shadow`, which has a card side, is one of [`CARDED`].
+fn note_carded(shadow: &Arc<Shadow>) {
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push((start, end, Arc::downgrade(shadow)));
+    if let Some(card) = &shadow.card {
+        let _ = card.me.set(Arc::downgrade(shadow));
+        // (Changed before it was one: taken as if after.)
+        if card.touched.load(Ordering::Acquire) {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+        }
+    }
+}
+
+/// Whether only the copies in the card's memory that matter are looked at
+/// (`VICTORY_CARD_NEAR=0`: every one of [`CARDED`], as before): by
+/// [`card_dirty`] those in [`TOUCHED`], by [`send_copied`] those that hold
+/// some of the bytes.
+///
+/// With title buffers of 64 KiB and more on the card (`VICTORY_CARD_BUFFERS_MIN_KB=64`)
+/// there are some 3,700 of them, and each of the 16 submissions a frame, and each
+/// title buffer copy, took a hold of every one under the lock of all.
+fn card_near() -> bool {
+    crate::toggled!("VICTORY_CARD_NEAR")
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -330,7 +363,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|c| c.2.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -620,13 +653,9 @@ impl SentRuns {
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        let ranges = shadow
+    let take = |shadow: &Shadow| -> Vec<(usize, usize)> {
+        shadow
             .card
             .as_ref()
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
@@ -640,7 +669,30 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 }
                 ranges
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
+    // (Those set from here on go to the next call.)
+    let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
+    if card_near() {
+        for shadow in touched.iter().filter_map(std::sync::Weak::upgrade) {
+            let ranges = take(&shadow);
+            if !ranges.is_empty() {
+                out.push((shadow, ranges));
+            }
+        }
+        // The copies that went, let go of now and then.
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.2.strong_count() > 0);
+        }
+        return out;
+    }
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.retain(|(_, _, weak)| {
+        let Some(shadow) = weak.upgrade() else {
+            return false;
+        };
+        let ranges = take(&shadow);
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
@@ -727,7 +779,14 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    let near: Vec<Arc<Shadow>> = if card_near() {
+        let end = dst + len;
+        let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded.iter().filter(|c| c.0 < end && dst < c.1).filter_map(|c| c.2.upgrade()).collect()
+    } else {
+        carded_copies()
+    };
+    for shadow in near {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         let (from, to) = (dst.max(start), (dst + len).min(end));
         if from >= to {
@@ -743,7 +802,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|c| c.2.upgrade()).collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -2774,6 +2833,40 @@ mod landing_tests {
 }
 
 #[cfg(test)]
+mod touched_tests {
+    use super::{Shadow, card_dirty, note_carded};
+    use std::sync::Arc;
+
+    /// What a copy in the card's memory changed is taken by the first look
+    /// after the change, once, and no other copy's with it.
+    #[test]
+    fn only_the_copies_that_changed_are_taken() {
+        let mut sides = [vec![0u8; 4096], vec![0u8; 4096]];
+        let [one, two] = [0, 1].map(|i| Shadow::unbacked(0x7f00_0000 + i as u64 * 0x10000, sides[i].as_mut_ptr(), 4096, true));
+        note_carded(&one);
+        note_carded(&two);
+        let ours = |taken: Vec<(Arc<Shadow>, Vec<(usize, usize)>)>| {
+            let mut ours: Vec<(u64, Vec<(usize, usize)>)> = taken
+                .into_iter()
+                .filter(|(s, _)| Arc::ptr_eq(s, &one) || Arc::ptr_eq(s, &two))
+                .map(|(s, r)| (s.id, r))
+                .collect();
+            ours.sort();
+            ours
+        };
+        one.card_changed(16, 32);
+        one.card_changed(32, 64);
+        assert_eq!(ours(card_dirty(1)), [(one.id, vec![(16, 64)])]);
+        assert_eq!(ours(card_dirty(2)), []);
+        two.card_changed(0, 8);
+        one.card_changed(100, 200);
+        let mut both = vec![(one.id, vec![(100, 200)]), (two.id, vec![(0, 8)])];
+        both.sort();
+        assert_eq!(ours(card_dirty(3)), both);
+    }
+}
+
+#[cfg(test)]
 mod parts_tests {
     use super::{PAGE, by_parts};
 
@@ -4242,7 +4335,11 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        if !card.touched.swap(true, Ordering::AcqRel)
+            && let Some(me) = card.me.get()
+        {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4539,6 +4636,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -4695,6 +4793,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
+            me: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -5110,6 +5209,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
+                    me: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5135,7 +5235,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            note_carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5338,10 +5438,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+        me: Default::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    note_carded(&shadow);
     Some(shadow)
 }
 
@@ -5427,6 +5528,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: Default::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5445,7 +5547,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        note_carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());
