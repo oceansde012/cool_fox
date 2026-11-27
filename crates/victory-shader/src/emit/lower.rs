@@ -111,9 +111,10 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
+    let cheap_wave = std::env::var_os("VICTORY_WAVE_CHEAP").is_some_and(|v| v == "1");
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run(counted) {
+        match Lower::new(parts, &bad, cheap_wave).run(counted) {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -333,6 +334,8 @@ struct Lower<'a> {
     /// With `split_lds`, LDS accesses in lane branches: per IR block whether every lane runs
     /// it, and whether the host waves meet at its start and before its exit ([`lds_meetings`]).
     lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)>,
+    /// Read-only LDS accesses that need no extra rendezvous in a widened shader.
+    lds_unordered: HashSet<(usize, usize)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
     /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
@@ -547,7 +550,13 @@ fn need(block: usize) {
 /// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`.
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
-fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -> HashSet<Value> {
+fn lane_uniform(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    ordered_lds: bool,
+    unstable_lds: &HashSet<(usize, usize)>,
+) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
@@ -577,7 +586,7 @@ fn lane_uniform(p: &Program, st: &Structured, all: &[bool], ordered_lds: bool) -
                     addr: Some(Operand::Vector { reg, dwords: 1 }),
                     gds: false,
                     ..
-                } if ordered_lds && name == "ds_read_b32" => {
+                } if ordered_lds && name == "ds_read_b32" && !unstable_lds.contains(&(b, i)) => {
                     if inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a)) {
                         same.extend(inst.writes.iter().map(|w| w.1));
                     }
@@ -927,6 +936,85 @@ fn meeting_mode() -> u32 {
     if super::group_sync() == 0 { 8 } else { 1 | 8 }
 }
 
+fn is_lds_access(inst: &Inst) -> bool {
+    let name = inst.name();
+    matches!(inst.fields, Fields::Ds { .. })
+        && !name.starts_with("ds_swizzle")
+        && !name.contains("permute")
+}
+
+#[derive(Default)]
+struct LdsOrder {
+    unordered: HashSet<(usize, usize)>,
+    unstable: HashSet<(usize, usize)>,
+}
+
+/// Split the CFG at guest barriers that wait for both halves. Connect the remaining edges
+/// in both directions: different halves can occupy sibling arms of a lane branch at once.
+/// Reads in a component with no writes need no added rendezvous. Keep existing ordering
+/// around atomics, whose results and interactions with reads can depend on execution order.
+fn lds_order(p: &Program, st: &Structured, all: &[bool], guest_barriers_wait: bool) -> LdsOrder {
+    let mut next_piece = 0;
+    let mut blocks = Vec::with_capacity(p.blocks.len());
+    let mut reads = Vec::new();
+    let mut writes = Vec::new();
+    let mut atomics = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        let first = next_piece;
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            if name == "s_barrier" && guest_barriers_wait && all[b] {
+                next_piece += 1;
+            } else if matches!(inst.fields, Fields::Ds { gds: false, .. }) && is_lds_access(inst) {
+                if name.starts_with("ds_read") {
+                    reads.push((next_piece, (b, i)));
+                } else {
+                    writes.push(next_piece);
+                    if !name.starts_with("ds_write") {
+                        atomics.push(next_piece);
+                    }
+                }
+            }
+        }
+        blocks.push((first, next_piece));
+        next_piece += 1;
+    }
+
+    let mut edges = vec![Vec::new(); next_piece];
+    for (b, exit) in st.exits.iter().enumerate() {
+        let (_, last) = blocks[b];
+        let mut connect = |target: usize| {
+            let (first, _) = blocks[target];
+            edges[last].push(first);
+            edges[first].push(last);
+        };
+        match *exit {
+            LaneExit::Jump(t) => connect(t),
+            LaneExit::Branch { taken, not_taken, .. } => {
+                connect(taken);
+                connect(not_taken);
+            }
+            LaneExit::End => {}
+            LaneExit::Indirect => return LdsOrder::default(),
+        }
+    }
+    let flood = |mut pending: Vec<usize>| {
+        let mut reached = vec![false; next_piece];
+        while let Some(piece) = pending.pop() {
+            if !std::mem::replace(&mut reached[piece], true) {
+                pending.extend_from_slice(&edges[piece]);
+            }
+        }
+        reached
+    };
+    let writes = flood(writes);
+    let atomics = flood(atomics);
+    LdsOrder {
+        unordered: reads.iter().filter(|(piece, _)| !writes[*piece]).map(|&(_, site)| site).collect(),
+        unstable: reads.iter().filter(|(piece, _)| atomics[*piece]).map(|&(_, site)| site).collect(),
+    }
+}
+
 /// LDS accesses of a console wave run as two host waves, where some sit in blocks that only
 /// some lanes run (`all` is [`all_lane_blocks`]): per IR block, whether the host waves meet (a
 /// group barrier) at its start and before its exit. `None` if barriers cannot keep the
@@ -941,7 +1029,12 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
-fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
+fn lds_meetings(
+    p: &Program,
+    st: &Structured,
+    all: &[bool],
+    unordered: &HashSet<(usize, usize)>,
+) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
         match st.exits[b] {
@@ -975,9 +1068,9 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
             continue;
         }
         let r = find(&mut region, b);
-        for i in &block.insts {
+        for (k, i) in block.insts.iter().enumerate() {
             let name = i.name();
-            if !matches!(i.fields, Fields::Ds { .. }) || name.starts_with("ds_swizzle") || name.contains("permute") {
+            if !is_lds_access(i) || unordered.contains(&(b, k)) {
                 continue;
             }
             if name.starts_with("ds_read") {
@@ -1388,7 +1481,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, cheap_wave: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1410,6 +1503,7 @@ impl<'a> Lower<'a> {
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
         // where the host waves meet around those branches (`lds_meetings`)
         let mut lds_meet: Option<(Vec<bool>, Vec<(bool, bool)>)> = None;
+        let mut lds_ordering = LdsOrder::default();
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
@@ -1462,18 +1556,23 @@ impl<'a> Lower<'a> {
                     // two waves of 32, a group barrier before every LDS access keeps their order
                     // – where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
-                    let lds = |i: &Inst| {
-                        matches!(i.fields, Fields::Ds { .. })
-                            && !(i.name().starts_with("ds_swizzle") || i.name().contains("permute"))
-                    };
                     if let Some(all) = all_lane_blocks(x.st) {
+                        let cheap = cheap_wave
+                            && group == 64
+                            && !x.st.wide.is_empty()
+                            && !LOCAL_WAVES.get()
+                            && super::group_sync() != 0;
+                        if cheap && s.lds_dwords > 0 {
+                            lds_ordering = lds_order(p, x.st, &all, super::group_sync() == 2);
+                        }
+                        let meets = |b, k, inst| is_lds_access(inst) && !lds_ordering.unordered.contains(&(b, k));
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
-                            blk.insts.iter().all(|inst| {
-                                !lds(inst) || all.get(b).copied().unwrap_or(false)
+                            blk.insts.iter().enumerate().all(|(k, inst)| {
+                                !meets(b, k, inst) || all.get(b).copied().unwrap_or(false)
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all, &lds_ordering.unordered) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1481,7 +1580,9 @@ impl<'a> Lower<'a> {
                             // (the blocks whose LDS accesses not every lane runs: with the
                             // branches around them taken wave-wide they get their barriers)
                             for (b, blk) in p.blocks.iter().enumerate() {
-                                if !all.get(b).copied().unwrap_or(false) && blk.insts.iter().any(lds) {
+                                if !all.get(b).copied().unwrap_or(false)
+                                    && blk.insts.iter().enumerate().any(|(k, inst)| meets(b, k, inst))
+                                {
                                     need(b);
                                 }
                             }
@@ -1527,7 +1628,7 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
+                            Some(all) if lds_meetings(p, x.st, &all, &lds_ordering.unordered).is_none() => {
                                 why.push("an LDS read and write in one lane-branch region")
                             }
                             Some(_) => {}
@@ -1692,12 +1793,13 @@ impl<'a> Lower<'a> {
             console_lanes,
             split_lds,
             lds_meet,
+            lds_unordered: lds_ordering.unordered,
             local: exchange.is_some() && LOCAL_WAVES.get(),
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => {
-                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0)
+                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0, &lds_ordering.unstable)
                 }
                 _ => HashSet::new(),
             },
@@ -5323,9 +5425,9 @@ impl<'a> Lower<'a> {
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
         if self.split_lds
-            && matches!(inst.fields, Fields::Ds { .. })
-            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
+            && is_lds_access(inst)
             && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
+            && !self.lds_unordered.contains(&(b, i))
         {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
@@ -12757,6 +12859,36 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    #[test]
+    fn wave_cheap_elides_lds_reads_only_in_read_only_regions() {
+        let words = [
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000, 0x0000_0001, // ds_write_b32 v1, v0
+            0xD8D8_0000, 0x0400_0001, // ds_read_b32 v4, v1
+            0xBF8A_0000, // s_barrier
+            0xD8D8_0000, 0x0500_0001, // ds_read_b32 v5, v1
+            0xBF8A_0000, // s_barrier
+            0xD800_0000, 0x0000_0001, // ds_add_u32 v1, v0
+            0xD8D8_0000, 0x0600_0001, // ds_read_b32 v6, v1
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, true, 8).expect("IR");
+        let st = structure::structure(&p).expect("structure");
+        let all = super::all_lane_blocks(&st).expect("direct CFG");
+        let sites: Vec<_> = p.blocks.iter().enumerate().flat_map(|(b, block)| {
+            block.insts.iter().enumerate().filter_map(move |(i, inst)| {
+                (inst.name() == "ds_read_b32").then_some((b, i))
+            })
+        }).collect();
+        let [before, read_only, after_atomic] = sites.try_into().expect("three LDS reads");
+        let order = super::lds_order(&p, &st, &all, true);
+        assert_eq!(order.unordered, [read_only].into());
+        assert_eq!(order.unstable, [after_atomic].into());
+        assert!(!order.unstable.contains(&before));
+        assert!(super::lds_order(&p, &st, &all, false).unordered.is_empty());
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
