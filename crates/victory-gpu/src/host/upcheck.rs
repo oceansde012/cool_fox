@@ -958,6 +958,13 @@ mod tests {
             return;
         };
         assert!(super::super::heat_on(), "set VICTORY_CARD_COMPARE_HOT=2 (with the relay)");
+        // As in the game: the thread that lands flights starts with the
+        // first submission, before any copy in the card's memory (and the
+        // cover fence) is made. (Run prisao-s-hotb: it never saw the fence.)
+        let first = host.new_list().unwrap();
+        first.close();
+        host.execute_own(&first);
+        settle_now(WHY_SYNC);
         let (title, start, shadow) = title(0x5555, false);
         let slow = Slow::new(host);
         let mut lists = Vec::new();

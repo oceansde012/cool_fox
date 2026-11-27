@@ -351,6 +351,12 @@ impl<S: Clone, C> Book<S, C> {
         self.uncovered.values().map(|&n| n as usize).sum()
     }
 
+    /// Covers not landed yet, and the first submission that owed a piece of
+    /// the oldest of them.
+    pub(super) fn waiting(&self) -> (usize, Option<u64>) {
+        (self.covers.len(), self.covers.iter().map(|c| c.oldest).min())
+    }
+
     /// Copies with nothing owed and nothing found lately go (their numbers
     /// are never given again; the book would only grow).
     fn prune(&mut self, number: u64, span: u64) {

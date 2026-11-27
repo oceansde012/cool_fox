@@ -2731,6 +2731,9 @@ fn heat_on() -> bool {
 /// (which then takes nothing else).
 static HEAT: Mutex<Option<heat::Book<std::sync::Weak<crate::shadow::Shadow>, CardPlan>>> = Mutex::new(None);
 
+/// Whether [`Host::card_before`] said covers are not landing (once).
+static HEAT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Pieces owed now ([`heat`]); 0 with it off.
 fn heat_owed() -> usize {
     if !heat_on() {
@@ -3633,8 +3636,12 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
-    // With `heat_on`: the fence behind the compares of owed pieces.
-    let cover_fence = heat_on().then(|| host.card_cover_fence()).flatten();
+    // With `heat_on`: the fence behind the compares of owed pieces. Made
+    // with the card copies' work (`Host::card_ready`), which comes with the
+    // first copy in the card's memory, after this thread started: asked for
+    // until it is there. (Taken once here, it stayed missing for good in
+    // run prisao-s-hotb, and flights landed without their covers.)
+    let mut cover_fence: Option<ID3D12Fence> = None;
     /// What the thread does next, besides landing.
     enum Wait {
         /// The host's fence reaches the value (a flight has run).
@@ -3645,6 +3652,9 @@ fn relay_worker() {
         Force,
     }
     loop {
+        if cover_fence.is_none() && heat_on() {
+            cover_fence = host.card_cover_fence();
+        }
         let next = {
             let mut line = line();
             loop {
@@ -3668,9 +3678,11 @@ fn relay_worker() {
                 // than a compare of them has run (and its results with it).
                 let mut covers = Vec::new();
                 let mut held = heat::Hold::Free;
-                if let Some(fence) = &cover_fence {
+                if heat_on() {
+                    // Without the fence yet no cover counts as done: a flight
+                    // that owes waits (`Wait::Cover` asks for it again).
                     // SAFETY: a plain query.
-                    let done = unsafe { fence.GetCompletedValue() };
+                    let done = cover_fence.as_ref().map_or(0, |fence| unsafe { fence.GetCompletedValue() });
                     let mut book = HEAT.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(book) = book.as_mut() {
                         let mut last = None;
@@ -4669,6 +4681,19 @@ impl Host {
                 && let Some((value, cover)) = self.card_cover(work, &planned.covers, number, sent_as.saturating_sub(1))
             {
                 book.add_cover(value, &planned.covers, cover);
+            }
+            // Covers land with the flights that owed their pieces, a few
+            // submissions after: many waiting, or an old one, means flights
+            // land without them (their shaders' writes lost) or do not land.
+            let (waiting, oldest) = book.waiting();
+            if (waiting > 512 || oldest.is_some_and(|o| o + 4 * deadline + 256 < number)) && !HEAT_WARNED.swap(true, Ordering::Relaxed) {
+                tracing::error!(
+                    waiting,
+                    oldest,
+                    number,
+                    "compares of owed pieces are not landing (VICTORY_CARD_COMPARE_HOT): what shaders wrote may be lost; \
+                     turn the switch off"
+                );
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
