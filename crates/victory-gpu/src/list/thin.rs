@@ -305,6 +305,15 @@ fn start() {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
             crate::queue::no_drain_here();
+            // Below the title's threads and the submitting one, which the
+            // frame waits for more than for a list's translation
+            // (`VICTORY_LIST_LOW=0`: normal): n-ab-prio, 37.2 -> 36.3 ms a
+            // frame, the chain's "woken, not running yet" being ~3 ms.
+            if std::env::var_os("VICTORY_LIST_LOW").is_none_or(|v| v != "0") {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+                // SAFETY: this thread's own priority.
+                unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+            }
             loop {
                 let recording = {
                     let mut ready = held(&READY);
