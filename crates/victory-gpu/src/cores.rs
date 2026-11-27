@@ -108,8 +108,10 @@ fn ask(what: &str, from: u32) {
 /// the heaps' records 6.2 / 2.5 ms, the card idle behind the submitting
 /// thread 24.7 / 13.2 ms. Lowering the translating threads below normal as
 /// well made each list call about 5 % slower, with no clear gain of its own.
+/// Off by default in this fork (upstream trustno1 80c70b71 has it on).
 fn helpers_raised() -> bool {
-    crate::toggled!("VICTORY_HELPER_PRIORITY")
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HELPER_PRIORITY"))
 }
 
 /// A helper's priority ([`helpers_raised`]). [`Self::keep`] is called before
