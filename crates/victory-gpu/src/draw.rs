@@ -3837,6 +3837,10 @@ impl State {
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                    Some(View::Constant(0, _)) => {
+                        // A null constant buffer view (upstream VIctory #2449).
+                        host.make_null(index);
+                    }
                     Some(View::Constant(address, size)) => {
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
