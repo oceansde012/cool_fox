@@ -1208,42 +1208,64 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
-    if side_by_side() <= 1 {
-        return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
-    }
-    // By the page: the address, and the one whose page it is to show.
-    let pages: Vec<(usize, Option<usize>)> = ranges
-        .iter()
-        .flat_map(|&(to, from, len)| {
-            (0..len as usize).step_by(PAGE).map(move |k| (to as usize + k, (from != 0).then_some(from as usize + k)))
-        })
-        .collect();
-    if pages.iter().any(|p| p.0 % PAGE != 0 || p.1.is_some_and(|from| from % PAGE != 0)) {
+    // A page stride preserves the alignment of each nonempty range.
+    if side_by_side() <= 1 || ranges.iter().any(|&(to, from, len)| {
+        len != 0 && (to % PAGE as u64 != 0 || from % PAGE as u64 != 0)
+    }) {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     let mut ok = true;
-    let mut at = 0;
-    while at < pages.len() {
+    alias_groups(ranges, |group| {
         let _busy = Busy::begin();
         let mut physical = physical();
-        let mut ops: Vec<Op> = Vec::new();
-        let mut touched = std::collections::HashSet::new();
-        for &(to, from) in &pages[at..] {
-            // A page the group changes already, or one it would be mapped
-            // from: after it.
-            if ops.len() == GROUP || touched.contains(&to) || from.is_some_and(|from| touched.contains(&from)) {
-                break;
-            }
+        let mut ops = Vec::with_capacity(group.len());
+        for &(to, from) in group {
             let slice = from.map(|from| physical.slice_at(from));
             ok &= !matches!(slice, Some(None));
-            touched.insert(to);
             ops.push(Op::new(to, slice.flatten()));
-            at += 1;
         }
         let _changing = victory_gpu::title_memory_remapping();
         ok &= change(&mut physical, ops);
-    }
+    });
     ok
+}
+
+/// Expand aligned ranges one independent group at a time. Only the addresses
+/// are planned here. Resolving the backing pages still takes the mapping lock.
+fn alias_groups(ranges: &[(u64, u64, u64)], mut visit: impl FnMut(&[(usize, Option<usize>)])) {
+    let mut group = [(0, None); GROUP];
+    let mut count = 0;
+    // Destinations generally advance together. Track that run as a range
+    // of page numbers and keep just the scattered destinations in the set.
+    let mut consecutive = 0..0;
+    let mut scattered = std::collections::HashSet::new();
+    for &(to, from, len) in ranges {
+        for offset in (0..len as usize).step_by(PAGE) {
+            let dest = to as usize + offset;
+            let source = (from != 0).then_some(from as usize + offset);
+            let page = dest / PAGE;
+            let touched = |page| {
+                consecutive.contains(&page) || (!scattered.is_empty() && scattered.contains(&page))
+            };
+            if count == GROUP || touched(page) || source.is_some_and(|at| touched(at / PAGE)) {
+                visit(&group[..count]);
+                count = 0;
+                scattered.clear();
+            }
+            if count == 0 {
+                consecutive = page..page + 1;
+            } else if consecutive.end == page {
+                consecutive.end += 1;
+            } else {
+                scattered.insert(page);
+            }
+            group[count] = (dest, source);
+            count += 1;
+        }
+    }
+    if count != 0 {
+        visit(&group[..count]);
+    }
 }
 
 /// Maps (page number not 0) or unmaps each address; false if a page is not
@@ -2206,6 +2228,34 @@ mod tests {
             assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
         }
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn alias_groups_split_at_capacity_and_at_dependencies() {
+        let page = PAGE as u64;
+        // Include a gap, a duplicate destination, repeated read-only sources,
+        // an unmap used as a later source, a zero length, and a partial page.
+        let ranges = [
+            (100 * page, 500 * page, (GROUP as u64 + 1) * page),
+            (200 * page, 0, 1),
+            (180 * page, 500 * page, page),
+            (180 * page, 700 * page, page),
+            (181 * page, 180 * page, page),
+            (190 * page, 500 * page, page),
+            (191 * page, 500 * page, page),
+            (193 * page, 0, page),
+            (192 * page, 193 * page, page),
+            (1, 1, 0),
+        ];
+        let mut groups = Vec::new();
+        alias_groups(&ranges, |group| groups.push(group.to_vec()));
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [GROUP, 3, 1, 4, 1]);
+        let expected = ranges.into_iter().flat_map(|(to, from, len)| {
+            (0..len as usize).step_by(PAGE).map(move |k| {
+                (to as usize + k, (from != 0).then_some(from as usize + k))
+            })
+        });
+        assert!(groups.into_iter().flatten().eq(expected));
     }
 
     /// Many pages in one call: mapped, moved over each other's addresses,
