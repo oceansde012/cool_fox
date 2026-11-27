@@ -5,7 +5,7 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 pub mod census;
 pub mod opt;
@@ -498,6 +498,40 @@ impl Module {
     }
     pub fn terminate(&mut self, block: usize, t: Term) {
         self.blocks[block].term = Some(t);
+    }
+
+    /// Connect the incoming and outgoing values of state carried through the CFG. Each
+    /// changed block supplies its incoming phi (or the entry value) and its outgoing value.
+    pub fn fill_state_phis(&mut self, entry: usize, initial: V, mut state: BTreeMap<usize, (V, V)>) {
+        if state.is_empty() {
+            return;
+        }
+        let mut preds = vec![Vec::new(); self.blocks.len()];
+        for (b, block) in self.blocks.iter().enumerate() {
+            for &t in successors(block.term).iter() {
+                preds[t].push(b);
+            }
+        }
+        let ty = self.type_of(initial);
+        state.entry(entry).or_insert((initial, initial));
+        let mut pending: Vec<_> = state.keys().copied().collect();
+        while let Some(b) = pending.pop() {
+            for &p in &preds[b] {
+                state.entry(p).or_insert_with(|| {
+                    if preds[p].is_empty() {
+                        return (initial, initial);
+                    }
+                    pending.push(p);
+                    let value = self.phi(p, ty);
+                    (value, value)
+                });
+            }
+        }
+        for (&b, &(phi, _)) in &state {
+            if b != entry && !preds[b].is_empty() {
+                self.set_phi(phi, preds[b].iter().map(|p| (state[p].1, *p)).collect());
+            }
+        }
     }
 
     pub fn md_str(&mut self, s: &str) -> Md {

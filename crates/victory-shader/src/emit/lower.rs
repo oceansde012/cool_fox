@@ -65,6 +65,8 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    #[cfg(test)]
+    barriers: u32,
 }
 
 pub(crate) struct Parts<'a> {
@@ -111,7 +113,32 @@ fn counted_in_threads(parts: &Parts) -> bool {
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
 pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
-    let cheap_wave = std::env::var_os("VICTORY_WAVE_CHEAP").is_some_and(|v| v == "1");
+    if !counted
+        && !parts.st.wide.is_empty()
+        && std::env::var_os("VICTORY_WAVE_CHEAP").is_some_and(|v| v == "1")
+        && parts.native.wave64
+        && host_max_wave() == 32
+        && matches!(parts.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+        && !LOCAL_WAVES.get()
+        && super::group_sync() != 0
+    {
+        let previous = take_needs();
+        let result = lower_with_wave_meetings(parts, counted, true);
+        let needs = NEEDS.replace(previous);
+        if result.as_ref().is_ok_and(|l| l.wave_size == Some(32)) {
+            needs.into_iter().for_each(need);
+            return result;
+        }
+        // Use the usual lowering and its widening decisions if the optimized form fails.
+    }
+    lower_with_wave_meetings(parts, counted, false)
+}
+
+fn lower_with_wave_meetings(
+    parts: &Parts,
+    counted: bool,
+    cheap_wave: bool,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
         match Lower::new(parts, &bad, cheap_wave).run(counted) {
@@ -337,9 +364,11 @@ struct Lower<'a> {
     /// Read-only LDS accesses that need no extra rendezvous in a widened shader.
     lds_unordered: HashSet<(usize, usize)>,
     /// A console wave64 program run as two host waves of 32 that exchange through LDS: the first
-    /// of two exchange dwords, whether the group has no upper half (32 threads or fewer), and per
+    /// exchange dword, whether the group has no upper half (32 threads or fewer), and per
     /// IR block whether every lane runs it (exchanges need both halves there).
     exchange: Option<(u32, bool, Vec<bool>)>,
+    /// With double-buffered exchanges: the incoming and outgoing buffer parity, by DXIL block.
+    exchange_parity: Option<BTreeMap<usize, (V, V)>>,
     /// With `exchange`: nothing is exchanged, each host wave acts as a wave
     /// of its own ([`with_local_waves`]).
     local: bool,
@@ -1010,8 +1039,16 @@ fn lds_order(p: &Program, st: &Structured, all: &[bool], guest_barriers_wait: bo
     let writes = flood(writes);
     let atomics = flood(atomics);
     LdsOrder {
-        unordered: reads.iter().filter(|(piece, _)| !writes[*piece]).map(|&(_, site)| site).collect(),
-        unstable: reads.iter().filter(|(piece, _)| atomics[*piece]).map(|&(_, site)| site).collect(),
+        unordered: reads
+            .iter()
+            .filter(|(piece, _)| !writes[*piece])
+            .map(|&(_, site)| site)
+            .collect(),
+        unstable: reads
+            .iter()
+            .filter(|(piece, _)| atomics[*piece])
+            .map(|&(_, site)| site)
+            .collect(),
     }
 }
 
@@ -1506,6 +1543,7 @@ impl<'a> Lower<'a> {
         let mut lds_ordering = LdsOrder::default();
         // a console wave64 program in two host waves of 32 (`exchange`)
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
+        let mut exchange_parity = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1557,15 +1595,12 @@ impl<'a> Lower<'a> {
                     // – where every thread of the group gets there (no lane branch around it,
                     // no guard), else a barrier would hang the group
                     if let Some(all) = all_lane_blocks(x.st) {
-                        let cheap = cheap_wave
-                            && group == 64
-                            && !x.st.wide.is_empty()
-                            && !LOCAL_WAVES.get()
-                            && super::group_sync() != 0;
-                        if cheap && s.lds_dwords > 0 {
+                        if cheap_wave && s.lds_dwords > 0 {
                             lds_ordering = lds_order(p, x.st, &all, super::group_sync() == 2);
                         }
-                        let meets = |b, k, inst| is_lds_access(inst) && !lds_ordering.unordered.contains(&(b, k));
+                        let meets = |b, k, inst| {
+                            is_lds_access(inst) && !lds_ordering.unordered.contains(&(b, k))
+                        };
                         let ok = p.blocks.iter().enumerate().all(|(b, blk)| {
                             blk.insts.iter().enumerate().all(|(k, inst)| {
                                 !meets(b, k, inst) || all.get(b).copied().unwrap_or(false)
@@ -1592,9 +1627,16 @@ impl<'a> Lower<'a> {
                             split_lds = s.lds_dwords > 0 && group > 32;
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
-                                // numbers go through two exchange dwords past the program's LDS
+                                // numbers go through exchange dwords past the program's LDS
                                 exchange = Some((s.lds_dwords, group <= 32, all));
-                                s.lds_dwords += 2 * group.div_ceil(64);
+                                // Two banks of four dwords, plus the wave-base counter below.
+                                // Use the D3D12 compute shared-memory limit.
+                                if cheap_wave && s.lds_dwords + 9 <= 8192 {
+                                    exchange_parity = Some(BTreeMap::new());
+                                    s.lds_dwords += 8;
+                                } else {
+                                    s.lds_dwords += 2 * group.div_ceil(64);
+                                }
                             }
                         }
                     }
@@ -1799,7 +1841,9 @@ impl<'a> Lower<'a> {
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
                 Some((_, false, all)) if !LOCAL_WAVES.get() => {
-                    lane_uniform(p, x.st, all, split_lds && super::group_sync() != 0, &lds_ordering.unstable)
+                    lane_uniform(
+                        p, x.st, all, split_lds && super::group_sync() != 0, &lds_ordering.unstable,
+                    )
                 }
                 _ => HashSet::new(),
             },
@@ -1810,6 +1854,7 @@ impl<'a> Lower<'a> {
                 _ => Default::default(),
             },
             exchange,
+            exchange_parity,
             clane: None,
             pair: None,
             halves,
@@ -2537,6 +2582,10 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if let Some(parity) = self.exchange_parity.take() {
+            let first = self.s.m.bool(false);
+            self.s.m.fill_state_phis(self.s.entry, first, parity);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -2554,6 +2603,11 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            barriers: {
+                use super::bitcode::census::KINDS;
+                self.s.m.census().counts[KINDS.iter().position(|&kind| kind == "barrier").unwrap()]
+            },
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -4278,6 +4332,9 @@ impl<'a> Lower<'a> {
             let hi = self.s.m.select(at, upper, mine, z);
             return (lo, hi);
         }
+        if self.exchange_parity.is_some() {
+            return self.exchange_words(at, slot, [mine])[0];
+        }
         // the pair of dwords of this thread's console wave: its half's, then both
         let pair = self.exchange_pair(slot);
         let cl = self.console_lane();
@@ -4297,6 +4354,54 @@ impl<'a> Lower<'a> {
         // the slots are written again only after every thread read them
         self.group_sync(at);
         (lo, hi)
+    }
+
+    /// Alternate banks on every dynamic exchange. Both halves reach exchanges in the same
+    /// order. Before either can reuse a bank, both must pass the intervening exchange's
+    /// barrier, which also orders the earlier reads. Parity is lane-local SSA state.
+    fn next_exchange_buffer(&mut self, at: usize, slot: u32) -> V {
+        let parity = self.exchange_parity.as_mut().expect("double-buffered exchange");
+        let (_, current) = parity.entry(at).or_insert_with(|| {
+            let input = if at == self.s.entry {
+                self.s.m.bool(false)
+            } else {
+                self.s.m.phi(at, self.s.t.i1)
+            };
+            (input, input)
+        });
+        let use_second = *current;
+        let one = self.s.m.bool(true);
+        *current = self.s.m.bin(at, Bin::Xor, use_second, one);
+        let (first, second) = (self.s.m.i32(slot), self.s.m.i32(slot + 4));
+        self.s.m.select(at, use_second, second, first)
+    }
+
+    /// Publish one or two values per half, then read both halves after one group barrier.
+    fn exchange_words<const N: usize>(&mut self, at: usize, slot: u32, values: [V; N]) -> [(V, V); N] {
+        debug_assert!((1..=2).contains(&N));
+        let bank = self.next_exchange_buffer(at, slot);
+        let lane = self.console_lane();
+        let four = self.s.m.i32(4);
+        let two = self.s.m.i32(2);
+        let half = self.s.m.bin(at, Bin::LShr, lane, four);
+        let half_offset = self.s.m.bin(at, Bin::And, half, two);
+        let own = self.s.m.bin(at, Bin::Add, bank, half_offset);
+        let lds = self.s.lds();
+        for (i, value) in values.into_iter().enumerate() {
+            let offset = self.s.m.i32(i as u32);
+            let index = self.s.m.bin(at, Bin::Add, own, offset);
+            let ptr = self.s.m.element(at, lds, index);
+            self.s.m.store(at, ptr, value);
+        }
+        self.group_sync(at);
+        std::array::from_fn(|i| {
+            let offset = self.s.m.i32(i as u32);
+            let lo = self.s.m.bin(at, Bin::Add, bank, offset);
+            let hi = self.s.m.bin(at, Bin::Add, lo, two);
+            let p0 = self.s.m.element(at, lds, lo);
+            let p1 = self.s.m.element(at, lds, hi);
+            (self.s.m.load(at, p0), self.s.m.load(at, p1))
+        })
     }
 
     /// The first of the two exchange dwords of this thread's console wave (made in the entry
@@ -8867,7 +8972,12 @@ impl<'a> Lower<'a> {
                     }
                     let cl = self.console_lane();
                     let is = self.s.m.cmp(self.cur, pred::EQ, cl, lane);
-                    let k = self.exchange_pair(slot);
+                    let double_buffered = self.exchange_parity.is_some();
+                    let k = if double_buffered {
+                        self.next_exchange_buffer(self.cur, slot)
+                    } else {
+                        self.exchange_pair(slot)
+                    };
                     let at = self.begin_guarded(Some(is));
                     let lds = self.s.lds();
                     let ptr = self.s.m.element(self.cur, lds, k);
@@ -8877,7 +8987,9 @@ impl<'a> Lower<'a> {
                     self.group_sync(c2);
                     let ptr = self.s.m.element(c2, lds, k);
                     let r = self.s.m.load(c2, ptr);
-                    self.group_sync(c2);
+                    if !double_buffered {
+                        self.group_sync(c2);
+                    }
                     return int(self, r);
                 }
                 let r = self.read_lane(a, lane);
@@ -8958,8 +9070,12 @@ impl<'a> Lower<'a> {
                     } else {
                         let i32t = self.s.t.i32;
                         let has = self.s.m.cast(c, Cast::ZExt, any, i32t);
-                        let (lo_has, hi_has) = self.exchange_halves(c, has);
-                        let (lo, hi) = self.exchange_halves(c, mine);
+                        let [(lo_has, hi_has), (lo, hi)] = if self.exchange_parity.is_some() {
+                            let slot = self.exchange.as_ref().expect("exchange").0;
+                            self.exchange_words(c, slot, [has, mine])
+                        } else {
+                            [self.exchange_halves(c, has), self.exchange_halves(c, mine)]
+                        };
                         let z = self.s.m.i32(0);
                         let in_lo = self.s.m.cmp(c, pred::NE, lo_has, z);
                         let in_hi = self.s.m.cmp(c, pred::NE, hi_has, z);
@@ -12877,17 +12993,84 @@ mod tests {
         let p = ir::build(&code, true, 8).expect("IR");
         let st = structure::structure(&p).expect("structure");
         let all = super::all_lane_blocks(&st).expect("direct CFG");
-        let sites: Vec<_> = p.blocks.iter().enumerate().flat_map(|(b, block)| {
-            block.insts.iter().enumerate().filter_map(move |(i, inst)| {
-                (inst.name() == "ds_read_b32").then_some((b, i))
+        let sites: Vec<_> = p
+            .blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(b, block)| {
+                block.insts.iter().enumerate().filter_map(move |(i, inst)| {
+                    (inst.name() == "ds_read_b32").then_some((b, i))
+                })
             })
-        }).collect();
+            .collect();
         let [before, read_only, after_atomic] = sites.try_into().expect("three LDS reads");
         let order = super::lds_order(&p, &st, &all, true);
         assert_eq!(order.unordered, [read_only].into());
         assert_eq!(order.unstable, [after_atomic].into());
         assert!(!order.unstable.contains(&before));
         assert!(super::lds_order(&p, &st, &all, false).unordered.is_empty());
+    }
+
+    #[test]
+    fn wave_cheap_double_buffers_a_widened_loop() {
+        let words: [u32; 9] = [
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xBF80_0000, // s_nop 0
+            0x7D84_0080, // loop: v_cmp_eq_u32 vcc, 0, v0
+            0xBF87_FFFE, // s_cbranch_vccnz loop
+            0x7E18_0500, // v_readfirstlane_b32 s12, v0
+            0x7E04_020C, // v_mov_b32 v2, s12
+            0xD834_0000, 0x0000_0201, // ds_write_b32 v1, v2
+            S_ENDPGM,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let p = ir::build(&native.code, true, native.vgprs).unwrap();
+        let wide = p
+            .blocks
+            .iter()
+            .position(|block| block.insts.iter().any(|i| i.name() == "s_cbranch_vccnz"))
+            .expect("loop branch");
+        let st = structure::structure_wide(&p, &[wide].into()).unwrap();
+        assert!(st.wide.contains(&wide));
+        let io = io::raise(&p, &native).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let parts = Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        };
+        super::TEST_HOST_WAVE.set(Some(32));
+        let off = super::lower_with_wave_meetings(&parts, false, false);
+        let on = super::lower_with_wave_meetings(&parts, false, true);
+        super::TEST_HOST_WAVE.set(None);
+        let (off, mut on) = (off.unwrap(), on.unwrap());
+        assert_eq!((off.wave_size, on.wave_size), (Some(32), Some(32)));
+        assert_eq!(on.barriers, 4);
+        assert!(matches!(off.barriers, 6 | 8), "unoptimized barriers: {}", off.barriers);
+        #[cfg(windows)]
+        if let Some(path) = super::super::validator::Validator::default_path() {
+            super::super::validator::Validator::load(Some(&path))
+                .unwrap()
+                .validate(&mut on.dxil)
+                .unwrap();
+        }
     }
 
     #[test]
