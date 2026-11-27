@@ -41,6 +41,8 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Serialize the optional first-use wait across recording threads.
+    first_wait: OnceLock<()>,
     /// A pass over the screen ([`GraphicsState::screen_pass`]) or a confirmed
     /// opening-scene / bake producer that must never sit behind cold RT shaders.
     screen: bool,
@@ -130,6 +132,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            first_wait: OnceLock::new(),
         }
     }
 
@@ -231,9 +234,69 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if first_wait_enabled() {
+            let frame = crate::frame::current();
+            if let Some(d) = first_wait_deadline(frame) {
+                p.first_wait.get_or_init(|| wait_first(p, Duration::from_secs(10), Some(d)));
+            }
+            wait(p, frame);
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Opt in to a bounded wait for each pipeline's first use, independently of
+/// the shared frame budget. A refused pipeline also ends the wait.
+fn first_wait_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_FIRST_WAIT").is_some_and(|v| v == "1"))
+}
+
+fn first_wait_frame_most() -> Duration {
+    static MOST: OnceLock<Duration> = OnceLock::new();
+    *MOST.get_or_init(|| {
+        let ms = std::env::var_os("VICTORY_PIPELINE_FIRST_WAIT_FRAME_MS")
+            .and_then(|v| v.to_str().and_then(|s| s.parse::<u64>().ok()))
+            .unwrap_or(12000);
+        Duration::from_millis(ms)
+    })
+}
+
+fn deadline_of(began: &mut (u64, Option<Instant>), frame: u64, now: Instant, most: Duration) -> Option<Instant> {
+    if began.0 != frame || began.1.is_none() {
+        *began = (frame, Some(now));
+    }
+    let end = began.1.unwrap() + most;
+    (now < end).then_some(end)
+}
+
+fn first_wait_deadline(frame: u64) -> Option<Instant> {
+    static BEGAN: Mutex<(u64, Option<Instant>)> = Mutex::new((u64::MAX, None));
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let now = Instant::now();
+    let mut began = BEGAN.lock().unwrap_or_else(|e| e.into_inner());
+    let deadline = deadline_of(&mut began, frame, now, first_wait_frame_most());
+    if deadline.is_none() && SAID.swap(frame, Ordering::Relaxed) != frame {
+        tracing::warn!("first-wait frame deadline exhausted; skipping first waits for frame {frame}");
+    }
+    deadline
+}
+
+fn wait_first(p: &Pending, limit: Duration, deadline: Option<Instant>) {
+    if deadline.is_some_and(|d| d <= Instant::now()) { return; }
+    let started = Instant::now();
+    let (lock, done) = &DONE;
+    let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    while p.made.get().is_none() {
+        let mut left = limit.saturating_sub(started.elapsed());
+        if let Some(d) = deadline {
+            left = left.min(d.saturating_duration_since(Instant::now()));
+        }
+        if left.is_zero() { break; }
+        held = done.wait_timeout(held, left).unwrap_or_else(|e| e.into_inner()).0;
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -560,6 +623,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_wait_frame_deadline() {
+        let t0 = Instant::now();
+        let mut began = (u64::MAX, None);
+
+        let end0 = deadline_of(&mut began, 7, t0, Duration::from_secs(10)).unwrap();
+        assert_eq!(began.0, 7);
+        assert_eq!(began.1, Some(t0));
+        assert_eq!(end0, t0 + Duration::from_secs(10));
+
+        let end1 = deadline_of(&mut began, 7, t0 + Duration::from_secs(1), Duration::from_secs(10)).unwrap();
+        assert_eq!(end1, end0);
+
+        assert!(deadline_of(&mut began, 7, t0 + Duration::from_secs(10), Duration::from_secs(10)).is_none());
+
+        let t1 = t0 + Duration::from_secs(20);
+        let end2 = deadline_of(&mut began, 8, t1, Duration::from_secs(10)).unwrap();
+        assert_eq!(began.1, Some(t1));
+        assert_eq!(end2, t1 + Duration::from_secs(10));
+
+        assert!(deadline_of(&mut began, 9, t1, Duration::ZERO).is_none());
+        assert_eq!(began.1, Some(t1));
+    }
+
+    #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
         assert_eq!(worker_count(None, 1), 2);
         assert_eq!(worker_count(None, 24), 16);
@@ -583,6 +670,54 @@ mod tests {
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
+        assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn first_wait_ends_on_refusal_or_timeout() {
+        let refused = Pending::new(Vec::new(), None);
+        assert!(refused.made.set(None).is_ok());
+        let started = Instant::now();
+        wait_first(&refused, Duration::from_secs(1), None);
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        let pending = Pending::new(Vec::new(), None);
+        let started = Instant::now();
+        wait_first(&pending, Duration::from_millis(10), None);
+        assert!(pending.made.get().is_none());
+        assert!(started.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn concurrent_first_waiters_share_one_wait_and_wake_on_completion() {
+        use std::sync::atomic::AtomicUsize;
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let p = p.clone();
+            let entered = entered.clone();
+            waiters.push(std::thread::spawn(move || {
+                p.first_wait.get_or_init(|| {
+                    entered.fetch_add(1, Ordering::SeqCst);
+                    wait_first(&p, Duration::from_secs(2), None);
+                });
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while entered.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        // Publish under the same mutex and notify just as Pending::make does.
+        let (lock, done) = &DONE;
+        let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(p.made.set(None).is_ok());
+        done.notify_all();
+        drop(held);
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 1);
         assert!(matches!(p.made.get(), Some(None)));
     }
 
