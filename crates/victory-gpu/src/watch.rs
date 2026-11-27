@@ -1528,8 +1528,10 @@ fn guards() -> GuardsHeld {
 }
 
 /// Whether a write fault opens its block without the guards' lock where the
-/// block's page is shown at no other address (`VICTORY_FAULT_FAST=0`: with
-/// the lock, as before; `VICTORY_AB` can name it).
+/// block's page is shown at no other address (`VICTORY_FAULT_FAST=1`; off by
+/// default: a write can go unreported to a later asking when [`open`] clears
+/// an aliased block's mark while a fault opens it alone; `VICTORY_AB` can
+/// name it).
 ///
 /// The title's job threads spent 41 ms a frame in write faults, most of it
 /// waiting for the guards' lock (287 waits a frame, 47 ms of all threads'
@@ -1554,7 +1556,7 @@ fn fast_faults() -> bool {
 
 fn fast_asked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_FAST").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_FAST").is_some_and(|v| v == "1"))
 }
 
 #[cfg(test)]
