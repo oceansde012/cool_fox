@@ -18,6 +18,10 @@
 //! card copies them from there. Runs of a few words, which a refresh that
 //! sends only what changed makes many of, go as pairs of offset and value,
 //! stored by one dispatch per copy; the others as a copy each.
+//!
+//! `VICTORY_PIPELINE_N1=1` lays out byte copies and scatter chunks together
+//! before allocating the upload. Packing still finishes before recording the
+//! upload list.
 
 use super::*;
 use crate::shadow::Shadow;
@@ -189,16 +193,56 @@ pub(super) struct Own {
 /// Runs whose pairs are one piece of work.
 const RUNS_AT_A_TIME: usize = 4096;
 
+// Shadow mapping, ranges to pack as pairs, byte offset in the upload.
+type Scatter<'a> = (usize, &'a [(usize, usize)], u64);
+
+/// Lays out the byte copies and counts pairs per worker chunk in one pass over the ranges.
+fn plan_copy<'a>(from: usize, ranges: &'a [(usize, usize)], at: &mut u64, work: &mut Vec<Scatter<'a>>) -> Copy {
+    let mut runs = Vec::new();
+    let first_chunk = work.len();
+    let mut pair_bytes = 0u64;
+    for chunk in ranges.chunks(RUNS_AT_A_TIME) {
+        let mut words = 0;
+        for &(a, b) in chunk {
+            let len = b - a;
+            if short(a, len) {
+                words += len / 4;
+            } else {
+                runs.push((a, *at, len));
+                *at += (len as u64).next_multiple_of(16);
+            }
+        }
+        if words > 0 {
+            work.push((from, chunk, pair_bytes));
+            pair_bytes += words as u64 * 8;
+        }
+    }
+    // The pair chunks follow all this shadow's byte copies.
+    for (_, _, offset) in &mut work[first_chunk..] {
+        *offset += *at;
+    }
+    let pairs = (*at, (pair_bytes / 8) as u32);
+    *at += pair_bytes.next_multiple_of(16);
+    Copy { runs, pairs }
+}
+
 /// Takes what `dirty` sends up out of the CPU sides.
 pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, usize)>)]) -> Option<Own> {
+    static PIPELINE_N1: OnceLock<bool> = OnceLock::new();
     let began = std::time::Instant::now();
     pass(host)?;
+    let combined = *PIPELINE_N1.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_N1").is_some_and(|v| v == "1"));
     // Runs of whole words of the copy: only those are pairs. (A byte beside
     // them in a word may be the card's.)
     let short = |&(a, b): &(usize, usize)| short(a, b - a);
     let mut at = 0u64;
     let mut copies = Vec::with_capacity(dirty.len());
-    for (_, ranges) in dirty {
+    let mut work: Vec<Scatter<'_>> = Vec::new();
+    for (shadow, ranges) in dirty {
+        if combined {
+            copies.push(plan_copy(shadow.card_data() as usize, ranges, &mut at, &mut work));
+            continue;
+        }
         let mut runs = Vec::new();
         for &(a, b) in ranges.iter().filter(|r| !short(r)) {
             runs.push((a, at, b - a));
@@ -213,23 +257,25 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     }
     let memory = memory(host, at)?;
     let mut moves: Vec<(usize, usize, usize)> = Vec::new();
-    let mut work: Vec<(usize, &[(usize, usize)], usize)> = Vec::new();
     for ((shadow, ranges), copy) in dirty.iter().zip(&copies) {
         let from = shadow.card_data() as usize;
         moves.extend(copy.runs.iter().map(|&(a, to, n)| (from + a, memory.data + to as usize, n)));
+        if combined {
+            continue;
+        }
         // (80,000 runs of some words a frame: in pieces of work.)
-        let mut to = memory.data + copy.pairs.0 as usize;
+        let mut to = copy.pairs.0;
         for ranges in ranges.chunks(RUNS_AT_A_TIME) {
             let words: usize = ranges.iter().filter(|r| short(r)).map(|r| (r.1 - r.0) / 4).sum();
             if words > 0 {
                 work.push((from, ranges, to));
-                to += words * 8;
+                to += words as u64 * 8;
             }
         }
     }
     let one = |i: usize| {
         let (from, ranges, to) = work[i];
-        let mut to = to as *mut [u32; 2];
+        let mut to = (memory.data + to as usize) as *mut [u32; 2];
         for &(a, b) in ranges.iter().filter(|r| short(r)) {
             for offset in (a..b).step_by(4) {
                 // SAFETY: inside the copy's mapping (its CPU side, which
@@ -251,6 +297,41 @@ pub(super) fn take(host: &Host, dirty: &[(std::sync::Arc<Shadow>, Vec<(usize, us
     crate::shadow::copy_all(moves);
     STATS[3].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
     Some(Own { memory, copies })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RUNS_AT_A_TIME, plan_copy};
+
+    #[test]
+    fn plan_copy_preserves_upload_offsets_across_chunks_and_shadows() {
+        // Short ranges in the first and third chunks, with a byte-only chunk in between.
+        let mut ranges = vec![(0, 4)];
+        ranges.extend((0..2 * RUNS_AT_A_TIME - 1).map(|i| (8 * i + 9, 8 * i + 12)));
+        let last = 16 * RUNS_AT_A_TIME;
+        ranges.extend([(last, last + 8), (last + 16, last + 288)]);
+        let mut at = 16;
+        let mut work = Vec::new();
+
+        let first = plan_copy(100, &ranges, &mut at, &mut work);
+        let pair_start = 16 + 16 * (2 * RUNS_AT_A_TIME as u64 - 1) + 272;
+        assert_eq!(first.runs.len(), 2 * RUNS_AT_A_TIME);
+        assert_eq!(first.runs[0], (9, 16, 3));
+        assert_eq!(first.runs.last(), Some(&(last + 16, pair_start - 272, 272)));
+        assert_eq!(first.pairs, (pair_start, 3));
+        assert_eq!(at, pair_start + 32);
+        assert_eq!(
+            work,
+            [(100, &ranges[..RUNS_AT_A_TIME], pair_start), (100, &ranges[2 * RUNS_AT_A_TIME..], pair_start + 8)]
+        );
+
+        let second_ranges = [(0, 0), (4, 8)];
+        let second = plan_copy(200, &second_ranges, &mut at, &mut work);
+        assert!(second.runs.is_empty());
+        assert_eq!(second.pairs, (pair_start + 32, 1));
+        assert_eq!(at, pair_start + 48);
+        assert_eq!(work[2], (200, second_ranges.as_slice(), pair_start + 32));
+    }
 }
 
 impl Own {
