@@ -4427,6 +4427,9 @@ impl Host {
                     continue;
                 };
                 let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                if compared {
+                    compared_of(shadow.span(), span.pieces);
+                }
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
@@ -9027,6 +9030,7 @@ impl Meter {
                 );
             }
         }
+        compared_line(frames);
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
@@ -10954,6 +10958,50 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+
+/// Since the last frame-rate line, by copy in the card's memory (the title buffer's address and
+/// length): the pieces of 64 KiB the card compared of it after submissions whose shaders may
+/// write it, and how many such compares.
+static COMPARED_OF: Mutex<Option<std::collections::HashMap<(u64, u64), (u64, u64)>>> = Mutex::new(None);
+
+/// A submission has `pieces` of the copy of the title buffer `copy` compared on the card.
+fn compared_of(copy: (u64, u64), pieces: u32) {
+    let mut by = COMPARED_OF.lock().unwrap_or_else(|e| e.into_inner());
+    let e = by.get_or_insert_with(Default::default).entry(copy).or_insert((0, 0));
+    e.0 += u64::from(pieces);
+    e.1 += 1;
+}
+
+/// The copies the card compares most of, a frame: which title buffers the declared writes of
+/// shaders make it read through, and how many times over.
+fn compared_line(frames: f64) {
+    let by = COMPARED_OF.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut by: Vec<_> = by.into_iter().flatten().collect();
+    if by.is_empty() {
+        return;
+    }
+    by.sort_by_key(|&(_, (pieces, _))| std::cmp::Reverse(pieces));
+    let all: u64 = by.iter().map(|&(_, (pieces, _))| pieces).sum();
+    let top: Vec<String> = by
+        .iter()
+        .take(8)
+        .map(|&((start, len), (pieces, times))| {
+            format!(
+                "{start:#x}+{:.1} MB: {:.0} pieces in {:.1} compares",
+                len as f64 / 1e6,
+                pieces as f64 / frames,
+                times as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "pieces of 64 KiB compared on the card per frame, by copy: {:.0} in {} copies ({:.0} MB read a frame); the most: {}",
+        all as f64 / frames,
+        by.len(),
+        all as f64 * 65536.0 / 1e6 / frames,
+        top.join("; ")
+    );
+}
 
 /// Whether the compares of ranges of one copy in the card's memory whose
 /// pieces and result places follow each other go in one pass
