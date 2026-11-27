@@ -26,6 +26,9 @@
 //!   with an effect stands between them (another thread's unsynchronised
 //!   store may fall between any two reads or before both: the title's code
 //!   cannot tell which).
+//! - [`EXT_FOLD`]: opt-in extended algebraic, bitwise, shift, power-of-two
+//!   strength reduction, comparison/select folds, and canonical comparison
+//!   reuse and branch facts.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -60,14 +63,16 @@ pub const FIRST: u32 = 32;
 /// the yard's frame replayed turn by turn, dispatches and draws 18.47 -> 18.45
 /// ms (12 loops) and 18.23 -> 18.16 (5 loops): the driver joins the loads.
 pub const WIDE: u32 = 64;
+/// Opt-in extended algebraic, bitwise, shift, compare/select folds, and
+/// canonical comparison reuse and branch facts.
+pub const EXT_FOLD: u32 = 128;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
-/// The passes that run when nothing says which: every one but [`WIDE`],
-/// which no card has shown a gain for yet (`VICTORY_SHADER_OPT=127` asks
-/// for it).
-pub const DEFAULT: u32 = ALL & !WIDE;
+/// The passes that run when nothing says which: the original default passes
+/// (`63`), keeping default output bit-identical unless opt-in bits are set.
+pub const DEFAULT: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | FIRST;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
@@ -126,6 +131,38 @@ fn opposite(p: u8) -> u8 {
         pred::SLE => pred::SGT,
         pred::SGE => pred::SLT,
         _ => pred::SGE,
+    }
+}
+
+/// Canonical `(pred, a, b)` for comparison equivalence: symmetric predicates
+/// order operands `a <= b`, and greater-than predicates flip to less-than by
+/// swapping `(a, b)`. Preserves IEEE-754 NaN semantics for every float
+/// predicate (ordered stays ordered, unordered stays unordered).
+fn canonical_cmp(p: u8, a: V, b: V) -> (u8, V, V) {
+    match p {
+        pred::EQ
+        | pred::NE
+        | pred::OEQ
+        | pred::UEQ
+        | pred::ONE
+        | pred::UNE
+        | pred::ORD
+        | pred::UNO => {
+            if b < a {
+                (p, b, a)
+            } else {
+                (p, a, b)
+            }
+        }
+        pred::IUGT => (pred::IULT, b, a),
+        pred::IUGE => (pred::IULE, b, a),
+        pred::SGT => (pred::SLT, b, a),
+        pred::SGE => (pred::SLE, b, a),
+        pred::OGT => (pred::OLT, b, a),
+        pred::OGE => (pred::OLE, b, a),
+        pred::UGT => (pred::ULT, b, a),
+        pred::UGE => (pred::ULE, b, a),
+        _ => (p, a, b),
     }
 }
 
@@ -229,13 +266,13 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
             for _ in 0..4 {
                 let mut changed = self.merge(passes);
-                if passes & FOLD != 0 {
+                if passes & (FOLD | EXT_FOLD) != 0 {
                     changed |= self.prune();
                 }
                 if !changed {
@@ -353,7 +390,18 @@ impl Module {
 
     /// Notes that `v` (an i1) is `holds` in the block being walked, and what
     /// follows from it for the values `v` was made of.
-    fn learn(&self, v: V, holds: bool, facts: &mut Facts, learned: &mut Learned, depth: u32) {
+    #[allow(clippy::too_many_arguments)]
+    fn learn(
+        &self,
+        repl: &[Option<V>],
+        v: V,
+        holds: bool,
+        facts: &mut Facts,
+        learned: &mut Learned,
+        depth: u32,
+        ext_fold: bool,
+    ) {
+        let v = if ext_fold { resolve(repl, v) } else { v };
         let V::Inst(i) = v else { return };
         if facts.bits.contains_key(&v) {
             return;
@@ -367,27 +415,50 @@ impl Module {
             // Both terms of an `and` that holds hold; neither of an `or`
             // that does not.
             Op::Bin(Bin::And, a, b) if holds => {
-                self.learn(a, true, facts, learned, depth - 1);
-                self.learn(b, true, facts, learned, depth - 1);
+                self.learn(repl, a, true, facts, learned, depth - 1, ext_fold);
+                self.learn(repl, b, true, facts, learned, depth - 1, ext_fold);
             }
             Op::Bin(Bin::Or, a, b) if !holds => {
-                self.learn(a, false, facts, learned, depth - 1);
-                self.learn(b, false, facts, learned, depth - 1);
+                self.learn(repl, a, false, facts, learned, depth - 1, ext_fold);
+                self.learn(repl, b, false, facts, learned, depth - 1, ext_fold);
             }
             Op::Bin(Bin::Xor, a, b) => {
+                let (a, b) = if ext_fold {
+                    (resolve(repl, a), resolve(repl, b))
+                } else {
+                    (a, b)
+                };
                 let (x, k) = match (self.int_k(a), self.int_k(b)) {
                     (None, Some((1, k))) => (a, k),
                     (Some((1, k)), None) => (b, k),
                     _ => return,
                 };
-                self.learn(x, holds != (k != 0), facts, learned, depth - 1);
+                self.learn(repl, x, holds != (k != 0), facts, learned, depth - 1, ext_fold);
             }
-            // The opposite comparison of the same operands.
+            // The opposite comparison of the same operands (and, under
+            // `EXT_FOLD`, canonicalised so flipped operands hit the same entry).
             Op::Cmp(p, a, b) => {
-                let key = (opposite(p), a, b);
-                if let std::collections::hash_map::Entry::Vacant(e) = facts.compares.entry(key) {
-                    e.insert(!holds);
-                    learned.compares.push(key);
+                if ext_fold {
+                    let (a, b) = (resolve(repl, a), resolve(repl, b));
+                    for (key, val) in [
+                        (canonical_cmp(p, a, b), holds),
+                        (canonical_cmp(opposite(p), a, b), !holds),
+                    ] {
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            facts.compares.entry(key)
+                        {
+                            e.insert(val);
+                            learned.compares.push(key);
+                        }
+                    }
+                } else {
+                    let key = (opposite(p), a, b);
+                    if let std::collections::hash_map::Entry::Vacant(e) =
+                        facts.compares.entry(key)
+                    {
+                        e.insert(!holds);
+                        learned.compares.push(key);
+                    }
                 }
             }
             _ => {}
@@ -493,10 +564,113 @@ impl Module {
         self.int_const(ty, signed(bits, x & mask(bits)))
     }
 
+    /// If `v` is `xor(x, true)` or `xor(true, x)` on `i1`, returns `Some(x)`.
+    fn is_bool_not(&self, v: V) -> Option<V> {
+        let V::Inst(j) = v else { return None };
+        let inst = &self.insts[j as usize];
+        if self.int_bits(inst.ty) != Some(1) {
+            return None;
+        }
+        let Op::Bin(Bin::Xor, a, b) = inst.op else {
+            return None;
+        };
+        match (self.int_k(a), self.int_k(b)) {
+            (None, Some((1, 1))) => Some(a),
+            (Some((1, 1)), None) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Simplifies `xor(x, true)` for an `i1` instruction `i`: returns a direct
+    /// replacement value when possible, or rewrites `self.insts[i].op` in place
+    /// to an inverted comparison or `xor(x, true)`.
+    fn negate_bool_in_place(&mut self, i: u32, x: V, changed: &mut bool) -> Option<V> {
+        if let Some((1, k)) = self.int_k(x) {
+            return Some(self.bool(k == 0));
+        }
+        if let Some(orig) = self.is_bool_not(x) {
+            return Some(orig);
+        }
+        if let V::Inst(j) = x
+            && let Op::Cmp(p, a, b) = self.insts[j as usize].op
+            && (p <= pred::TRUE || (pred::EQ..=pred::SLE).contains(&p))
+        {
+            let opp = opposite(p);
+            if opp == pred::FALSE {
+                return Some(self.bool(false));
+            }
+            if opp == pred::TRUE {
+                return Some(self.bool(true));
+            }
+            // Never emit `fcmp one` (`pred::ONE`): the AMD D3D12 driver
+            // treats it as `une`.
+            if opp != pred::ONE {
+                self.insts[i as usize].op = Op::Cmp(opp, a, b);
+                *changed = true;
+                return None;
+            }
+        }
+        let yes = self.bool(true);
+        let already = matches!(
+            self.insts[i as usize].op,
+            Op::Bin(Bin::Xor, a, b) if (a == x && b == yes) || (a == yes && b == x)
+        );
+        if !already {
+            self.insts[i as usize].op = Op::Bin(Bin::Xor, x, yes);
+            *changed = true;
+        }
+        None
+    }
+
+    /// If `v` is an integer instruction of form `(x op c)` (with either operand
+    /// order for commutative `op`), returns `Some((x, c))`.
+    fn bin_with_const(&self, v: V, want: Bin) -> Option<(V, u64)> {
+        let V::Inst(j) = v else { return None };
+        let Op::Bin(op, a, b) = self.insts[j as usize].op else {
+            return None;
+        };
+        if op != want {
+            return None;
+        }
+        match (self.int_k(a), self.int_k(b)) {
+            (None, Some((_, k))) => Some((a, k)),
+            (Some((_, k)), None)
+                if matches!(op, Bin::Add | Bin::Mul | Bin::And | Bin::Or | Bin::Xor) =>
+            {
+                Some((b, k))
+            }
+            _ => None,
+        }
+    }
+
+    /// If `v` is a two-valued integer driven by an `i1` condition `c`, returns
+    /// `(c, value_when_true, value_when_false)` masked to `bits`.
+    fn two_valued_int(&self, v: V, bits: u32) -> Option<(V, u64, u64)> {
+        if bits == 1 && self.int_k(v).is_none() {
+            return Some((v, 1, 0));
+        }
+        let V::Inst(j) = v else { return None };
+        match self.insts[j as usize].op {
+            Op::Select(c, t, f) => {
+                let (_, k1) = self.int_k(t)?;
+                let (_, k2) = self.int_k(f)?;
+                Some((c, k1, k2))
+            }
+            Op::Cast(Cast::ZExt, b) if self.int_bits(self.type_of(b)) == Some(1) => {
+                Some((b, 1, 0))
+            }
+            Op::Cast(Cast::SExt, b) if self.int_bits(self.type_of(b)) == Some(1) => {
+                Some((b, mask(bits), 0))
+            }
+            _ => None,
+        }
+    }
+
     /// The value instruction `i` is known to have without it, if any: a
     /// constant or an earlier value. May instead give `i` simpler operands
-    /// (`changed` says so).
-    fn simplify(&mut self, i: u32, changed: &mut bool) -> Option<V> {
+    /// (`changed` says so). When `ext_fold` is false, runs only the base
+    /// [`FOLD`] rules so [`DEFAULT`] stays bit-identical.
+    fn simplify(&mut self, i: u32, ext_fold: bool, changed: &mut bool) -> Option<V> {
         let ty = self.insts[i as usize].ty;
         match self.insts[i as usize].op {
             Op::Bin(op, a, b) => {
@@ -507,7 +681,7 @@ impl Module {
                 let all = mask(bits);
                 if let (Some(x), Some(y)) = (ka, kb) {
                     // A shift by the width or more and a division by zero
-                    // have no defined result: left as they are.
+                    // (or signed MIN / -1) have no defined result: left as they are.
                     let amount = u32::try_from(y).ok().filter(|&y| y < bits);
                     let r = match op {
                         Bin::Add => x.wrapping_add(y),
@@ -520,6 +694,13 @@ impl Module {
                         Bin::LShr => x >> amount?,
                         Bin::AShr => (signed(bits, x) >> amount?) as u64,
                         Bin::UDiv if y != 0 => x / y,
+                        Bin::SDiv
+                            if ext_fold
+                                && y != 0
+                                && !(signed(bits, y) == -1 && x == (1u64 << (bits - 1))) =>
+                        {
+                            (signed(bits, x) / signed(bits, y)) as u64
+                        }
                         Bin::URem if y != 0 => x % y,
                         _ => return None,
                     };
@@ -530,21 +711,287 @@ impl Module {
                         Bin::Add | Bin::Sub | Bin::Or | Bin::Xor | Bin::Shl | Bin::LShr | Bin::AShr,
                         _,
                         Some(0),
-                    ) => Some(a),
-                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => Some(b),
-                    (Bin::Mul | Bin::UDiv, _, Some(1)) => Some(a),
-                    (Bin::Mul, Some(1), _) => Some(b),
-                    (Bin::Mul | Bin::And, _, Some(0)) => Some(b),
-                    (Bin::Mul | Bin::And, Some(0), _) => Some(a),
-                    (Bin::And, _, Some(m)) if m == all => Some(a),
-                    (Bin::And, Some(m), _) if m == all => Some(b),
-                    (Bin::Or, _, Some(m)) if m == all => Some(b),
-                    (Bin::Or, Some(m), _) if m == all => Some(a),
-                    (Bin::And | Bin::Or, _, _) if a == b => Some(a),
+                    ) => return Some(a),
+                    (Bin::Add | Bin::Or | Bin::Xor, Some(0), _) => return Some(b),
+                    (Bin::Mul | Bin::UDiv, _, Some(1)) => return Some(a),
+                    (Bin::SDiv, _, Some(1)) if ext_fold && bits > 1 => return Some(a),
+                    (Bin::Mul, Some(1), _) => return Some(b),
+                    (Bin::Mul | Bin::And, _, Some(0)) => return Some(b),
+                    (Bin::Mul | Bin::And, Some(0), _) => return Some(a),
+                    (Bin::URem, _, Some(1)) if ext_fold => return Some(self.k(ty, bits, 0)),
+                    (Bin::And, _, Some(m)) if m == all => return Some(a),
+                    (Bin::And, Some(m), _) if m == all => return Some(b),
+                    (Bin::Or, _, Some(m)) if m == all => return Some(b),
+                    (Bin::Or, Some(m), _) if m == all => return Some(a),
+                    (Bin::And | Bin::Or, _, _) if a == b => return Some(a),
+                    (Bin::Sub | Bin::Xor, _, _) if ext_fold && a == b => {
+                        return Some(self.k(ty, bits, 0));
+                    }
+                    _ => {}
+                }
+                if !ext_fold {
+                    return None;
+                }
+                // Extended algebraic, bitwise, shift-mask, and power-of-two strength reduction.
+                match op {
+                    Bin::Xor => {
+                        if bits == 1 {
+                            match (ka, kb) {
+                                (None, Some(1)) => return self.negate_bool_in_place(i, a, changed),
+                                (Some(1), None) => return self.negate_bool_in_place(i, b, changed),
+                                _ => {}
+                            }
+                        }
+                        let const_pair = match (ka, kb) {
+                            (None, Some(c2)) => Some((a, c2)),
+                            (Some(c2), None) => Some((b, c2)),
+                            _ => None,
+                        };
+                        if let Some((other, c2)) = const_pair
+                            && let Some((x, c1)) = self.bin_with_const(other, Bin::Xor)
+                        {
+                            let c = (c1 ^ c2) & all;
+                            if c == 0 {
+                                return Some(x);
+                            }
+                            let ck = self.k(ty, bits, c);
+                            self.insts[i as usize].op = Op::Bin(Bin::Xor, x, ck);
+                            *changed = true;
+                            return None;
+                        }
+                        // `(x ^ y) ^ y => x` and symmetric forms.
+                        if let V::Inst(j) = a
+                            && let Op::Bin(Bin::Xor, x, y) = self.insts[j as usize].op
+                        {
+                            if y == b {
+                                return Some(x);
+                            }
+                            if x == b {
+                                return Some(y);
+                            }
+                        }
+                        if let V::Inst(j) = b
+                            && let Op::Bin(Bin::Xor, x, y) = self.insts[j as usize].op
+                        {
+                            if y == a {
+                                return Some(x);
+                            }
+                            if x == a {
+                                return Some(y);
+                            }
+                        }
+                        None
+                    }
+                    Bin::Add => {
+                        let const_pair = match (ka, kb) {
+                            (None, Some(c2)) => Some((a, c2)),
+                            (Some(c2), None) => Some((b, c2)),
+                            _ => None,
+                        };
+                        if let Some((other, c2)) = const_pair {
+                            if let Some((x, c1)) = self.bin_with_const(other, Bin::Add) {
+                                let c = c1.wrapping_add(c2) & all;
+                                if c == 0 {
+                                    return Some(x);
+                                }
+                                let ck = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(Bin::Add, x, ck);
+                                *changed = true;
+                                return None;
+                            }
+                            if let Some((x, c1)) = self.bin_with_const(other, Bin::Sub) {
+                                let d = c2.wrapping_sub(c1) & all;
+                                if d == 0 {
+                                    return Some(x);
+                                }
+                                let dk = self.k(ty, bits, d);
+                                self.insts[i as usize].op = Op::Bin(Bin::Add, x, dk);
+                                *changed = true;
+                                return None;
+                            }
+                        }
+                        // `(x - y) + y => x` and `y + (x - y) => x`.
+                        if let V::Inst(j) = a
+                            && let Op::Bin(Bin::Sub, x, y) = self.insts[j as usize].op
+                            && y == b
+                        {
+                            return Some(x);
+                        }
+                        if let V::Inst(j) = b
+                            && let Op::Bin(Bin::Sub, x, y) = self.insts[j as usize].op
+                            && y == a
+                        {
+                            return Some(x);
+                        }
+                        None
+                    }
+                    Bin::Sub => {
+                        if let Some(c2) = kb {
+                            if let Some((x, c1)) = self.bin_with_const(a, Bin::Sub) {
+                                let c = c1.wrapping_add(c2) & all;
+                                if c == 0 {
+                                    return Some(x);
+                                }
+                                let ck = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(Bin::Sub, x, ck);
+                                *changed = true;
+                                return None;
+                            }
+                            if let Some((x, c1)) = self.bin_with_const(a, Bin::Add) {
+                                let d = c1.wrapping_sub(c2) & all;
+                                if d == 0 {
+                                    return Some(x);
+                                }
+                                let dk = self.k(ty, bits, d);
+                                self.insts[i as usize].op = Op::Bin(Bin::Add, x, dk);
+                                *changed = true;
+                                return None;
+                            }
+                        }
+                        // `(x + y) - y => x` and `(y + x) - y => x`.
+                        if let V::Inst(j) = a
+                            && let Op::Bin(Bin::Add, x, y) = self.insts[j as usize].op
+                        {
+                            if y == b {
+                                return Some(x);
+                            }
+                            if x == b {
+                                return Some(y);
+                            }
+                        }
+                        None
+                    }
+                    Bin::And => {
+                        let const_pair = match (ka, kb) {
+                            (None, Some(c2)) => Some((a, c2)),
+                            (Some(c2), None) => Some((b, c2)),
+                            _ => None,
+                        };
+                        if let Some((other, c2)) = const_pair {
+                            if let Some((x, c1)) = self.bin_with_const(other, Bin::And) {
+                                let c = c1 & c2;
+                                if c == 0 {
+                                    return Some(self.k(ty, bits, 0));
+                                }
+                                if c == c1 {
+                                    return Some(other);
+                                }
+                                let ck = self.k(ty, bits, c);
+                                self.insts[i as usize].op = Op::Bin(Bin::And, x, ck);
+                                *changed = true;
+                                return None;
+                            }
+                            // `and(zext i1 b, c)` is `zext i1 b` when bit 0 is set, else 0.
+                            if let V::Inst(z) = other
+                                && let Op::Cast(Cast::ZExt, src) = self.insts[z as usize].op
+                                && self.int_bits(self.type_of(src)) == Some(1)
+                            {
+                                return Some(if c2 & 1 != 0 {
+                                    other
+                                } else {
+                                    self.k(ty, bits, 0)
+                                });
+                            }
+                        }
+                        None
+                    }
+                    Bin::Or => {
+                        let const_pair = match (ka, kb) {
+                            (None, Some(c2)) => Some((a, c2)),
+                            (Some(c2), None) => Some((b, c2)),
+                            _ => None,
+                        };
+                        if let Some((other, c2)) = const_pair
+                            && let Some((x, c1)) = self.bin_with_const(other, Bin::Or)
+                        {
+                            let c = (c1 | c2) & all;
+                            if c == all {
+                                return Some(self.k(ty, bits, all));
+                            }
+                            if c == c1 {
+                                return Some(other);
+                            }
+                            let ck = self.k(ty, bits, c);
+                            self.insts[i as usize].op = Op::Bin(Bin::Or, x, ck);
+                            *changed = true;
+                            return None;
+                        }
+                        None
+                    }
+                    Bin::Shl | Bin::LShr | Bin::AShr => {
+                        if let Some(c2) = kb
+                            && c2 < u64::from(bits)
+                            && let Some((x, c1)) = self.bin_with_const(a, op)
+                            && c1 < u64::from(bits)
+                            && let Some(sum) = c1.checked_add(c2)
+                        {
+                            if sum < u64::from(bits) {
+                                let sk = self.k(ty, bits, sum);
+                                self.insts[i as usize].op = Op::Bin(op, x, sk);
+                                *changed = true;
+                                return None;
+                            }
+                            if matches!(op, Bin::Shl | Bin::LShr) {
+                                return Some(self.k(ty, bits, 0));
+                            }
+                            let max_s = u64::from(bits - 1);
+                            if c1 == max_s {
+                                return Some(a);
+                            }
+                            let sk = self.k(ty, bits, max_s);
+                            self.insts[i as usize].op = Op::Bin(Bin::AShr, x, sk);
+                            *changed = true;
+                            return None;
+                        }
+                        None
+                    }
+                    Bin::Mul => {
+                        let pow2 = match (ka, kb) {
+                            (None, Some(c)) if c > 1 && c.is_power_of_two() => Some((a, c)),
+                            (Some(c), None) if c > 1 && c.is_power_of_two() => Some((b, c)),
+                            _ => None,
+                        };
+                        if let Some((x, c)) = pow2 {
+                            let sh = self.k(ty, bits, u64::from(c.trailing_zeros()));
+                            self.insts[i as usize].op = Op::Bin(Bin::Shl, x, sh);
+                            *changed = true;
+                        }
+                        None
+                    }
+                    Bin::UDiv => {
+                        if let Some(c) = kb
+                            && c > 1
+                            && c.is_power_of_two()
+                        {
+                            let sh = self.k(ty, bits, u64::from(c.trailing_zeros()));
+                            self.insts[i as usize].op = Op::Bin(Bin::LShr, a, sh);
+                            *changed = true;
+                        }
+                        None
+                    }
+                    Bin::URem => {
+                        if let Some(c) = kb
+                            && c > 1
+                            && c.is_power_of_two()
+                        {
+                            let m = self.k(ty, bits, c - 1);
+                            self.insts[i as usize].op = Op::Bin(Bin::And, a, m);
+                            *changed = true;
+                        }
+                        None
+                    }
                     _ => None,
                 }
             }
             Op::Cmp(p, a, b) if p <= pred::TRUE => {
+                if ext_fold {
+                    if p == pred::FALSE {
+                        return Some(self.bool(false));
+                    }
+                    if p == pred::TRUE {
+                        return Some(self.bool(true));
+                    }
+                }
                 // Two float constants compare one way (`v_mul_legacy` asks
                 // whether its constant factor is zero).
                 let (V::Const(x), V::Const(y)) = (a, b) else {
@@ -591,24 +1038,56 @@ impl Module {
                 if a == b {
                     return Some(self.bool(holds(0, 0, 32)));
                 }
-                // A bit widened and tested again is the bit.
-                if p == pred::NE
-                    && self.int_k(b).is_some_and(|k| k.1 == 0)
-                    && let V::Inst(z) = a
-                    && let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op
-                    && self.type_of(x) == ty
+                if !ext_fold {
+                    // A bit widened and tested again is the bit.
+                    if p == pred::NE
+                        && self.int_k(b).is_some_and(|k| k.1 == 0)
+                        && let V::Inst(z) = a
+                        && let Op::Cast(Cast::ZExt, x) = self.insts[z as usize].op
+                        && self.type_of(x) == ty
+                    {
+                        return Some(x);
+                    }
+                    return None;
+                }
+                // Comparing `select(c, k1, k2)`, `zext i1 c`, `sext i1 c`, or
+                // `i1` against an integer constant reduces directly to a
+                // constant, `c`, or `!c`.
+                let reduced = if let Some((bits, k)) = self.int_k(b)
+                    && let Some((c, k1, k2)) = self.two_valued_int(a, bits)
                 {
-                    return Some(x);
+                    Some((c, holds(k1, k, bits), holds(k2, k, bits)))
+                } else if let Some((bits, k)) = self.int_k(a)
+                    && let Some((c, k1, k2)) = self.two_valued_int(b, bits)
+                {
+                    Some((c, holds(k, k1, bits), holds(k, k2, bits)))
+                } else {
+                    None
+                };
+                if let Some((c, wt, wf)) = reduced {
+                    return match (wt, wf) {
+                        (true, true) => Some(self.bool(true)),
+                        (false, false) => Some(self.bool(false)),
+                        (true, false) => Some(c),
+                        (false, true) => self.negate_bool_in_place(i, c, changed),
+                    };
                 }
                 None
             }
-            Op::Select(c, mut t, mut f) => {
+            Op::Select(mut c, mut t, mut f) => {
+                let mut inner = false;
+                if ext_fold {
+                    while let Some(not_c) = self.is_bool_not(c) {
+                        c = not_c;
+                        std::mem::swap(&mut t, &mut f);
+                        inner = true;
+                    }
+                }
                 if let Some((_, c)) = self.int_k(c) {
                     return Some(if c != 0 { t } else { f });
                 }
                 // Under the same condition an inner select is one of its
                 // operands (two guarded writes of one register in a row).
-                let mut inner = false;
                 while let V::Inst(x) = t
                     && let Op::Select(c2, t2, _) = self.insts[x as usize].op
                     && c2 == c
@@ -624,11 +1103,47 @@ impl Module {
                 if t == f {
                     return Some(t);
                 }
-                if self.int_bits(ty) == Some(1)
-                    && self.int_k(t).is_some_and(|k| k.1 == 1)
-                    && self.int_k(f).is_some_and(|k| k.1 == 0)
-                {
-                    return Some(c);
+                if self.int_bits(ty) == Some(1) {
+                    if !ext_fold {
+                        if self.int_k(t).is_some_and(|k| k.1 == 1)
+                            && self.int_k(f).is_some_and(|k| k.1 == 0)
+                        {
+                            return Some(c);
+                        }
+                    } else {
+                        let (kt, kf) = (self.int_k(t).map(|k| k.1), self.int_k(f).map(|k| k.1));
+                        match (kt, kf) {
+                            (Some(1), Some(0)) => return Some(c),
+                            (Some(0), Some(1)) => return self.negate_bool_in_place(i, c, changed),
+                            (Some(1), _) => {
+                                if f == c {
+                                    return Some(c);
+                                }
+                                self.insts[i as usize].op = Op::Bin(Bin::Or, c, f);
+                                *changed = true;
+                                return None;
+                            }
+                            (_, Some(0)) => {
+                                if t == c {
+                                    return Some(c);
+                                }
+                                self.insts[i as usize].op = Op::Bin(Bin::And, c, t);
+                                *changed = true;
+                                return None;
+                            }
+                            _ => {}
+                        }
+                        if t == c {
+                            self.insts[i as usize].op = Op::Bin(Bin::Or, c, f);
+                            *changed = true;
+                            return None;
+                        }
+                        if f == c {
+                            self.insts[i as usize].op = Op::Bin(Bin::And, c, t);
+                            *changed = true;
+                            return None;
+                        }
+                    }
                 }
                 if inner {
                     self.insts[i as usize].op = Op::Select(c, t, f);
@@ -723,7 +1238,7 @@ impl Module {
         }
     }
 
-    fn key(&self, i: u32) -> Option<Key> {
+    fn key(&self, i: u32, ext_fold: bool) -> Option<Key> {
         let inst = &self.insts[i as usize];
         Some(match &inst.op {
             Op::Bin(op, a, b) => {
@@ -740,7 +1255,14 @@ impl Module {
                 Key::Bin(*op as u8, a, b)
             }
             Op::Cast(op, v) => Key::Cast(*op as u8, inst.ty, *v),
-            Op::Cmp(p, a, b) => Key::Cmp(*p, *a, *b),
+            Op::Cmp(p, a, b) => {
+                if ext_fold {
+                    let (cp, ca, cb) = canonical_cmp(*p, *a, *b);
+                    Key::Cmp(cp, ca, cb)
+                } else {
+                    Key::Cmp(*p, *a, *b)
+                }
+            }
             Op::Select(c, t, f) => Key::Select(*c, *t, *f),
             Op::Extract(a, n) => Key::Extract(*a, *n),
             Op::Call(f, args) => Key::Call(*f, args.clone()),
@@ -750,19 +1272,20 @@ impl Module {
         })
     }
 
-    /// [`FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
+    /// [`FOLD`], [`EXT_FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
     /// dominator tree. Returns whether anything changed.
     fn merge(&mut self, passes: u32) -> bool {
         if self.blocks.is_empty() {
             return false;
         }
+        let ext_fold = passes & EXT_FOLD != 0;
         let effects = self.effects();
         let tree = self.dominator_tree();
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
         // Joins of one value: until none is left (one gone can leave
         // another with one value).
-        if passes & FOLD != 0 {
+        if passes & (FOLD | EXT_FOLD) != 0 {
             let mut again = true;
             while again {
                 again = false;
@@ -833,7 +1356,15 @@ impl Module {
                 && let Some(Term::CondBr(c, t, f)) = self.blocks[p].term
                 && t != f
             {
-                self.learn(resolve(&repl, c), b == t, &mut facts, &mut learned, 8);
+                self.learn(
+                    &repl,
+                    resolve(&repl, c),
+                    b == t,
+                    &mut facts,
+                    &mut learned,
+                    8,
+                    ext_fold,
+                );
             }
             let known_bit = |facts: &Facts, v: V| match facts.bits.get(&v) {
                 Some(true) => yes,
@@ -880,24 +1411,38 @@ impl Module {
                     changed |= bit != v;
                     bit
                 });
-                if let Op::Cmp(p, x, y) = self.insts[i as usize].op
-                    && let Some(&holds) = facts.compares.get(&(p, x, y))
+                if let Op::Cmp(p, x, y) = self.insts[i as usize].op {
+                    let lookup = if ext_fold {
+                        canonical_cmp(p, x, y)
+                    } else {
+                        (p, x, y)
+                    };
+                    if let Some(&holds) = facts.compares.get(&lookup) {
+                        repl[i as usize] = Some(if holds { yes } else { no });
+                        changed = true;
+                        continue;
+                    }
+                }
+                if passes & (FOLD | EXT_FOLD) != 0
+                    && let Some(v) = self.simplify(i, ext_fold, &mut changed)
                 {
-                    repl[i as usize] = Some(if holds { yes } else { no });
+                    repl[i as usize] = Some(v);
                     changed = true;
                     continue;
                 }
-                if passes & FOLD != 0
-                    && let Some(v) = self.simplify(i, &mut changed)
+                if ext_fold
+                    && passes & FACTS != 0
+                    && let Op::Cmp(p, x, y) = self.insts[i as usize].op
+                    && let Some(&holds) = facts.compares.get(&canonical_cmp(p, x, y))
                 {
-                    repl[i as usize] = Some(v);
+                    repl[i as usize] = Some(if holds { yes } else { no });
                     changed = true;
                     continue;
                 }
                 let class = self.class(&effects, i);
                 if passes & REUSE != 0
                     && class == Effect::Pure
-                    && let Some(key) = self.key(i)
+                    && let Some(key) = self.key(i, ext_fold)
                 {
                     if let Some(&first) = known.get(&key) {
                         repl[i as usize] = Some(first);
@@ -911,7 +1456,7 @@ impl Module {
                 // the whole block): the block's own earlier one.
                 if passes & LOADS != 0
                     && matches!(class, Effect::Reads | Effect::Lanes)
-                    && let Some(key) = self.key(i)
+                    && let Some(key) = self.key(i, ext_fold)
                 {
                     if let Some(&first) = read.get(&key) {
                         repl[i as usize] = Some(first);
@@ -2203,11 +2748,13 @@ mod tests {
             for passes in [
                 DEAD,
                 FOLD,
+                EXT_FOLD,
                 REUSE,
                 FACTS,
                 LOADS,
                 FOLD | FACTS,
-                FOLD | REUSE | DEAD,
+                FOLD | EXT_FOLD | FACTS,
+                FOLD | EXT_FOLD | REUSE | DEAD,
                 ALL,
             ] {
                 let mut m = random_program(seed);
@@ -2224,5 +2771,372 @@ mod tests {
         }
         // The programs are of the wasteful kind: the passes find work.
         assert!(removed > 4000, "{removed} instructions removed");
+    }
+
+    #[test]
+    fn extended_fold_algebraic_bitwise_shifts_and_strength_reduction() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (k0, k1, k2, k3, k4, k5, k6, k8, k16, k20, k32) = (
+            m.i32(0),
+            m.i32(1),
+            m.i32(2),
+            m.i32(3),
+            m.i32(4),
+            m.i32(5),
+            m.i32(6),
+            m.i32(8),
+            m.i32(16),
+            m.i32(20),
+            m.i32(32),
+        );
+        let x = m.call(b, reads, vec![k1, k1]);
+        let y = m.call(b, reads, vec![k2, k2]);
+
+        // x - x => 0, x ^ x => 0, (x ^ c) ^ c => x
+        let sub_self = m.bin(b, Bin::Sub, x, x);
+        let xor_self = m.bin(b, Bin::Xor, x, x);
+        let xc = m.bin(b, Bin::Xor, x, k5);
+        let xcc = m.bin(b, Bin::Xor, xc, k5);
+        // (x + c1) + c2 => x + (c1 + c2), (x + c) - c => x, (x - c1) - c2 => x - (c1 + c2)
+        let add1 = m.bin(b, Bin::Add, x, k3);
+        let add2 = m.bin(b, Bin::Add, add1, k4);
+        let add_cancel = m.bin(b, Bin::Sub, add1, k3);
+        let sub1 = m.bin(b, Bin::Sub, x, k3);
+        let sub2 = m.bin(b, Bin::Sub, sub1, k4);
+        let wrap_hi = m.i32(u32::MAX);
+        let wrap1 = m.bin(b, Bin::Add, x, wrap_hi);
+        let wrap_zero = m.bin(b, Bin::Add, wrap1, k1);
+        // (x & c1) & c2 => x & (c1 & c2), (x | c1) | c2 => x | (c1 | c2)
+        let m0f = m.i32(0x0F);
+        let m3c = m.i32(0x3C);
+        let and1 = m.bin(b, Bin::And, x, m0f);
+        let and2 = m.bin(b, Bin::And, and1, m3c);
+        let or1 = m.bin(b, Bin::Or, x, m0f);
+        let or2 = m.bin(b, Bin::Or, or1, m3c);
+        // Shifts: (x << 3) << 4 => x << 7, (x >>u 5) >>u 6 => x >>u 11, (x << 20) << 20 => 0
+        let shl1 = m.bin(b, Bin::Shl, x, k3);
+        let shl2 = m.bin(b, Bin::Shl, shl1, k4);
+        let lshr1 = m.bin(b, Bin::LShr, x, k5);
+        let lshr2 = m.bin(b, Bin::LShr, lshr1, k6);
+        let shl_ov1 = m.bin(b, Bin::Shl, x, k20);
+        let shl_ov2 = m.bin(b, Bin::Shl, shl_ov1, k20);
+        // Negative control: shift by >= 32 must NOT fold.
+        let bad_sh = m.bin(b, Bin::Shl, x, k32);
+        let bad_sh2 = m.bin(b, Bin::Shl, bad_sh, k1);
+        // Strength reduction: x * 8 => x << 3, x /u 8 => x >>u 3, x %u 16 => x & 15, x %u 1 => 0
+        let mul_p2 = m.bin(b, Bin::Mul, x, k8);
+        let udiv_p2 = m.bin(b, Bin::UDiv, x, k8);
+        let urem_p2 = m.bin(b, Bin::URem, x, k16);
+        let urem_1 = m.bin(b, Bin::URem, x, k1);
+        // Negative controls: x * 6, x /s 8, x /u 0, x %u 0 must stay as written.
+        let mul_6 = m.bin(b, Bin::Mul, y, k6);
+        let sdiv_8 = m.bin(b, Bin::SDiv, y, k8);
+        let udiv_0 = m.bin(b, Bin::UDiv, y, k0);
+        let urem_0 = m.bin(b, Bin::URem, y, k0);
+
+        for (p, q) in [
+            (sub_self, xor_self),
+            (xcc, add_cancel),
+            (add2, sub2),
+            (wrap_zero, and2),
+            (or2, shl2),
+            (lshr2, shl_ov2),
+            (bad_sh2, mul_p2),
+            (udiv_p2, urem_p2),
+            (urem_1, mul_6),
+            (sdiv_8, udiv_0),
+            (urem_0, k0),
+        ] {
+            m.call(b, writes, vec![p, q]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | EXT_FOLD | DEAD);
+
+        let st = stores(&m, b);
+        assert_eq!(st[0], [k0, k0], "x - x and x ^ x fold to 0");
+        assert_eq!(st[1], [x, x], "(x ^ c) ^ c and (x + c) - c fold to x");
+        assert_eq!(st[3][0], x, "(x + 0xFFFF_FFFF) + 1 wraps to x");
+        assert_eq!(st[5][1], k0, "(x << 20) << 20 folds to 0");
+        assert_eq!(st[8][0], k0, "x %u 1 folds to 0");
+
+        let k7 = m.i32(7);
+        let k11 = m.i32(11);
+        let k15 = m.i32(15);
+        let k0c = m.i32(0x0C);
+        let k3f = m.i32(0x3F);
+        let inst_op = |v: V| match v {
+            V::Inst(id) => m.insts[id as usize].op.clone(),
+            other => panic!("expected inst, got {other:?}"),
+        };
+        assert!(matches!(inst_op(st[2][0]), Op::Bin(Bin::Add, a, c) if a == x && c == k7));
+        assert!(matches!(inst_op(st[2][1]), Op::Bin(Bin::Sub, a, c) if a == x && c == k7));
+        assert!(matches!(inst_op(st[3][1]), Op::Bin(Bin::And, a, c) if a == x && c == k0c));
+        assert!(matches!(inst_op(st[4][0]), Op::Bin(Bin::Or, a, c) if a == x && c == k3f));
+        assert!(matches!(inst_op(st[4][1]), Op::Bin(Bin::Shl, a, c) if a == x && c == k7));
+        assert!(matches!(inst_op(st[5][0]), Op::Bin(Bin::LShr, a, c) if a == x && c == k11));
+        assert!(matches!(inst_op(st[6][0]), Op::Bin(Bin::Shl, a, c) if a == bad_sh && c == k1));
+        assert!(matches!(inst_op(st[6][1]), Op::Bin(Bin::Shl, a, c) if a == x && c == k3));
+        assert!(matches!(inst_op(st[7][0]), Op::Bin(Bin::LShr, a, c) if a == x && c == k3));
+        assert!(matches!(inst_op(st[7][1]), Op::Bin(Bin::And, a, c) if a == x && c == k15));
+        assert!(matches!(inst_op(st[8][1]), Op::Bin(Bin::Mul, a, c) if a == y && c == k6));
+        assert!(matches!(inst_op(st[9][0]), Op::Bin(Bin::SDiv, a, c) if a == y && c == k8));
+        assert!(matches!(inst_op(st[9][1]), Op::Bin(Bin::UDiv, a, c) if a == y && c == k0));
+        assert!(matches!(inst_op(st[10][0]), Op::Bin(Bin::URem, a, c) if a == y && c == k0));
+        m.write();
+    }
+
+    #[test]
+    fn compare_select_zext_fold_and_nan_safety() {
+        let Kit {
+            mut m,
+            b,
+            reads,
+            writes,
+            ..
+        } = kit();
+        let (i32t, f32t) = (m.int(32), m.float());
+        let (k0, k1, k2, k10, k20, k30) = (
+            m.i32(0),
+            m.i32(1),
+            m.i32(2),
+            m.i32(10),
+            m.i32(20),
+            m.i32(30),
+        );
+        let (t, f) = (m.bool(true), m.bool(false));
+        let x = m.call(b, reads, vec![k1, k1]);
+        let y = m.call(b, reads, vec![k2, k2]);
+        let xf = m.cast(b, Cast::Bitcast, x, f32t);
+        let yf = m.cast(b, Cast::Bitcast, y, f32t);
+
+        // xor(icmp(IULT, x, y), true) => icmp(IUGE, x, y)
+        let ic = m.cmp(b, pred::IULT, x, y);
+        let nic = m.bin(b, Bin::Xor, ic, t);
+        // Canonical REUSE: `icmp(IULE, y, x)` equals `icmp(IUGE, x, y)`.
+        let mir_ic = m.cmp(b, pred::IULE, y, x);
+        // xor(fcmp(OLT, xf, yf), true) => fcmp(UGE, xf, yf)
+        let fc = m.cmp(b, pred::OLT, xf, yf);
+        let nfc = m.bin(b, Bin::Xor, fc, t);
+        // Canonical float REUSE: `fcmp(ULE, yf, xf)` equals `fcmp(UGE, xf, yf)`.
+        let mir_fc = m.cmp(b, pred::ULE, yf, xf);
+        // Negative control (AMD driver): xor(fcmp(UEQ, xf, yf), true) MUST NOT become fcmp(ONE).
+        let ueq = m.cmp(b, pred::UEQ, xf, yf);
+        let nueq = m.bin(b, Bin::Xor, ueq, t);
+        // Negative control (NaN): fcmp(OEQ, xf, xf) MUST NOT fold to true.
+        let nan_eq = m.cmp(b, pred::OEQ, xf, xf);
+        let nan_une = m.cmp(b, pred::UNE, xf, xf);
+
+        // select(xor(opaque_bool, true), x, y) => select(opaque_bool, y, x)
+        let i1t = m.int(1);
+        let opaque_b = m.cast(b, Cast::Trunc, x, i1t);
+        let not_opaque = m.bin(b, Bin::Xor, opaque_b, t);
+        let sel_flip = m.select(b, not_opaque, x, y);
+        // Boolean selects on well-defined values:
+        let c2 = m.cmp(b, pred::EQ, x, k10);
+        let b2 = m.cmp(b, pred::EQ, y, k20);
+        let sel_or = m.select(b, c2, t, b2);
+        let sel_and = m.select(b, c2, b2, f);
+        let sel_not = m.select(b, c2, f, t);
+        // icmp (select(c, k10, k20), k)
+        let sel_k = m.select(b, c2, k10, k20);
+        let eq_10 = m.cmp(b, pred::EQ, sel_k, k10);
+        let eq_20 = m.cmp(b, pred::EQ, sel_k, k20);
+        let eq_30 = m.cmp(b, pred::EQ, sel_k, k30);
+        // icmp (zext i1 c2, 0/1) & and(zext i1 c2, 1/2)
+        let z = m.cast(b, Cast::ZExt, c2, i32t);
+        let z_eq0 = m.cmp(b, pred::EQ, z, k0);
+        let z_eq1 = m.cmp(b, pred::EQ, z, k1);
+        let z_ne1 = m.cmp(b, pred::NE, k1, z);
+        let z_and1 = m.bin(b, Bin::And, z, k1);
+        let z_and2 = m.bin(b, Bin::And, z, k2);
+
+        let w = |m: &mut Module, v: V| m.cast(b, Cast::ZExt, v, i32t);
+        let vals = [
+            (w(&mut m, nic), w(&mut m, mir_ic)),
+            (w(&mut m, nfc), w(&mut m, mir_fc)),
+            (w(&mut m, nueq), w(&mut m, nan_eq)),
+            (w(&mut m, nan_une), sel_flip),
+            (w(&mut m, sel_or), w(&mut m, sel_and)),
+            (w(&mut m, sel_not), w(&mut m, eq_10)),
+            (w(&mut m, eq_20), w(&mut m, eq_30)),
+            (w(&mut m, z_eq0), w(&mut m, z_eq1)),
+            (w(&mut m, z_ne1), z_and1),
+            (z_and2, k0),
+        ];
+        for (p, q) in vals {
+            m.call(b, writes, vec![p, q]);
+        }
+        m.terminate(b, Term::Ret);
+        m.optimise(FOLD | EXT_FOLD | REUSE | DEAD);
+
+        let st = stores(&m, b);
+        assert_eq!(st[0][0], st[0][1], "icmp IUGE(x,y) merges with IULE(y,x)");
+        assert_eq!(st[1][0], st[1][1], "fcmp UGE(xf,yf) merges with ULE(yf,xf)");
+        for &id in &m.blocks[b].body {
+            if let Op::Cmp(p, _, _) = m.insts[id as usize].op {
+                assert_ne!(p, pred::ONE, "must never emit fcmp ONE (AMD driver bug)");
+            }
+        }
+        assert!(matches!(st[2][1], V::Inst(_)), "fcmp OEQ(xf, xf) must stay");
+        assert!(matches!(st[3][0], V::Inst(_)), "fcmp UNE(xf, xf) must stay");
+        let V::Inst(sf) = st[3][1] else { panic!() };
+        assert!(
+            matches!(m.insts[sf as usize].op, Op::Select(c, a, z) if (c, a, z) == (opaque_b, y, x))
+        );
+        let unwrap_zext = |v: V| match v {
+            V::Inst(id) => match m.insts[id as usize].op {
+                Op::Cast(Cast::ZExt, inner) => inner,
+                _ => panic!("expected zext, got {:?}", m.insts[id as usize].op),
+            },
+            _ => panic!("expected inst, got {v:?}"),
+        };
+        let V::Inst(or_id) = unwrap_zext(st[4][0]) else { panic!() };
+        assert!(matches!(m.insts[or_id as usize].op, Op::Bin(Bin::Or, a, b) if (a, b) == (c2, b2)));
+        let V::Inst(and_id) = unwrap_zext(st[4][1]) else { panic!() };
+        assert!(matches!(m.insts[and_id as usize].op, Op::Bin(Bin::And, a, b) if (a, b) == (c2, b2)));
+        let V::Inst(not_id) = unwrap_zext(st[5][0]) else { panic!() };
+        assert!(matches!(m.insts[not_id as usize].op, Op::Cmp(pred::NE, a, k) if (a, k) == (x, k10)));
+        assert_eq!(unwrap_zext(st[5][1]), c2, "eq(select(c2,10,20),10) => c2");
+        assert_eq!(unwrap_zext(st[6][0]), V::Inst(not_id), "eq(select(c2,10,20),20) => !c2");
+        assert_eq!(st[6][1], k0, "eq(select(c2,10,20),30) => false");
+        assert_eq!(unwrap_zext(st[7][0]), V::Inst(not_id), "eq(zext c2, 0) => !c2");
+        assert_eq!(unwrap_zext(st[7][1]), c2, "eq(zext c2, 1) => c2");
+        assert_eq!(unwrap_zext(st[8][0]), V::Inst(not_id), "ne(1, zext c2) => !c2");
+        assert_eq!(st[8][1], z, "and(zext c2, 1) => zext c2");
+        assert_eq!(st[9][0], k0, "and(zext c2, 2) => 0");
+        m.write();
+    }
+
+    #[test]
+    fn default_63_leaves_ext_fold_off() {
+        let build = || {
+            let Kit {
+                mut m,
+                b,
+                reads,
+                writes,
+                ..
+            } = kit();
+            let i32t = m.int(32);
+            let (k1, k2, k8, k10) = (m.i32(1), m.i32(2), m.i32(8), m.i32(10));
+            let t = m.bool(true);
+            let x = m.call(b, reads, vec![k1, k1]);
+            let y = m.call(b, reads, vec![k2, k2]);
+            let mul8 = m.bin(b, Bin::Mul, x, k8);
+            let sub_self = m.bin(b, Bin::Sub, x, x);
+            let c1 = m.cmp(b, pred::EQ, x, k10);
+            let c2 = m.cmp(b, pred::EQ, y, k10);
+            let sel = m.select(b, c1, t, c2);
+            let sel_i32 = m.cast(b, Cast::ZExt, sel, i32t);
+            m.call(b, writes, vec![mul8, sub_self]);
+            m.call(b, writes, vec![sel_i32, k1]);
+            m.terminate(b, Term::Ret);
+            m
+        };
+        assert_eq!(DEFAULT, 63);
+        let mut base = build();
+        base.optimise(DEFAULT);
+        let st_base = stores(&base, 0);
+        let op_of = |m: &Module, v: V| match v {
+            V::Inst(id) => m.insts[id as usize].op.clone(),
+            other => panic!("expected inst, got {other:?}"),
+        };
+        assert!(matches!(op_of(&base, st_base[0][0]), Op::Bin(Bin::Mul, ..)));
+        assert!(matches!(op_of(&base, st_base[0][1]), Op::Bin(Bin::Sub, ..)));
+        let Op::Cast(Cast::ZExt, V::Inst(sel_id)) = op_of(&base, st_base[1][0]) else {
+            panic!("expected zext");
+        };
+        assert!(matches!(base.insts[sel_id as usize].op, Op::Select(..)));
+
+        let mut ext = build();
+        ext.optimise(DEFAULT | EXT_FOLD);
+        let st_ext = stores(&ext, 0);
+        assert!(matches!(op_of(&ext, st_ext[0][0]), Op::Bin(Bin::Shl, ..)));
+        assert_eq!(st_ext[0][1], ext.i32(0));
+        let Op::Cast(Cast::ZExt, V::Inst(or_id)) = op_of(&ext, st_ext[1][0]) else {
+            panic!("expected zext");
+        };
+        assert!(matches!(ext.insts[or_id as usize].op, Op::Bin(Bin::Or, ..)));
+    }
+
+    #[test]
+    fn fcmp_opposite_matches_ieee754_for_all_predicates_including_nans() {
+        let samples = [
+            0.0f32.to_bits(),
+            (-0.0f32).to_bits(),
+            1.0f32.to_bits(),
+            (-2.5f32).to_bits(),
+            f32::INFINITY.to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            f32::NAN.to_bits(),
+            0x7F80_0001u32, // sNaN
+        ];
+        for p in 0..=15u8 {
+            let build = || {
+                let mut k = kit();
+                let (i32t, f32t) = (k.m.int(32), k.m.float());
+                let fty = k.m.func_ty(i32t, vec![i32t, i32t]);
+                let inp = k.m.function("dx.op.loadInput.i32", fty, Some(Attr::ReadNone), false);
+                let (k0, k1) = (k.m.i32(0), k.m.i32(1));
+                let a = k.m.call(k.b, inp, vec![k0, k0]);
+                let b = k.m.call(k.b, inp, vec![k1, k0]);
+                let af = k.m.cast(k.b, Cast::Bitcast, a, f32t);
+                let bf = k.m.cast(k.b, Cast::Bitcast, b, f32t);
+                let c = k.m.cmp(k.b, p, af, bf);
+                let yes = k.m.bool(true);
+                let nc = k.m.bin(k.b, Bin::Xor, c, yes);
+                let z = k.m.cast(k.b, Cast::ZExt, nc, i32t);
+                k.m.call(k.b, k.writes, vec![k0, z]);
+                k.m.terminate(k.b, Term::Ret);
+                k.m
+            };
+            let plain = build();
+            let mut opt = build();
+            opt.optimise(FOLD | EXT_FOLD | REUSE | DEAD);
+            for &x in &samples {
+                for &y in &samples {
+                    assert_eq!(
+                        run(&opt, &[x, y]),
+                        run(&plain, &[x, y]),
+                        "pred {p}, x={x:#x}, y={y:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_facts_propagate_flipped_comparisons() {
+        let Diamond {
+            k: Kit { mut m, writes, .. },
+            x,
+            y,
+            then,
+            other,
+            ..
+        } = diamond();
+        // Entry branches on `x <u y`.
+        // In `then`: `y >u x` is true, `y <=u x` is false, `x >=u y` is false.
+        let flipped_true = m.cmp(then, pred::IUGT, y, x);
+        let flipped_false = m.cmp(then, pred::IULE, y, x);
+        let s1 = m.select(then, flipped_true, x, y);
+        let s2 = m.select(then, flipped_false, x, y);
+        m.call(then, writes, vec![s1, s2]);
+        // In `other`: `y <=u x` is true, `y >u x` is false.
+        let o1 = m.cmp(other, pred::IULE, y, x);
+        let o2 = m.cmp(other, pred::IUGT, y, x);
+        let s3 = m.select(other, o1, x, y);
+        let s4 = m.select(other, o2, x, y);
+        m.call(other, writes, vec![s3, s4]);
+        m.optimise(FOLD | EXT_FOLD | FACTS | DEAD);
+        assert_eq!(stores(&m, then), [[x, y]]);
+        assert_eq!(stores(&m, other), [[x, y]]);
+        m.write();
     }
 }
