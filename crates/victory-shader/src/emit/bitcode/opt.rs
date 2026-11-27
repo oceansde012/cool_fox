@@ -29,6 +29,9 @@
 //! - [`EXT_FOLD`]: opt-in extended algebraic, bitwise, shift, power-of-two
 //!   strength reduction, comparison/select folds, and canonical comparison
 //!   reuse and branch facts.
+//! - [`MEM_FWD`]: opt-in alias-aware forwarding and overwritten-store
+//!   elimination for non-escaping private globals, plus non-aliasing shared
+//!   (LDS) load reuse without store-to-load forwarding across lanes.
 //!
 //! Which passes run is `emit::shader_opt()` (`VICTORY_SHADER_OPT`), part of
 //! the translation and so of the shader cache's key.
@@ -66,8 +69,11 @@ pub const WIDE: u32 = 64;
 /// Opt-in extended algebraic, bitwise, shift, compare/select folds, and
 /// canonical comparison reuse and branch facts.
 pub const EXT_FOLD: u32 = 128;
+/// Opt-in alias-aware private-global forwarding, shared-memory load reuse,
+/// and overwritten-store elimination.
+pub const MEM_FWD: u32 = 256;
 /// The passes over the module.
-pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD;
+pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD;
 /// Every pass.
 pub const ALL: u32 = MODULE | FIRST | WIDE;
 /// The passes that run when nothing says which: the original default passes
@@ -164,6 +170,76 @@ fn canonical_cmp(p: u8, a: V, b: V) -> (u8, V, V) {
         pred::UGE => (pred::ULE, b, a),
         _ => (p, a, b),
     }
+}
+
+/// Memory domain for a pointer traced through GEP chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PtrRoot {
+    /// Immutable constant global (`init.is_some()`).
+    ConstGlobal(u32),
+    /// Non-escaping thread-private global (`space == 0`, `init.is_none()`).
+    PrivateGlobal(u32),
+    /// Non-escaping thread-group shared global (`space == 3`, LDS).
+    SharedGlobal(u32),
+    /// Escaped global or non-global pointer.
+    Unknown,
+}
+
+/// Constant canonical scalar-leaf vs dynamic GEP path from a [`PtrRoot`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PtrPath {
+    /// Canonical in-bounds root-to-scalar-leaf path with its exact leaf type.
+    Const(Ty, Vec<u64>),
+    Dynamic,
+}
+
+/// Fine-grained classification of `Effect::Writes` `dx.op.*` calls for
+/// non-aliasing tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteKind {
+    /// Stage output sinks (`storeOutput*`, `emitIndices`, etc.): never alias
+    /// buffers, textures, LDS, private memory, or wave lanes.
+    OutputOnly,
+    /// Resource buffer/texture stores and atomics: invalidate DXIL resource
+    /// reads, never alias LDS, non-escaping private memory, or wave lanes.
+    ResourceMemory,
+    /// `dx.op.barrier`: synchronises shared/UAV memory according to mode bits;
+    /// never aliases non-escaping thread-private memory.
+    Barrier,
+    /// `dx.op.discard` or any unrecognised side-effecting call.
+    All,
+}
+
+fn write_kind(f: &Func) -> WriteKind {
+    let name = f.name.strip_prefix("dx.op.").unwrap_or(&f.name);
+    if name == "barrier" {
+        WriteKind::Barrier
+    } else if name.starts_with("storeOutput")
+        || name.starts_with("storeVertexOutput")
+        || name.starts_with("storePrimitiveOutput")
+        || matches!(
+            name,
+            "emitIndices" | "setMeshOutputCounts" | "emitStream" | "cutStream"
+        )
+    {
+        WriteKind::OutputOnly
+    } else if name.starts_with("bufferStore")
+        || name.starts_with("rawBufferStore")
+        || name.starts_with("textureStore")
+        || name.starts_with("atomicBinOp")
+        || name.starts_with("atomicCompareExchange")
+    {
+        WriteKind::ResourceMemory
+    } else {
+        WriteKind::All
+    }
+}
+
+/// Tracked values of non-escaping thread-private globals (`space == 0`).
+#[derive(Default, Clone)]
+struct PrivateVals {
+    const_vals: HashMap<(u32, Vec<u64>), V>,
+    dyn_vals: HashMap<(u32, V, Ty), V>,
 }
 
 /// What holds in the block being walked: values that are a known bit there,
@@ -266,7 +342,7 @@ pub(super) fn effect(f: &Func) -> Effect {
 impl Module {
     /// Runs the clean-up passes named in `passes` ([`ALL`]: every one).
     pub(crate) fn optimise(&mut self, passes: u32) {
-        if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD) != 0 {
+        if passes & (FOLD | REUSE | FACTS | LOADS | EXT_FOLD | MEM_FWD) != 0 {
             // Values merged in one round can make two joins the same in
             // the next (a loop's registers that only go round), and a
             // branch that goes one way leaves blocks with one way in.
@@ -1209,8 +1285,162 @@ impl Module {
         }
     }
 
+    /// Whether `ty` is an indivisible scalar leaf (never a struct/array aggregate).
+    fn is_scalar_ty(&self, ty: Ty) -> bool {
+        matches!(
+            self.types[ty.0 as usize],
+            TypeDef::Int(_) | TypeDef::Float | TypeDef::Double | TypeDef::Ptr(..)
+        )
+    }
+
+    /// Traces pointer `v` through arbitrarily deep GEP chains to its root
+    /// global and canonical, provably in-bounds, non-overlapping scalar-leaf
+    /// path (or [`PtrPath::Dynamic`] for any dynamic, out-of-bounds, negative,
+    /// aggregate, or non-canonical pointer).
+    fn trace_ptr(&self, mut v: V, escaped: &[bool]) -> (PtrRoot, PtrPath) {
+        let mut hops: Vec<(Ty, Ty, Vec<V>)> = Vec::new();
+        for _ in 0..=self.insts.len() {
+            match v {
+                V::Global(g) => {
+                    let global = &self.globals[g as usize];
+                    let root = if global.init.is_some() {
+                        PtrRoot::ConstGlobal(g)
+                    } else if escaped.get(g as usize).copied().unwrap_or(true) {
+                        PtrRoot::Unknown
+                    } else if global.space == 0 {
+                        PtrRoot::PrivateGlobal(g)
+                    } else if global.space == 3 {
+                        PtrRoot::SharedGlobal(g)
+                    } else {
+                        PtrRoot::Unknown
+                    };
+                    let mut cur_ty = global.ty;
+                    let g_space = global.space;
+                    let mut path: Vec<u64> = Vec::new();
+                    let mut parent_array_len: Option<u32> = None;
+                    for (gep_ty, res_ty, idx) in hops.into_iter().rev() {
+                        if gep_ty != cur_ty || idx.is_empty() {
+                            return (root, PtrPath::Dynamic);
+                        }
+                        let mut consts = Vec::with_capacity(idx.len());
+                        for ix in idx {
+                            let Some((bits, k)) = self.int_k(ix) else {
+                                return (root, PtrPath::Dynamic);
+                            };
+                            if bits == 0 {
+                                return (root, PtrPath::Dynamic);
+                            }
+                            consts.push(signed(bits, k));
+                        }
+                        let s0 = consts[0];
+                        if s0 != 0 {
+                            let (Some(len), Some(last)) = (parent_array_len, path.last_mut())
+                            else {
+                                return (root, PtrPath::Dynamic);
+                            };
+                            let next = i128::from(*last) + i128::from(s0);
+                            if next < 0 || next >= i128::from(len) {
+                                return (root, PtrPath::Dynamic);
+                            }
+                            *last = next as u64;
+                        }
+                        for &s in &consts[1..] {
+                            if s < 0 {
+                                return (root, PtrPath::Dynamic);
+                            }
+                            match &self.types[cur_ty.0 as usize] {
+                                TypeDef::Array(len, elem) if (s as u64) < u64::from(*len) => {
+                                    path.push(s as u64);
+                                    parent_array_len = Some(*len);
+                                    cur_ty = *elem;
+                                }
+                                TypeDef::Struct(_, fields) if (s as u64) < fields.len() as u64 => {
+                                    path.push(s as u64);
+                                    parent_array_len = None;
+                                    cur_ty = fields[s as usize];
+                                }
+                                _ => return (root, PtrPath::Dynamic),
+                            }
+                        }
+                        if !matches!(
+                            self.types[res_ty.0 as usize],
+                            TypeDef::Ptr(pt, sp) if pt == cur_ty && sp == g_space
+                        ) {
+                            return (root, PtrPath::Dynamic);
+                        }
+                    }
+                    if !self.is_scalar_ty(cur_ty) {
+                        return (root, PtrPath::Dynamic);
+                    }
+                    return (root, PtrPath::Const(cur_ty, path));
+                }
+                V::Inst(id) => {
+                    let inst = &self.insts[id as usize];
+                    let Op::Gep(gep_ty, base, idx) = &inst.op else {
+                        return (PtrRoot::Unknown, PtrPath::Dynamic);
+                    };
+                    hops.push((*gep_ty, inst.ty, idx.clone()));
+                    v = *base;
+                }
+                _ => return (PtrRoot::Unknown, PtrPath::Dynamic),
+            }
+        }
+        (PtrRoot::Unknown, PtrPath::Dynamic)
+    }
+
+    /// Per global: whether its address (or any GEP derived from it) escapes
+    /// beyond direct `Gep`/`Load`/`Store`/`AtomicRmw`/`CmpXchg` pointer slots.
+    fn escaped_globals(&self, order: &[usize]) -> Vec<bool> {
+        let mut escaped = vec![false; self.globals.len()];
+        if escaped.is_empty() {
+            return escaped;
+        }
+        let mut gep_root: Vec<Option<u32>> = vec![None; self.insts.len()];
+        let root_of = |gep_root: &[Option<u32>], v: V| match v {
+            V::Global(g) => Some(g),
+            V::Inst(i) => gep_root[i as usize],
+            _ => None,
+        };
+        // Collect GEP roots in RPO order (bases dominate derived GEPs).
+        for &b in order {
+            for &i in &self.blocks[b].body {
+                if let Op::Gep(_, base, _) = self.insts[i as usize].op {
+                    gep_root[i as usize] = root_of(&gep_root, base);
+                }
+            }
+        }
+        let mark = |escaped: &mut [bool], gep_root: &[Option<u32>], v: V| {
+            if let Some(g) = root_of(gep_root, v) {
+                escaped[g as usize] = true;
+            }
+        };
+        for &b in order {
+            for &i in self.blocks[b].phis.iter().chain(&self.blocks[b].body) {
+                match &self.insts[i as usize].op {
+                    Op::Gep(_, _, idx) => {
+                        for &ix in idx {
+                            mark(&mut escaped, &gep_root, ix);
+                        }
+                    }
+                    Op::Load(_) => {}
+                    Op::Store(_, val) | Op::AtomicRmw(_, _, val) => {
+                        mark(&mut escaped, &gep_root, *val);
+                    }
+                    Op::CmpXchg(_, exp, new) => {
+                        mark(&mut escaped, &gep_root, *exp);
+                        mark(&mut escaped, &gep_root, *new);
+                    }
+                    other => {
+                        for_each_operand(other, |v| mark(&mut escaped, &gep_root, v));
+                    }
+                }
+            }
+        }
+        escaped
+    }
+
     /// What kind of instruction `i` is for merging.
-    fn class(&self, effects: &[Effect], i: u32) -> Effect {
+    fn class(&self, effects: &[Effect], i: u32, deep_gep: bool) -> Effect {
         match &self.insts[i as usize].op {
             Op::Bin(..)
             | Op::Cast(..)
@@ -1220,16 +1450,33 @@ impl Module {
             | Op::Gep(..) => Effect::Pure,
             Op::Load(p) => {
                 // A constant table reads the same whatever is stored.
-                let base = match *p {
-                    V::Inst(g) => match &self.insts[g as usize].op {
-                        Op::Gep(_, base, _) => *base,
+                if deep_gep {
+                    let mut cur = *p;
+                    for _ in 0..=self.insts.len() {
+                        match cur {
+                            V::Global(g) if self.globals[g as usize].init.is_some() => {
+                                return Effect::Pure;
+                            }
+                            V::Inst(g) => match &self.insts[g as usize].op {
+                                Op::Gep(_, base, _) => cur = *base,
+                                _ => break,
+                            },
+                            _ => break,
+                        }
+                    }
+                    Effect::Reads
+                } else {
+                    let base = match *p {
+                        V::Inst(g) => match &self.insts[g as usize].op {
+                            Op::Gep(_, base, _) => *base,
+                            _ => *p,
+                        },
                         _ => *p,
-                    },
-                    _ => *p,
-                };
-                match base {
-                    V::Global(g) if self.globals[g as usize].init.is_some() => Effect::Pure,
-                    _ => Effect::Reads,
+                    };
+                    match base {
+                        V::Global(g) if self.globals[g as usize].init.is_some() => Effect::Pure,
+                        _ => Effect::Reads,
+                    }
                 }
             }
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => Effect::Writes,
@@ -1272,15 +1519,21 @@ impl Module {
         })
     }
 
-    /// [`FOLD`], [`EXT_FOLD`], [`REUSE`], [`FACTS`] and [`LOADS`]: one walk over the
-    /// dominator tree. Returns whether anything changed.
+    /// [`FOLD`], [`EXT_FOLD`], [`REUSE`], [`FACTS`], [`LOADS`] and [`MEM_FWD`]:
+    /// one walk over the dominator tree. Returns whether anything changed.
     fn merge(&mut self, passes: u32) -> bool {
         if self.blocks.is_empty() {
             return false;
         }
         let ext_fold = passes & EXT_FOLD != 0;
+        let mem_fwd = passes & MEM_FWD != 0;
         let effects = self.effects();
         let tree = self.dominator_tree();
+        let escaped = if mem_fwd {
+            self.escaped_globals(&tree.order)
+        } else {
+            Vec::new()
+        };
         let mut repl: Vec<Option<V>> = vec![None; self.insts.len()];
         let mut changed = false;
         // Joins of one value: until none is left (one gone can leave
@@ -1322,19 +1575,32 @@ impl Module {
         // The values every path to the block being walked has computed
         // (those of the blocks above it in the tree, and its own so far).
         let mut known: HashMap<Key, V> = HashMap::new();
-        // The reads of the block being walked since its last store.
+        // Base `LOADS` path (when `MEM_FWD` is off): block reads since last store.
         let mut read: HashMap<Key, V> = HashMap::new();
+        // `MEM_FWD` alias-aware per-block memory tracking.
+        let mut read_mem: HashMap<Key, V> = HashMap::new();
+        let mut read_lanes: HashMap<Key, V> = HashMap::new();
+        let mut shared_const: HashMap<(u32, Vec<u64>), V> = HashMap::new();
+        let mut shared_dyn: HashMap<(u32, V, Ty), V> = HashMap::new();
+        let mut unknown_loads: HashMap<V, V> = HashMap::new();
+        let mut pending_const_stores: HashMap<(u32, Vec<u64>), usize> = HashMap::new();
+        let mut pending_dyn_stores: HashMap<(u32, V, Ty), usize> = HashMap::new();
+        let mut exit_private: Vec<Option<PrivateVals>> = if mem_fwd {
+            vec![None; self.blocks.len()]
+        } else {
+            Vec::new()
+        };
         let mut facts = Facts::default();
         let (yes, no) = (self.bool(true), self.bool(false));
         enum Step {
             Enter(usize),
-            Leave(Vec<Key>, Learned),
+            Leave(usize, Vec<Key>, Learned),
         }
         let mut steps = vec![Step::Enter(0)];
         while let Some(step) = steps.pop() {
             let b = match step {
                 Step::Enter(b) => b,
-                Step::Leave(keys, learned) => {
+                Step::Leave(b, keys, learned) => {
                     for k in keys {
                         known.remove(&k);
                     }
@@ -1343,6 +1609,9 @@ impl Module {
                     }
                     for k in learned.compares {
                         facts.compares.remove(&k);
+                    }
+                    if mem_fwd {
+                        exit_private[b] = None;
                     }
                     continue;
                 }
@@ -1372,6 +1641,23 @@ impl Module {
                 None => v,
             };
             read.clear();
+            let mut priv_vals = if mem_fwd {
+                read_mem.clear();
+                read_lanes.clear();
+                shared_const.clear();
+                shared_dyn.clear();
+                unknown_loads.clear();
+                pending_const_stores.clear();
+                pending_dyn_stores.clear();
+                if let [p] = tree.preds[b][..] {
+                    exit_private[p].clone().unwrap_or_default()
+                } else {
+                    PrivateVals::default()
+                }
+            } else {
+                PrivateVals::default()
+            };
+            let mut dropped_kept = false;
             // Two joins of the same values from the same blocks are one.
             if passes & REUSE != 0 && self.blocks[b].phis.len() > 1 {
                 let mut joins: HashMap<Vec<(usize, V)>, V> = HashMap::new();
@@ -1439,7 +1725,7 @@ impl Module {
                     changed = true;
                     continue;
                 }
-                let class = self.class(&effects, i);
+                let class = self.class(&effects, i, mem_fwd);
                 if passes & REUSE != 0
                     && class == Effect::Pure
                     && let Some(key) = self.key(i, ext_fold)
@@ -1452,30 +1738,312 @@ impl Module {
                     known.insert(key.clone(), V::Inst(i));
                     added.push(key);
                 }
-                // Reads of memory, and wave operations (the same lanes run
-                // the whole block): the block's own earlier one.
-                if passes & LOADS != 0
-                    && matches!(class, Effect::Reads | Effect::Lanes)
-                    && let Some(key) = self.key(i, ext_fold)
-                {
-                    if let Some(&first) = read.get(&key) {
-                        repl[i as usize] = Some(first);
-                        changed = true;
-                        continue;
+                if !mem_fwd {
+                    // Base `LOADS` path (identical to `DEFAULT = 63`): reads of
+                    // memory and wave operations reuse the block's earlier one
+                    // until any `Effect::Writes`.
+                    if passes & LOADS != 0
+                        && matches!(class, Effect::Reads | Effect::Lanes)
+                        && let Some(key) = self.key(i, ext_fold)
+                    {
+                        if let Some(&first) = read.get(&key) {
+                            repl[i as usize] = Some(first);
+                            changed = true;
+                            continue;
+                        }
+                        read.insert(key, V::Inst(i));
                     }
-                    read.insert(key, V::Inst(i));
-                }
-                if class == Effect::Writes {
-                    read.clear();
+                    if class == Effect::Writes {
+                        read.clear();
+                    }
+                } else {
+                    match self.insts[i as usize].op.clone() {
+                        Op::Load(_) if class == Effect::Pure => {}
+                        Op::Load(ptr) => {
+                            let val_ty = self.insts[i as usize].ty;
+                            let (root, raw_path) = self.trace_ptr(ptr, &escaped);
+                            let path = match raw_path {
+                                PtrPath::Const(leaf_ty, cp) if leaf_ty == val_ty => {
+                                    PtrPath::Const(leaf_ty, cp)
+                                }
+                                _ => PtrPath::Dynamic,
+                            };
+                            match root {
+                                PtrRoot::PrivateGlobal(g) => {
+                                    let hit = match &path {
+                                        PtrPath::Const(_, cp) => {
+                                            priv_vals.const_vals.get(&(g, cp.clone())).copied()
+                                        }
+                                        PtrPath::Dynamic => {
+                                            priv_vals.dyn_vals.get(&(g, ptr, val_ty)).copied()
+                                        }
+                                    };
+                                    if let Some(v) = hit {
+                                        repl[i as usize] = Some(v);
+                                        changed = true;
+                                        continue;
+                                    }
+                                    match path {
+                                        PtrPath::Const(_, cp) => {
+                                            pending_const_stores
+                                                .retain(|(pg, pp), _| !(*pg == g && *pp == cp));
+                                            pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                            priv_vals.const_vals.insert((g, cp), V::Inst(i));
+                                        }
+                                        PtrPath::Dynamic => {
+                                            pending_const_stores.retain(|(pg, _), _| *pg != g);
+                                            pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                            priv_vals
+                                                .dyn_vals
+                                                .insert((g, ptr, val_ty), V::Inst(i));
+                                        }
+                                    }
+                                }
+                                PtrRoot::SharedGlobal(g) => {
+                                    let hit = match &path {
+                                        PtrPath::Const(_, cp) => {
+                                            shared_const.get(&(g, cp.clone())).copied()
+                                        }
+                                        PtrPath::Dynamic => {
+                                            shared_dyn.get(&(g, ptr, val_ty)).copied()
+                                        }
+                                    };
+                                    if let Some(v) = hit {
+                                        repl[i as usize] = Some(v);
+                                        changed = true;
+                                        continue;
+                                    }
+                                    match path {
+                                        PtrPath::Const(_, cp) => {
+                                            pending_const_stores
+                                                .retain(|(pg, pp), _| !(*pg == g && *pp == cp));
+                                            pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                            shared_const.insert((g, cp), V::Inst(i));
+                                        }
+                                        PtrPath::Dynamic => {
+                                            pending_const_stores.retain(|(pg, _), _| *pg != g);
+                                            pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                            shared_dyn.insert((g, ptr, val_ty), V::Inst(i));
+                                        }
+                                    }
+                                }
+                                PtrRoot::Unknown => {
+                                    if let Some(&first) = unknown_loads.get(&ptr)
+                                        && self.type_of(first) == val_ty
+                                    {
+                                        repl[i as usize] = Some(first);
+                                        changed = true;
+                                        continue;
+                                    }
+                                    unknown_loads.insert(ptr, V::Inst(i));
+                                }
+                                PtrRoot::ConstGlobal(_) => {}
+                            }
+                        }
+                        Op::Store(ptr, val) => {
+                            let val_ty = self.type_of(val);
+                            let (root, raw_path) = self.trace_ptr(ptr, &escaped);
+                            let path = match raw_path {
+                                PtrPath::Const(leaf_ty, cp) if leaf_ty == val_ty => {
+                                    PtrPath::Const(leaf_ty, cp)
+                                }
+                                _ => PtrPath::Dynamic,
+                            };
+                            match root {
+                                PtrRoot::PrivateGlobal(g) => match path {
+                                    PtrPath::Const(_, cp) => {
+                                        let slot = (g, cp);
+                                        if priv_vals.const_vals.get(&slot) == Some(&val) {
+                                            changed = true;
+                                            continue;
+                                        }
+                                        if let Some(prev) = pending_const_stores.remove(&slot) {
+                                            kept[prev] = u32::MAX;
+                                            dropped_kept = true;
+                                            changed = true;
+                                        }
+                                        priv_vals.dyn_vals.retain(|(pg, _, _), _| *pg != g);
+                                        pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                        priv_vals.const_vals.insert(slot.clone(), val);
+                                        let pos = kept.len();
+                                        kept.push(i);
+                                        pending_const_stores.insert(slot, pos);
+                                        continue;
+                                    }
+                                    PtrPath::Dynamic => {
+                                        let slot = (g, ptr, val_ty);
+                                        if priv_vals.dyn_vals.get(&slot) == Some(&val) {
+                                            changed = true;
+                                            continue;
+                                        }
+                                        if let Some(prev) = pending_dyn_stores.remove(&slot) {
+                                            kept[prev] = u32::MAX;
+                                            dropped_kept = true;
+                                            changed = true;
+                                        }
+                                        pending_const_stores.retain(|(pg, _), _| *pg != g);
+                                        pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                        priv_vals.const_vals.retain(|(pg, _), _| *pg != g);
+                                        priv_vals.dyn_vals.retain(|(pg, _, _), _| *pg != g);
+                                        priv_vals.dyn_vals.insert(slot, val);
+                                        let pos = kept.len();
+                                        kept.push(i);
+                                        pending_dyn_stores.insert(slot, pos);
+                                        continue;
+                                    }
+                                },
+                                PtrRoot::SharedGlobal(g) => match path {
+                                    PtrPath::Const(_, cp) => {
+                                        let slot = (g, cp);
+                                        if let Some(prev) = pending_const_stores.remove(&slot) {
+                                            kept[prev] = u32::MAX;
+                                            dropped_kept = true;
+                                            changed = true;
+                                        }
+                                        // Never forward space-3 stores to later loads:
+                                        // single-wave programs (group <= 32 or native wave64)
+                                        // rely on wave-ordered LDS exchange without barriers.
+                                        shared_const.remove(&slot);
+                                        shared_dyn.retain(|(pg, _, _), _| *pg != g);
+                                        pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                        let pos = kept.len();
+                                        kept.push(i);
+                                        pending_const_stores.insert(slot, pos);
+                                        continue;
+                                    }
+                                    PtrPath::Dynamic => {
+                                        let slot = (g, ptr, val_ty);
+                                        if let Some(prev) = pending_dyn_stores.remove(&slot) {
+                                            kept[prev] = u32::MAX;
+                                            dropped_kept = true;
+                                            changed = true;
+                                        }
+                                        pending_const_stores.retain(|(pg, _), _| *pg != g);
+                                        pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                        shared_const.retain(|(pg, _), _| *pg != g);
+                                        shared_dyn.retain(|(pg, _, _), _| *pg != g);
+                                        let pos = kept.len();
+                                        kept.push(i);
+                                        pending_dyn_stores.insert(slot, pos);
+                                        continue;
+                                    }
+                                },
+                                PtrRoot::Unknown | PtrRoot::ConstGlobal(_) => {
+                                    unknown_loads.clear();
+                                }
+                            }
+                        }
+                        Op::AtomicRmw(_, ptr, _) | Op::CmpXchg(ptr, _, _) => {
+                            let (root, _) = self.trace_ptr(ptr, &escaped);
+                            match root {
+                                PtrRoot::PrivateGlobal(g) => {
+                                    priv_vals.const_vals.retain(|(pg, _), _| *pg != g);
+                                    priv_vals.dyn_vals.retain(|(pg, _, _), _| *pg != g);
+                                    pending_const_stores.retain(|(pg, _), _| *pg != g);
+                                    pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                }
+                                PtrRoot::SharedGlobal(g) => {
+                                    shared_const.retain(|(pg, _), _| *pg != g);
+                                    shared_dyn.retain(|(pg, _, _), _| *pg != g);
+                                    pending_const_stores.retain(|(pg, _), _| *pg != g);
+                                    pending_dyn_stores.retain(|(pg, _, _), _| *pg != g);
+                                }
+                                PtrRoot::Unknown | PtrRoot::ConstGlobal(_) => {
+                                    unknown_loads.clear();
+                                }
+                            }
+                        }
+                        Op::Call(f, args) => match class {
+                            Effect::Reads => {
+                                if let Some(key) = self.key(i, ext_fold) {
+                                    if let Some(&first) = read_mem.get(&key) {
+                                        repl[i as usize] = Some(first);
+                                        changed = true;
+                                        continue;
+                                    }
+                                    read_mem.insert(key, V::Inst(i));
+                                }
+                            }
+                            Effect::Lanes => {
+                                if let Some(key) = self.key(i, ext_fold) {
+                                    if let Some(&first) = read_lanes.get(&key) {
+                                        repl[i as usize] = Some(first);
+                                        changed = true;
+                                        continue;
+                                    }
+                                    read_lanes.insert(key, V::Inst(i));
+                                }
+                            }
+                            Effect::Writes => match write_kind(&self.funcs[f as usize]) {
+                                WriteKind::Barrier => {
+                                    let mode = if args.len() == 2
+                                        && self.int_k(args[0]).is_some_and(|(_, op)| op == 80)
+                                    {
+                                        self.int_k(args[1]).map(|(_, m)| m)
+                                    } else {
+                                        None
+                                    };
+                                    let touches_lds = mode.is_none_or(|m| m & (1 | 8) != 0);
+                                    let touches_uav = mode.is_none_or(|m| m & (1 | 2 | 4) != 0);
+                                    if touches_lds {
+                                        shared_const.clear();
+                                        shared_dyn.clear();
+                                        unknown_loads.clear();
+                                        pending_const_stores.retain(|(pg, _), _| {
+                                            self.globals[*pg as usize].space == 0
+                                        });
+                                        pending_dyn_stores.retain(|(pg, _, _), _| {
+                                            self.globals[*pg as usize].space == 0
+                                        });
+                                    }
+                                    if touches_uav {
+                                        read_mem.clear();
+                                    }
+                                }
+                                WriteKind::OutputOnly => {}
+                                WriteKind::ResourceMemory => {
+                                    read_mem.clear();
+                                }
+                                WriteKind::All => {
+                                    let is_discard = self.funcs[f as usize]
+                                        .name
+                                        .strip_prefix("dx.op.")
+                                        .unwrap_or(&self.funcs[f as usize].name)
+                                        == "discard";
+                                    read_mem.clear();
+                                    read_lanes.clear();
+                                    shared_const.clear();
+                                    shared_dyn.clear();
+                                    unknown_loads.clear();
+                                    pending_const_stores.clear();
+                                    pending_dyn_stores.clear();
+                                    if !is_discard {
+                                        priv_vals = PrivateVals::default();
+                                    }
+                                }
+                            },
+                            Effect::Pure => {}
+                        },
+                        _ => {}
+                    }
                 }
                 kept.push(i);
+            }
+            if dropped_kept {
+                kept.retain(|&id| id != u32::MAX);
             }
             self.blocks[b].body = kept;
             if let Some(Term::CondBr(c, t, f)) = self.blocks[b].term {
                 let c = known_bit(&facts, resolve(&repl, c));
                 self.blocks[b].term = Some(Term::CondBr(c, t, f));
             }
-            steps.push(Step::Leave(added, learned));
+            if mem_fwd
+                && (!priv_vals.const_vals.is_empty() || !priv_vals.dyn_vals.is_empty())
+                && tree.children[b].iter().any(|&c| tree.preds[c].len() == 1)
+            {
+                exit_private[b] = Some(priv_vals);
+            }
+            steps.push(Step::Leave(b, added, learned));
             for &c in tree.children[b].iter().rev() {
                 steps.push(Step::Enter(c));
             }
@@ -2752,8 +3320,10 @@ mod tests {
                 REUSE,
                 FACTS,
                 LOADS,
+                MEM_FWD,
                 FOLD | FACTS,
                 FOLD | EXT_FOLD | FACTS,
+                LOADS | MEM_FWD,
                 FOLD | EXT_FOLD | REUSE | DEAD,
                 ALL,
             ] {
@@ -3138,5 +3708,421 @@ mod tests {
         assert_eq!(stores(&m, then), [[x, y]]);
         assert_eq!(stores(&m, other), [[x, y]]);
         m.write();
+    }
+
+    #[test]
+    fn local_and_shared_memory_forwarding_non_aliasing_and_dse() {
+        let mut k = kit();
+        let (i32t, void) = (k.m.int(32), k.m.void());
+        let arr = k.m.array(4, i32t);
+        let priv_a = k.m.global("priv_a", arr, 0);
+        let priv_b = k.m.global("priv_b", arr, 0);
+        let lds = k.m.global("lds", arr, 3);
+        let bty = k.m.func_ty(void, vec![i32t, i32t]);
+        k.m.ptr(bty);
+        let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+        let (k0, k1, k2, k9, k80) = (k.m.i32(0), k.m.i32(1), k.m.i32(2), k.m.i32(9), k.m.i32(80));
+        let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+        let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+        let dyn_idx = k.m.call(k.b, k.reads, vec![k2, k2]);
+
+        // 1) Dead overwritten store on priv_a[0] before any read, plus non-aliasing
+        // forwarding across priv_b store, LDS store, UAV bufferStore, and dx.op.barrier.
+        let pa0 = k.m.element(k.b, priv_a, k0);
+        let pa1 = k.m.element(k.b, priv_a, k1);
+        let pb0 = k.m.element(k.b, priv_b, k0);
+        let lds0 = k.m.element(k.b, lds, k0);
+        let lds1 = k.m.element(k.b, lds, k1);
+        k.m.store(k.b, pa0, v1); // dead: overwritten below
+        k.m.store(k.b, pa1, v2);
+        k.m.store(k.b, pa0, v2); // overwrites pa0 -> keeps this, drops first
+        k.m.store(k.b, pb0, v1); // unrelated private global
+        k.m.store(k.b, lds0, v1); // unrelated LDS
+        k.m.call(k.b, k.writes, vec![v1, v2]); // unrelated UAV bufferStore
+        // LDS load of lds0 after store MUST NOT forward v1 (wave-ordered LDS
+        // exchange without a barrier), but a second load across a non-aliasing
+        // UAV store reuses the first load.
+        let lds_read1 = k.m.load(k.b, lds0);
+        k.m.call(k.b, k.writes, vec![v2, v1]); // unrelated UAV bufferStore
+        let lds_read2 = k.m.load(k.b, lds0);
+        // Barrier invalidates LDS, but MUST NOT invalidate priv_a.
+        k.m.call(k.b, barrier, vec![k80, k9]);
+        let pa0_after_bar = k.m.load(k.b, pa0); // forwards v2 across barrier
+        let lds0_after_bar = k.m.load(k.b, lds0); // MUST NOT reuse across barrier
+        // Dynamic-indexed store to priv_a invalidates priv_a[0] & priv_a[1],
+        // but NOT priv_b[0].
+        let pa_dyn = k.m.element(k.b, priv_a, dyn_idx);
+        k.m.store(k.b, pa_dyn, v1);
+        let pa0_after_dyn = k.m.load(k.b, pa0); // MUST NOT forward (invalidated)
+        let pb0_after_dyn = k.m.load(k.b, pb0); // forwards v1 (different global)
+        // LDS dead overwritten store with non-aliasing const load lds1 in between:
+        k.m.store(k.b, lds0, v1); // dead: overwritten after non-aliasing load lds1
+        let lds1_read = k.m.load(k.b, lds1);
+        k.m.store(k.b, lds0, v2);
+        // Negative control: dynamic LDS load between two LDS stores preserves earlier store.
+        let lds_dyn = k.m.element(k.b, lds, dyn_idx);
+        k.m.store(k.b, lds1, v1);
+        let lds_dyn_read = k.m.load(k.b, lds_dyn);
+        k.m.store(k.b, lds1, v2);
+
+        k.m.call(k.b, k.writes, vec![lds_read1, lds_read2]);
+        k.m.call(k.b, k.writes, vec![pa0_after_bar, lds0_after_bar]);
+        k.m.call(k.b, k.writes, vec![pa0_after_dyn, pb0_after_dyn]);
+        k.m.call(k.b, k.writes, vec![lds1_read, lds_dyn_read]);
+        k.m.terminate(k.b, Term::Ret);
+        k.m.optimise(MEM_FWD | DEAD);
+
+        let st = stores(&k.m, k.b);
+        assert_eq!(
+            st[2],
+            [lds_read1, lds_read1],
+            "lds0 store MUST NOT forward to load, while load-to-load reuse survives UAV store"
+        );
+        assert_eq!(st[3][0], v2, "pa0 forwarded across barrier");
+        assert_eq!(st[3][1], lds0_after_bar, "lds0 NOT reused across barrier");
+        assert_eq!(st[4][0], pa0_after_dyn, "pa0 NOT forwarded across dynamic store to priv_a");
+        assert_eq!(st[4][1], v1, "pb0 forwarded across dynamic store to priv_a");
+
+        let count_stores_to = |ptr: V| -> usize {
+            k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == ptr))
+                .count()
+        };
+        assert_eq!(count_stores_to(pa0), 1, "first dead store to pa0 eliminated");
+        assert_eq!(count_stores_to(lds0), 2, "pre-barrier lds0 kept; dead post-barrier lds0 dropped");
+        assert_eq!(count_stores_to(lds1), 2, "intervening dynamic lds load preserves both lds1 stores");
+        k.m.write();
+    }
+
+    #[test]
+    fn shared_store_to_load_not_forwarded_wave_leader_election() {
+        let mut k = kit();
+        let i32t = k.m.int(32);
+        let arr = k.m.array(8, i32t);
+        let lds = k.m.global("lds", arr, 3);
+        let (k0, k1, k2) = (k.m.i32(0), k.m.i32(1), k.m.i32(2));
+        let lane = k.m.call(k.b, k.reads, vec![k0, k0]);
+        let bucket = k.m.call(k.b, k.reads, vec![k1, k1]);
+        let v2 = k.m.call(k.b, k.reads, vec![k2, k2]);
+
+        // Dynamic wave-ordered leader election: `lds[bucket] = lane; winner = lds[bucket]`.
+        let lds_dyn = k.m.element(k.b, lds, bucket);
+        k.m.store(k.b, lds_dyn, lane);
+        let win_dyn = k.m.load(k.b, lds_dyn);
+        let win_dyn_2 = k.m.load(k.b, lds_dyn);
+        k.m.store(k.b, lds_dyn, v2);
+        let after_dyn = k.m.load(k.b, lds_dyn);
+
+        // Constant-slot wave-ordered leader election: `lds[0] = lane; winner = lds[0]`.
+        let lds0 = k.m.element(k.b, lds, k0);
+        let lds1 = k.m.element(k.b, lds, k1);
+        k.m.store(k.b, lds0, lane);
+        let win_c = k.m.load(k.b, lds0);
+        k.m.store(k.b, lds1, v2); // non-aliasing const slot keeps win_c cached
+        let win_c_2 = k.m.load(k.b, lds0);
+        k.m.store(k.b, lds0, v2); // MUST invalidate win_c without forwarding v2
+        let after_c = k.m.load(k.b, lds0);
+
+        k.m.call(k.b, k.writes, vec![win_dyn, win_dyn_2]);
+        k.m.call(k.b, k.writes, vec![after_dyn, win_c]);
+        k.m.call(k.b, k.writes, vec![win_c_2, after_c]);
+        k.m.terminate(k.b, Term::Ret);
+        k.m.optimise(MEM_FWD | DEAD);
+
+        let st = stores(&k.m, k.b);
+        assert_eq!(st[0], [win_dyn, win_dyn], "dynamic LDS store not forwarded; load reused");
+        assert_eq!(st[1][0], after_dyn, "dynamic LDS overwrite invalidates cached load and does not forward");
+        assert_eq!(st[1][1], win_c, "const LDS store not forwarded");
+        assert_eq!(st[2][0], win_c, "const LDS load reused across unrelated const LDS store");
+        assert_eq!(st[2][1], after_c, "const LDS overwrite invalidates cached load and does not forward");
+
+        let count_stores_to = |ptr: V| -> usize {
+            k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == ptr))
+                .count()
+        };
+        assert_eq!(count_stores_to(lds_dyn), 2, "observed dynamic LDS store must not be dropped");
+        assert_eq!(count_stores_to(lds0), 2, "observed const LDS store must not be dropped");
+        k.m.write();
+    }
+
+    #[test]
+    fn escaped_private_global_and_loop_header_do_not_misforward() {
+        // Escaped global passed to a call disables private-global forwarding.
+        let mut k = kit();
+        let i32t = k.m.int(32);
+        let arr = k.m.array(2, i32t);
+        let p = k.m.global("esc", arr, 0);
+        let ptr_ty = k.m.ptr(i32t);
+        let cty = k.m.func_ty(i32t, vec![ptr_ty]);
+        k.m.ptr(cty);
+        let escape_fn = k.m.function("dx.op.unknownMutate", cty, Some(Attr::NoUnwind), false);
+        let (k0, k1, k2) = (k.m.i32(0), k.m.i32(1), k.m.i32(2));
+        let p0 = k.m.element(k.b, p, k0);
+        k.m.store(k.b, p0, k1);
+        k.m.call(k.b, escape_fn, vec![p0]);
+        let after = k.m.load(k.b, p0);
+        k.m.call(k.b, k.writes, vec![after, k2]);
+        k.m.terminate(k.b, Term::Ret);
+        k.m.optimise(MEM_FWD | DEAD);
+        assert_eq!(stores(&k.m, k.b), [[after, k2]], "escaped global must reload after call");
+        k.m.write();
+
+        // Loop header (2 preds) must NOT inherit preheader private global value across backedge.
+        let mut k = kit();
+        let i32t = k.m.int(32);
+        let arr = k.m.array(2, i32t);
+        let priv_g = k.m.global("loop_priv", arr, 0);
+        let (k0, k1, k4) = (k.m.i32(0), k.m.i32(1), k.m.i32(4));
+        let p0 = k.m.element(k.b, priv_g, k0);
+        k.m.store(k.b, p0, k0);
+        let (head, exit) = (k.m.new_block(), k.m.new_block());
+        k.m.terminate(k.b, Term::Br(head));
+        let idx = k.m.phi(head, i32t);
+        let cur = k.m.load(head, p0); // changes every iteration
+        let inc = k.m.bin(head, Bin::Add, cur, k1);
+        k.m.store(head, p0, inc);
+        let next = k.m.bin(head, Bin::Add, idx, k1);
+        let more = k.m.cmp(head, pred::IULT, next, k4);
+        k.m.terminate(head, Term::CondBr(more, head, exit));
+        k.m.set_phi(idx, vec![(k0, k.b), (next, head)]);
+        let final_v = k.m.load(exit, p0);
+        k.m.call(exit, k.writes, vec![final_v, k0]);
+        k.m.terminate(exit, Term::Ret);
+        k.m.optimise(ALL);
+        assert!(
+            k.m.blocks[head]
+                .body
+                .iter()
+                .any(|&id| matches!(k.m.insts[id as usize].op, Op::Load(_))),
+            "load inside loop header must NOT be forwarded from preheader"
+        );
+        k.m.write();
+    }
+
+    #[test]
+    fn ptr_path_aliasing_scalar_aggregate_signed_multidim_and_deep_gep() {
+        // 1a-i: Scalar global `V::Global(g)` vs `gep ty, g, 0` MUST canonicalize to the same slot.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let g = k.m.global("scalar_g", i32t, 0);
+            let (k0, k1, k2) = (k.m.i32(0), k.m.i32(1), k.m.i32(2));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let g_gep0 = k.m.push(k.b, ptr_i32, Op::Gep(i32t, g, vec![k0]));
+            k.m.store(k.b, g, v1);
+            let read_via_gep = k.m.load(k.b, g_gep0); // must see v1
+            k.m.store(k.b, g_gep0, v2);
+            let read_via_global = k.m.load(k.b, g); // must see v2, NOT stale v1
+            k.m.call(k.b, k.writes, vec![read_via_gep, read_via_global]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(MEM_FWD | DEAD);
+            assert_eq!(
+                stores(&k.m, k.b),
+                [[v1, v2]],
+                "scalar V::Global(g) and gep(i32, g, 0) must share canonical slot"
+            );
+            let mut k2m = kit();
+            let i32t = k2m.m.int(32);
+            let ptr_lds = k2m.m.ptr_in(i32t, 3);
+            let sg = k2m.m.global("scalar_lds", i32t, 3);
+            let (z0, z1) = (k2m.m.i32(0), k2m.m.i32(1));
+            let a = k2m.m.call(k2m.b, k2m.reads, vec![z0, z0]);
+            let b = k2m.m.call(k2m.b, k2m.reads, vec![z1, z1]);
+            let sg_gep0 = k2m.m.push(k2m.b, ptr_lds, Op::Gep(i32t, sg, vec![z0]));
+            k2m.m.store(k2m.b, sg, a);
+            k2m.m.store(k2m.b, sg_gep0, b);
+            let out = k2m.m.load(k2m.b, sg);
+            let out2 = k2m.m.load(k2m.b, sg_gep0);
+            k2m.m.call(k2m.b, k2m.writes, vec![out, out2]);
+            k2m.m.terminate(k2m.b, Term::Ret);
+            k2m.m.optimise(MEM_FWD | DEAD);
+            assert_eq!(
+                stores(&k2m.m, k2m.b),
+                [[out, out]],
+                "LDS scalar alias must NOT forward store b, but MUST reuse load out"
+            );
+            let rem_stores = k2m.m.blocks[k2m.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k2m.m.insts[id as usize].op, Op::Store(..)))
+                .count();
+            assert_eq!(rem_stores, 1, "overwritten store via equivalent scalar GEP drops first");
+            let _ = k2;
+        }
+
+        // 1a-ii: Whole-aggregate store/load vs field access MUST invalidate each other.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let st_ty = k.m.named_struct("pair", vec![i32t, i32t]);
+            let ptr_i32 = k.m.ptr(i32t);
+            let g = k.m.global("agg_g", st_ty, 0);
+            let (k0, k1) = (k.m.i32(0), k.m.i32(1));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let agg_k = k.m.aggregate(st_ty, &[k1, k1]);
+            let f0 = k.m.push(k.b, ptr_i32, Op::Gep(st_ty, g, vec![k0, k0]));
+            k.m.store(k.b, f0, v1);
+            let whole = k.m.load(k.b, g);
+            let whole_f0 = k.m.extract(k.b, whole, 0);
+            k.m.store(k.b, f0, v2);
+            k.m.store(k.b, g, agg_k);
+            let f0_after_agg = k.m.load(k.b, f0);
+            k.m.call(k.b, k.writes, vec![whole_f0, f0_after_agg]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(MEM_FWD | DEAD);
+            assert_eq!(
+                stores(&k.m, k.b),
+                [[whole_f0, f0_after_agg]],
+                "whole-aggregate store must invalidate field load (no stale v2)"
+            );
+            let f0_stores = k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == f0))
+                .count();
+            assert_eq!(f0_stores, 2, "whole-aggregate load must preserve preceding field store");
+        }
+
+        // 1b: Signed negative GEP index (`gep i32, (gep [4 x i32], g, 0, 1), -1` == `[0]`,
+        //     and OOB `gep i32, (gep [4 x i32], g, 0, 0), -1` falls back to Dynamic).
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let arr = k.m.array(4, i32t);
+            let g = k.m.global("signed_g", arr, 0);
+            let (k0, k1, km1) = (k.m.i32(0), k.m.i32(1), k.m.i32(u32::MAX));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let p0 = k.m.element(k.b, g, k0);
+            let p1 = k.m.element(k.b, g, k1);
+            let p1_m1 = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p1, vec![km1]));
+            let p0_m1 = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p0, vec![km1]));
+
+            k.m.store(k.b, p0, v1);
+            k.m.store(k.b, p1_m1, v2);
+            let after_inbounds = k.m.load(k.b, p0);
+
+            k.m.store(k.b, p0, v1);
+            let oob_rd = k.m.load(k.b, p0_m1);
+            k.m.store(k.b, p0, v2);
+            k.m.store(k.b, p0_m1, v1);
+            let after_oob_st = k.m.load(k.b, p0);
+
+            k.m.call(k.b, k.writes, vec![after_inbounds, oob_rd]);
+            k.m.call(k.b, k.writes, vec![after_oob_st, k0]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(MEM_FWD | DEAD);
+            let st = stores(&k.m, k.b);
+            assert_eq!(st[0][0], v2, "gep(p1, -1) must alias p0 and forward v2");
+            assert_eq!(st[1][0], after_oob_st, "OOB negative GEP store must invalidate p0");
+            let p0_stores = k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == p0))
+                .count();
+            assert_eq!(p0_stores, 2, "OOB negative GEP load must preserve earlier p0 store");
+        }
+
+        // 1c: Multi-dimensional array flattening `gep i32, (gep [2 x [2 x i32]], g, 0, 0, 1), 1`
+        //     aliases `gep g, 0, 1, 0` -> must fall back to Dynamic (no stale forward, no DSE).
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let inner = k.m.array(2, i32t);
+            let outer = k.m.array(2, inner);
+            let g = k.m.global("md_g", outer, 0);
+            let (k0, k1) = (k.m.i32(0), k.m.i32(1));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let p10 = k.m.push(k.b, ptr_i32, Op::Gep(outer, g, vec![k0, k1, k0]));
+            let p01 = k.m.push(k.b, ptr_i32, Op::Gep(outer, g, vec![k0, k0, k1]));
+            let p01_flat = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p01, vec![k1]));
+
+            k.m.store(k.b, p10, v1);
+            let rd_flat = k.m.load(k.b, p01_flat);
+            k.m.store(k.b, p10, v2);
+            k.m.store(k.b, p01_flat, v1);
+            let rd_p10 = k.m.load(k.b, p10);
+
+            k.m.call(k.b, k.writes, vec![rd_flat, rd_p10]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(MEM_FWD | DEAD);
+            assert_eq!(
+                stores(&k.m, k.b),
+                [[rd_flat, rd_p10]],
+                "flattened multi-dim GEP store must invalidate [1, 0]"
+            );
+            let p10_stores = k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == p10))
+                .count();
+            assert_eq!(
+                p10_stores, 2,
+                "flattened multi-dim GEP load must prevent DSE of [1, 0] store"
+            );
+        }
+
+        // 1d: Deep GEP chains (>32 hops) MUST agree with `escaped_globals` and invalidate `g`.
+        {
+            let mut k = kit();
+            let i32t = k.m.int(32);
+            let ptr_i32 = k.m.ptr(i32t);
+            let arr = k.m.array(4, i32t);
+            let g = k.m.global("deep_g", arr, 0);
+            let (k0, k1, k2) = (k.m.i32(0), k.m.i32(1), k.m.i32(2));
+            let v1 = k.m.call(k.b, k.reads, vec![k0, k0]);
+            let v2 = k.m.call(k.b, k.reads, vec![k1, k1]);
+            let dyn_idx = k.m.call(k.b, k.reads, vec![k2, k2]);
+            let p0 = k.m.element(k.b, g, k0);
+            let mut p_deep_const = p0;
+            let mut p_deep_dyn = k.m.element(k.b, g, dyn_idx);
+            for _ in 0..35 {
+                p_deep_const = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p_deep_const, vec![k0]));
+                p_deep_dyn = k.m.push(k.b, ptr_i32, Op::Gep(i32t, p_deep_dyn, vec![k0]));
+            }
+
+            k.m.store(k.b, p0, v1);
+            k.m.store(k.b, p_deep_const, v2);
+            let after_deep_const = k.m.load(k.b, p0);
+
+            k.m.store(k.b, p0, v1);
+            let deep_rd = k.m.load(k.b, p_deep_dyn);
+            k.m.store(k.b, p0, v2);
+            k.m.store(k.b, p_deep_dyn, v1);
+            let after_deep_st = k.m.load(k.b, p0);
+            k.m.store(k.b, p0, v2);
+            let deep_rmw = k.m.atomic(k.b, crate::emit::bitcode::Rmw::Add, p_deep_dyn, k1);
+            let after_deep_rmw = k.m.load(k.b, p0);
+
+            k.m.call(k.b, k.writes, vec![after_deep_const, deep_rd]);
+            k.m.call(k.b, k.writes, vec![after_deep_st, deep_rmw]);
+            k.m.call(k.b, k.writes, vec![after_deep_rmw, k0]);
+            k.m.terminate(k.b, Term::Ret);
+            k.m.optimise(MEM_FWD | DEAD);
+            let st = stores(&k.m, k.b);
+            assert_eq!(st[0][0], v2, "36-hop constant GEP must alias p0");
+            assert_eq!(st[1][0], after_deep_st, "36-hop dynamic GEP store must invalidate p0");
+            assert_eq!(st[2][0], after_deep_rmw, "36-hop dynamic GEP atomic must invalidate p0");
+            let p0_stores = k.m.blocks[k.b]
+                .body
+                .iter()
+                .filter(|&&id| matches!(k.m.insts[id as usize].op, Op::Store(p, _) if p == p0))
+                .count();
+            assert_eq!(
+                p0_stores, 3,
+                "36-hop dynamic load/store/atomic must preserve all 3 live p0 stores"
+            );
+        }
     }
 }
