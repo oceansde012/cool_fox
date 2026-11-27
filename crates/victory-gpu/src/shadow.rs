@@ -675,11 +675,10 @@ impl SentRuns {
 /// that send knows the card did not hold these bytes yet
 /// ([`Shadow::card_merge_relay`]). Notes of sends that every fetch still to
 /// be merged came after are dropped.
-pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+pub(crate) fn card_dirty(sent_as: u64, out: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>) {
     if card_dirty_list() {
-        return take_card_dirty_list(sent_as);
+        return take_card_dirty_list(sent_as, out);
     }
-    let mut out = Vec::new();
     let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
     carded.retain(|weak| {
@@ -700,17 +699,16 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         }
         true
     });
-    out
 }
 
-fn take_card_dirty_list(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
+fn take_card_dirty_list(sent_as: u64, out: &mut Vec<(Arc<Shadow>, Vec<(usize, usize)>)>) {
     static ROUNDS: AtomicU64 = AtomicU64::new(0);
     if ROUNDS.fetch_add(1, Ordering::Relaxed) % 256 == 255 {
         CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.strong_count() > 0);
     }
     let queued = std::mem::take(&mut *CARD_DIRTY.lock().unwrap_or_else(|e| e.into_inner()));
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    let mut out = Vec::with_capacity(queued.len());
+    out.reserve_exact(queued.len());
     for weak in queued.into_values() {
         let Some(shadow) = weak.upgrade() else { continue };
         let card = shadow.card.as_ref().unwrap();
@@ -723,7 +721,6 @@ fn take_card_dirty_list(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)>
             out.push((shadow, ranges));
         }
     }
-    out
 }
 
 fn take_card_ranges(card: &Card, dirty: &mut Vec<(usize, usize)>, sent_as: u64, fetched: u64) -> Vec<(usize, usize)> {
@@ -877,9 +874,14 @@ fn joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 /// for 87 MB in run 102), and each had a pass of its own over its pieces,
 /// so a piece that held several ranges was hashed once for each.
 pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
-    runs.sort_unstable_by_key(|r| r.first);
     let mut out: Vec<CardSpan> = Vec::new();
-    for run in runs {
+    join_piece_runs_into(&mut runs, &mut out);
+    out
+}
+
+pub(crate) fn join_piece_runs_into(runs: &mut Vec<CardSpan>, out: &mut Vec<CardSpan>) {
+    runs.sort_unstable_by_key(|r| r.first);
+    for run in runs.drain(..) {
         match out.last_mut() {
             Some(last) if run.first <= last.first + last.pieces => {
                 last.pieces = last.pieces.max(run.first + run.pieces - last.first);
@@ -888,7 +890,6 @@ pub(crate) fn joined_piece_runs(mut runs: Vec<CardSpan>) -> Vec<CardSpan> {
             _ => out.push(run),
         }
     }
-    out
 }
 
 /// A declared range of a copy in the card's memory, as the compare on the
