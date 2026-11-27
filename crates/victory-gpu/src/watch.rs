@@ -185,10 +185,6 @@ impl Ahead {
         std::mem::take(&mut self.ranges)
     }
 
-    fn is_empty(&self) -> bool {
-        self.ranges.is_empty()
-    }
-
     /// Whether one of the ranges holds pages `[first, last)`.
     fn holds(&self, first: usize, last: usize) -> bool {
         // Those that start at `first` or before; of them the furthest end.
@@ -3320,7 +3316,7 @@ mod parts_tests {
         }
         assert!(!Ahead::new().holds(0, 1));
         assert_eq!(ahead.take().len(), all.len());
-        assert!(ahead.is_empty() && !ahead.holds(10, 11));
+        assert!(ahead.ranges.is_empty() && !ahead.holds(10, 11));
     }
 
     #[test]
