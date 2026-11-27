@@ -7681,10 +7681,10 @@ fn submit_reuse() -> bool {
 }
 
 fn take_batch() -> Batch {
-    if submit_reuse() {
-        if let Some(batch) = SPARE_BATCH.with(|spare| spare.borrow_mut().take()) {
-            return batch;
-        }
+    if submit_reuse()
+        && let Some(batch) = SPARE_BATCH.with(|spare| spare.borrow_mut().take())
+    {
+        return batch;
     }
     Batch::default()
 }
@@ -7721,11 +7721,11 @@ fn give_back_batch(mut batch: Batch) {
 }
 
 fn take_places() -> ByCopy<Option<usize>> {
-    if submit_reuse() {
-        if let Some(mut places) = SPARE_PLACES.with(|spare| spare.borrow_mut().take()) {
-            places.clear();
-            return places;
-        }
+    if submit_reuse()
+        && let Some(mut places) = SPARE_PLACES.with(|spare| spare.borrow_mut().take())
+    {
+        places.clear();
+        return places;
     }
     ByCopy::default()
 }
