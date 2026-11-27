@@ -48,11 +48,14 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// Lock-free mirror of `ranged` for the submission's empty-refresh filter.
+    quick_ranges: QuickRanges,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
     /// title memory there is older than the copy.
     pending: Mutex<Vec<(usize, usize)>>,
+    quick_pending: std::sync::atomic::AtomicBool,
     /// With [`relay`]: how many submissions not yet copied back declared
     /// each range of `pending` ([`Flights`]). Locked inside `pending`'s
     /// lock.
@@ -102,6 +105,41 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+}
+
+#[derive(Default)]
+struct QuickRanges {
+    seq: AtomicU64,
+    ranges: [[AtomicU64; 3]; 2],
+}
+
+impl QuickRanges {
+    /// Writers hold `copied` and `ranged` until both entries are published.
+    fn publish(&self, ranges: [(usize, usize, u64); 2]) {
+        use Ordering::SeqCst;
+        self.seq.fetch_add(1, SeqCst);
+        for (entry, (from, to, taken)) in self.ranges.iter().zip(ranges) {
+            entry[0].store(from as u64, SeqCst);
+            entry[1].store(to as u64, SeqCst);
+            entry[2].store(taken, SeqCst);
+        }
+        self.seq.fetch_add(1, SeqCst);
+    }
+
+    fn taken(&self, from: usize, to: usize) -> u64 {
+        use Ordering::SeqCst;
+        let seq = self.seq.load(SeqCst);
+        if seq == 0 || seq % 2 != 0 {
+            return 0;
+        }
+        let mut taken = 0;
+        for range in &self.ranges {
+            if range[0].load(SeqCst) <= from as u64 && range[1].load(SeqCst) >= to as u64 {
+                taken = taken.max(range[2].load(SeqCst));
+            }
+        }
+        if self.seq.load(SeqCst) == seq { taken } else { 0 }
+    }
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -3027,8 +3065,10 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            quick_ranges: QuickRanges::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            quick_pending: Default::default(),
             flights: Mutex::default(),
             before: Mutex::default(),
             merging: RwLock::default(),
@@ -3101,6 +3141,9 @@ impl Shadow {
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
             return;
+        }
+        if crate::watch::skip_empty_refreshes() {
+            self.quick_pending.store(true, Ordering::Release);
         }
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
@@ -3419,6 +3462,9 @@ impl Shadow {
             pending.retain(|r| free.binary_search(r).is_err());
         } else {
             pending.retain(|r| !ranges.contains(r));
+        }
+        if crate::watch::skip_empty_refreshes() && pending.is_empty() {
+            self.quick_pending.store(false, Ordering::Release);
         }
         if !pending.is_empty() || self.card.is_some() {
             return;
@@ -3798,6 +3844,29 @@ impl Shadow {
         same
     }
 
+    /// A sufficient proof using the last or longest watched range copied.
+    /// The caller falls back to the exact per-page check for other ranges.
+    pub(crate) fn nothing_new_quick(&self, address: usize, len: usize) -> bool {
+        let (from, to) = (address.max(self.start as usize), (address + len).min((self.start + self.len) as usize));
+        if from >= to || self.place.is_some() {
+            return true;
+        }
+        if !matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED) || self.quick_pending.load(Ordering::Acquire) {
+            return false;
+        }
+        let taken = self.quick_ranges.taken(from, to);
+        let same = taken != 0
+            && crate::watch::nothing_written_since(from, to, taken)
+            && !self.quick_pending.load(Ordering::Acquire);
+        #[cfg(feature = "diagnostics")]
+        if same {
+            use crate::copystat::{C, add};
+            add(C::Checked, (to - from) as u64);
+            add(C::Unchanged, (to - from) as u64);
+        }
+        same
+    }
+
     /// The latest asking after which a range that holds `[from, to)` was
     /// taken whole (0: none is known). The caller holds `copied`'s lock.
     fn ranged(&self, from: usize, to: usize) -> u64 {
@@ -3954,6 +4023,9 @@ impl Shadow {
             ranged[0] = (from, to, now);
             if to - from >= ranged[1].1 - ranged[1].0 {
                 ranged[1] = (from, to, now);
+            }
+            if crate::watch::skip_empty_refreshes() {
+                self.quick_ranges.publish(*ranged);
             }
         }
         bytes

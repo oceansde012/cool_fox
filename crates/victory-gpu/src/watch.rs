@@ -58,6 +58,9 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
+        if skip_empty_refreshes() {
+            QUICK_WRITTEN[page % QUICK_WRITTEN.len()].fetch_max(now, std::sync::atomic::Ordering::AcqRel);
+        }
         let before = self.written.insert(page, now).unwrap_or(0);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
@@ -95,6 +98,50 @@ static ASKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 
 fn next_asking() -> u64 {
     ASKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+pub(crate) fn skip_empty_refreshes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_REFRESH_SKIP_EMPTY") && light())
+}
+
+use std::sync::atomic::{AtomicU64, Ordering::{Acquire, AcqRel}};
+
+// Journal writes are numbered under its write lock. A bucket collision can
+// only report a newer write, causing the caller to use the ordinary check.
+static QUICK_WRITTEN: [AtomicU64; 1 << 17] = [const { AtomicU64::new(0) }; 1 << 17];
+static QUICK_EPOCH: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    static QUICK_AHEAD: std::cell::RefCell<(u64, Vec<(usize, usize)>)> = const { std::cell::RefCell::new((0, Vec::new())) };
+}
+
+// Called under the journal's write lock whenever ahead coverage changes.
+// Readers on a different thread conservatively use the ordinary check.
+fn quick_ahead(ranges: &[(usize, usize)]) {
+    if skip_empty_refreshes() {
+        let epoch = QUICK_EPOCH.fetch_add(1, AcqRel) + 1;
+        QUICK_AHEAD.with_borrow_mut(|(saved, spans)| {
+            *saved = epoch;
+            spans.clear();
+            spans.extend_from_slice(ranges);
+            spans.sort_unstable();
+            let mut end = 0;
+            for span in spans.iter_mut() {
+                end = end.max(span.1);
+                span.1 = end;
+            }
+        });
+    }
+}
+
+pub(crate) fn nothing_written_since(start: usize, end: usize, taken: u64) -> bool {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let epoch = QUICK_EPOCH.load(Acquire);
+    let covered = published(start, end) || QUICK_AHEAD.with_borrow(|(saved, spans)| {
+        *saved == epoch && spans[..spans.partition_point(|r| r.0 <= first)].last().is_some_and(|r| r.1 >= last)
+    });
+    covered && (first..last).all(|p| QUICK_WRITTEN[p % QUICK_WRITTEN.len()].load(Acquire) <= taken)
+        && epoch == QUICK_EPOCH.load(Acquire)
 }
 
 /// A title-memory range whose changed pages another subsystem needs to read.
@@ -354,6 +401,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     for (page, parts) in written {
         j.note(page, parts, now);
     }
+    quick_ahead(&j.ahead);
 }
 
 /// Since the last frame line: the kernel askings that took a millisecond
@@ -497,6 +545,7 @@ pub(crate) fn ask_ahead_done() {
     let mut j = journal_mut();
     if !j.kept {
         j.ahead.clear();
+        quick_ahead(&[]);
     }
 }
 
@@ -542,6 +591,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     let _all = Asking::hold_all();
     let mut ahead = {
         let mut j = journal_mut();
+        quick_ahead(&[]);
         std::mem::take(&mut j.ahead)
     };
     // `ask_ahead` leaves a range that lies alone to `writes`, which asks
@@ -575,6 +625,7 @@ fn ask_rest(ranges: &[(usize, usize)]) {
     }
     j.kept = !ahead.is_empty();
     j.ahead = ahead;
+    quick_ahead(&j.ahead);
 }
 
 /// The submission's one asking stands no longer: its refreshes are done,
@@ -584,6 +635,7 @@ pub(crate) fn ask_once_end() {
     if j.kept {
         j.kept = false;
         j.ahead.clear();
+        quick_ahead(&[]);
     }
 }
 

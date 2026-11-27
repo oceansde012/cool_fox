@@ -5563,6 +5563,8 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
+        #[cfg(feature = "diagnostics")]
+        FLUSHES[5].fetch_add(1, Ordering::Relaxed);
         let mut batch = Batch::default();
         #[cfg(feature = "diagnostics")]
         let split = Split::begin();
@@ -7488,9 +7490,10 @@ impl std::hash::Hasher for AddressHash {
 static SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
 
 /// Since the last frame-rate line: flushes of refreshes, their refreshes,
-/// those known to copy nothing, and those done on several threads.
+/// those known to copy nothing, those in wide groups, buffer refresh fan-outs,
+/// and submissions that reached the lists' steps.
 #[cfg(feature = "diagnostics")]
-static FLUSHES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static FLUSHES: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Counts into [`SPLIT`].
 #[cfg(feature = "diagnostics")]
@@ -7519,6 +7522,7 @@ impl Split {
 fn split_line(frames: f64) {
     let ms: Vec<f64> = SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
     let f: Vec<f64> = FLUSHES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let fanouts = f[4] / f[5].max(1.0 / frames);
     let e: Vec<f64> = crate::watch::early_asks().iter().map(|&n| n as f64 / frames).collect();
     let a: Vec<f64> = crate::watch::asks().iter().map(|&n| n as f64 / frames).collect();
     let h: Vec<f64> = crate::draw::HEAP_SPLIT.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
@@ -7526,7 +7530,7 @@ fn split_line(frames: f64) {
     tracing::info!(
         "preparing per frame, the submitting thread: {:.1} ms asking the write watch ({:.1} of them finding what to ask), {:.1} putting the title's bytes under flights' \
          writes, {:.1} in the lists' steps (refreshes {:.1} in {:.0} flushes of {:.0}, {:.0} of them known to copy nothing, {:.0} on \
-         several threads, {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
+         several threads, {:.2} buffer-refresh fan-outs per submission, {:.1} one at a time in {:.0} before shader writes; copies and fills {:.1}, the refreshes before copies among them), {:.1} snapshots, {:.1} for copies in the \
          card's memory, {:.1} sending the lists (VICTORY_LIGHT_REFRESH is {}); ahead of these {:.1} waiting for the submission lock, {:.1} \
          planning steps done on the card, {:.1} waiting for flights, {:.1} the heaps' records and what is swept; at the end {:.1} waiting \
          for the heaps' records; asked early by a thread of its own {:.0} pieces of 2 MiB, {:.1} ms (VICTORY_ASK_EARLY)",
@@ -7539,6 +7543,7 @@ fn split_line(frames: f64) {
         f[1],
         f[2],
         f[3],
+        fanouts,
         ms[9],
         ms[10] * 1e6,
         ms[7],
@@ -7887,6 +7892,29 @@ fn wide_textures() -> bool {
 }
 
 impl Batch {
+    fn unchanged(shadow: &crate::shadow::Shadow, from: usize, to: usize) -> bool {
+        (crate::watch::skip_empty_refreshes() && shadow.nothing_new_quick(from, to - from))
+            || shadow.nothing_new(from, to - from)
+    }
+
+    fn filter_refreshes(spans: &mut Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>, quick_only: bool) {
+        #[cfg(feature = "diagnostics")]
+        let all = spans.len();
+        spans.retain(|(shadow, from, to)| {
+            if quick_only { !shadow.nothing_new_quick(*from, *to - *from) } else { !Self::unchanged(shadow, *from, *to) }
+        });
+        #[cfg(feature = "diagnostics")]
+        FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+    }
+
+    fn refresh_fanout(n: usize) {
+        #[cfg(feature = "diagnostics")]
+        if n > 1 {
+            FLUSHES[4].fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = n;
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -7923,7 +7951,7 @@ impl Batch {
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        if !(crate::watch::light() && shadow.nothing_new(from, to - from)) {
+        if !(crate::watch::light() && Self::unchanged(&shadow, from, to)) {
             Self::update(&shadow, from, to);
         }
         #[cfg(feature = "diagnostics")]
@@ -8013,34 +8041,40 @@ impl Batch {
         const FEW: usize = 256;
         let mut spans = spans;
         let many = spans.len() > FEW;
+        let skip = crate::watch::skip_empty_refreshes();
         if !many {
-            #[cfg(feature = "diagnostics")]
-            let all = spans.len();
-            spans.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
-            #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - spans.len()) as u64, Ordering::Relaxed);
+            Self::filter_refreshes(&mut spans, false);
+        } else if skip {
+            Self::filter_refreshes(&mut spans, true);
         }
         let ahead = spans.len() > 1;
         if ahead {
             let ranges: Vec<(usize, usize)> = spans.iter().filter(|r| r.0.asked_ahead()).map(|r| (r.1, r.2)).collect();
             crate::watch::ask_ahead(&ranges);
         }
+        if many && skip {
+            Self::filter_refreshes(&mut spans, false);
+        }
         #[cfg(feature = "diagnostics")]
         FLUSHES[3].fetch_add(spans.len() as u64, Ordering::Relaxed);
-        crate::shadow::wide_each(spans.len() + due.len(), move |i| {
-            // The textures first: they are the longer pieces.
-            let Some(i) = i.checked_sub(due.len()) else {
-                due[i].refresh();
-                return;
-            };
-            let (shadow, from, to) = &spans[i];
-            if many && shadow.nothing_new(*from, *to - *from) {
-                #[cfg(feature = "diagnostics")]
-                FLUSHES[2].fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            Self::update(shadow, *from, *to);
-        });
+        let jobs = spans.len() + due.len();
+        Self::refresh_fanout(jobs);
+        if !skip || jobs != 0 {
+            crate::shadow::wide_each(jobs, move |i| {
+                // The textures first: they are the longer pieces.
+                let Some(i) = i.checked_sub(due.len()) else {
+                    due[i].refresh();
+                    return;
+                };
+                let (shadow, from, to) = &spans[i];
+                if many && !skip && shadow.nothing_new(*from, *to - *from) {
+                    #[cfg(feature = "diagnostics")]
+                    FLUSHES[2].fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                Self::update(shadow, *from, *to);
+            });
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
@@ -8074,7 +8108,7 @@ impl Batch {
                 });
             }
         }
-        let due: Vec<_> = written_spans(touches.into_iter())
+        let mut due: Vec<_> = written_spans(touches.into_iter())
             .into_iter()
             .filter_map(|(key, from, to)| Some((copies.get(&key)?.clone(), from, to)))
             .collect();
@@ -8085,12 +8119,20 @@ impl Batch {
         let began = std::time::Instant::now();
         let started = std::time::Instant::now();
         let before = PREPARING[0].load(Ordering::Relaxed);
-        crate::shadow::wide_each(due.len(), move |i| {
-            let (shadow, from, to) = &due[i];
-            if !shadow.nothing_new(*from, *to - *from) {
-                Self::update(shadow, *from, *to);
-            }
-        });
+        let skip = crate::watch::skip_empty_refreshes();
+        if skip {
+            // This path has its own timing bucket in the frame line.
+            due.retain(|(shadow, from, to)| !Self::unchanged(shadow, *from, *to));
+        }
+        Self::refresh_fanout(due.len());
+        if !skip || !due.is_empty() {
+            crate::shadow::wide_each(due.len(), move |i| {
+                let (shadow, from, to) = &due[i];
+                if skip || !shadow.nothing_new(*from, *to - *from) {
+                    Self::update(shadow, *from, *to);
+                }
+            });
+        }
         // The time counted is the time it took, not the threads' sum.
         let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
         PREPARING[0].fetch_sub(summed.saturating_sub(started.elapsed().as_micros() as u64), Ordering::Relaxed);
@@ -8170,14 +8212,14 @@ impl Batch {
         // once a frame: on the threads, below.)
         const FEW: usize = 256;
         let light = crate::watch::light();
+        let skip = crate::watch::skip_empty_refreshes();
+        let many = self.refreshes.len() > FEW;
         if light && self.refreshes.len() <= FEW {
             let started = std::time::Instant::now();
-            #[cfg(feature = "diagnostics")]
-            let all = self.refreshes.len();
-            self.refreshes.retain(|(shadow, from, to)| !shadow.nothing_new(*from, *to - *from));
+            Self::filter_refreshes(&mut self.refreshes, false);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
-            #[cfg(feature = "diagnostics")]
-            FLUSHES[2].fetch_add((all - self.refreshes.len()) as u64, Ordering::Relaxed);
+        } else if skip {
+            Self::filter_refreshes(&mut self.refreshes, true);
         }
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -8193,12 +8235,16 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
+        if many && skip {
+            Self::filter_refreshes(&mut self.refreshes, false);
+        }
         if wide_refresh() && self.refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
+            Self::refresh_fanout(self.refreshes.len());
             #[cfg(feature = "diagnostics")]
             FLUSHES[3].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
             if light {
@@ -8206,7 +8252,7 @@ impl Batch {
                 let refreshes = std::mem::take(&mut self.refreshes);
                 crate::shadow::wide_each(refreshes.len(), move |i| {
                     let (shadow, from, to) = &refreshes[i];
-                    if refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
+                    if !skip && refreshes.len() > FEW && shadow.nothing_new(*from, *to - *from) {
                         #[cfg(feature = "diagnostics")]
                         FLUSHES[2].fetch_add(1, Ordering::Relaxed);
                         return;
@@ -10000,6 +10046,52 @@ mod refresh_tests {
             batch.flush();
         }
         crate::watch::ask_once_end();
+    }
+
+    /// An isolated counter check for both a wholly empty large flush and
+    /// a large flush with one real refresh. Run twice with the switch off/on.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "reads process-wide diagnostic counters; run in isolation"]
+    fn known_empty_refresh_fanouts() {
+        use super::{FLUSHES, Ordering};
+
+        assert!(super::wide_refresh() && crate::watch::once() && crate::watch::light());
+        const N: usize = 300;
+        const SAMPLES: u64 = 8;
+        let start = title(N * PAGE, false);
+        let data = memory(N * PAGE);
+        assert_ne!(start, 0);
+        assert!(!data.is_null());
+        // SAFETY: these are this test's two disjoint allocations.
+        unsafe { std::ptr::write_bytes(start as *mut u8, 1, N * PAGE) };
+        let spans: Vec<_> = (0..N)
+            .map(|index| {
+                let offset = index * PAGE;
+                let at = start + offset;
+                // SAFETY: each copy owns a different page of the allocation.
+                (Shadow::unbacked(at as u64, unsafe { data.add(offset) }, PAGE as u64, false), at, PAGE)
+            })
+            .collect();
+        submission(&spans, 1);
+        let skipped = crate::watch::skip_empty_refreshes();
+        for changed in [false, true] {
+            let before = [2, 4].map(|k| FLUSHES[k].load(Ordering::Relaxed));
+            for i in 0..SAMPLES {
+                if changed {
+                    // SAFETY: each write is to this test's title allocation.
+                    unsafe { (start as *mut u8).write_volatile(2 + i as u8) };
+                }
+                submission(&spans, 1);
+                // SAFETY: the batch has joined every refresh of this mapping.
+                assert_eq!(unsafe { data.read() }, if changed { 2 + i as u8 } else { 1 });
+            }
+            let [empty, fanouts] = [2, 4].map(|k| FLUSHES[k].load(Ordering::Relaxed));
+            let (empty, fanouts) = (empty - before[0], fanouts - before[1]);
+            assert_eq!(empty, SAMPLES * (N as u64 - u64::from(changed)));
+            assert_eq!(fanouts, if skipped { 0 } else { SAMPLES });
+            println!("empty-refresh switch={skipped}, changed={changed}, {empty} skipped refreshes, {fanouts}/{SAMPLES} fan-outs");
+        }
     }
 
     /// Whatever is written where, by the title or by us, and whichever
