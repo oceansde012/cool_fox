@@ -58,7 +58,7 @@ impl Journal {
     /// Page `page` was found written by asking `now`: the parts in `parts`
     /// (a bit each). The asking that found it written before (0: none).
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
-        let before = self.written.insert(page, now).unwrap_or(0);
+        let before = self.written.insert(page, now);
         if parts == WHOLE || !parts_on() {
             self.parts.remove(&page);
             return before;
@@ -118,9 +118,59 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     })
 }
 
+/// Page number → the asking that last found it written, of the pages ever
+/// found written: in pieces of [`PIECE`] pages, each made when a page
+/// of it is first written. A look at a range of pages is a lookup for each
+/// piece it lies in.
+///
+/// It was a tree of every page ever written (B-tree of some hundred thousand
+/// pages): its lookups, under the journal's lock, some 10,000 a frame from the
+/// refreshes' looks (`Shadow::nothing_new`) and their askings, were a
+/// twentieth of the submitting thread in a timeline of the Series S cell.
+struct Written {
+    pieces: std::collections::HashMap<usize, Box<[u64; PIECE]>, std::hash::BuildHasherDefault<PageHash>>,
+}
+
+/// Pages to a piece of [`Written`]: 4 MiB of title memory.
+const PIECE: usize = 64;
+
+impl Written {
+    const fn new() -> Written {
+        Written {
+            pieces: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+        }
+    }
+
+    /// `page` was found written by asking `now` (not 0); the asking that
+    /// found it written before (0: none).
+    fn insert(&mut self, page: usize, now: u64) -> u64 {
+        let piece = self.pieces.entry(page / PIECE).or_insert_with(|| Box::new([0; PIECE]));
+        std::mem::replace(&mut piece[page % PIECE], now)
+    }
+
+    /// The asking that last found `page` written, if one did.
+    #[cfg(test)]
+    fn get(&self, page: usize) -> Option<u64> {
+        self.pieces.get(&(page / PIECE)).map(|piece| piece[page % PIECE]).filter(|&w| w != 0)
+    }
+
+    /// The pages of `[first, last)` ever found written, in order, each with
+    /// the asking that last found it written.
+    fn range(&self, first: usize, last: usize) -> impl Iterator<Item = (usize, u64)> + '_ {
+        let pieces = if first < last { first / PIECE..(last - 1) / PIECE + 1 } else { 0..0 };
+        pieces.filter_map(|n| self.pieces.get(&n).map(|piece| (n, piece))).flat_map(move |(n, piece)| {
+            let (from, to) = ((n * PIECE).max(first), ((n + 1) * PIECE).min(last));
+            (from..to).filter_map(move |page| {
+                let write = piece[page % PIECE];
+                (write != 0).then_some((page, write))
+            })
+        })
+    }
+}
+
 struct Journal {
     /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
+    written: Written,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
     /// written whole, as far as anyone knows.
@@ -143,7 +193,7 @@ struct Journal {
 /// the submitting thread, and one in six of those at the six threads beside
 /// it, found it waiting for that lock (run pooloff1).
 static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
-    written: BTreeMap::new(),
+    written: Written::new(),
     parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
     ahead: Vec::new(),
     ahead_asked: 0,
@@ -657,7 +707,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead
         .iter()
         .any(|&(a, b)| a <= first && last <= b)
-        .then(|| (j.ahead_asked, j.written.range(first..last).map(|(&p, &w)| (p, w)).collect()))
+        .then(|| (j.ahead_asked, j.written.range(first, last).collect()))
 }
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
@@ -667,7 +717,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first..last).map(|(&p, &w)| (p, w)).collect() };
+    let of = |j: &Journal| -> Vec<(usize, u64)> { j.written.range(first, last).collect() };
     // Asked ahead with the submission's other ranges: the journal has it.
     let ahead = |j: &Journal| j.ahead.iter().any(|&(a, b)| a <= first && last <= b).then(|| (j.ahead_asked, of(j)));
     if let Some(known) = ahead(&journal()) {
@@ -760,7 +810,7 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         return false;
     };
     (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.written.range(first..last).all(|(&page, &write)| write <= taken[page - first].max(ranged))
+        && j.written.range(first, last).all(|(page, write)| write <= taken[page - first].max(ranged))
 }
 
 impl Tracked {
@@ -2763,7 +2813,7 @@ mod parts_tests {
     #[test]
     fn the_parts_of_a_page_written_since_it_was_taken() {
         let mut j = Journal {
-            written: BTreeMap::new(),
+            written: Written::new(),
             parts: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
             ahead: Vec::new(),
             ahead_asked: 0,
@@ -2785,6 +2835,33 @@ mod parts_tests {
         // A page never written before: what was not named was never written.
         assert_eq!(j.note(9, 0b100, 9), 0);
         assert_eq!(j.parts_since(9, 5), 0b100);
+    }
+
+    /// The pieces answer for any range what a tree of the same pages does.
+    #[test]
+    fn the_pieces_say_what_a_tree_of_the_pages_says() {
+        let mut written = Written::new();
+        let mut tree = BTreeMap::new();
+        let mut seed = 0x9e37_79b9_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for now in 1..5000u64 {
+            // Pages clustered in two places, one of them across pieces' ends.
+            let page = if now.is_multiple_of(3) { 1_000_000 + next() % 300 } else { 10 * PIECE - 150 + next() % 300 };
+            assert_eq!(written.insert(page, now), tree.insert(page, now).unwrap_or(0));
+        }
+        for _ in 0..2000 {
+            let first = [0, 1_000_000 - 50, 10 * PIECE - 200][next() % 3] + next() % 400;
+            let last = first + [0, 1, 2, 63, 64, 65, 500][next() % 7];
+            let want: Vec<(usize, u64)> = tree.range(first..last).map(|(&p, &w)| (p, w)).collect();
+            assert_eq!(written.range(first, last).collect::<Vec<_>>(), want, "{first}..{last}");
+            assert_eq!(written.get(first), tree.get(&first).copied());
+        }
+        assert_eq!(written.range(5, 5).count(), 0);
     }
 }
 
@@ -3178,7 +3255,7 @@ mod tests {
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE) as *mut u8).write_volatile(1) };
         ask_rest(&ranges);
-        let last = journal().written.get(&(p / PAGE + 1)).copied();
+        let last = journal().written.get(p / PAGE + 1);
         ask_once_end();
         assert!(last.is_some_and(|last| last > copied), "{last:?} is not after {copied}");
         // SAFETY: our allocation.
