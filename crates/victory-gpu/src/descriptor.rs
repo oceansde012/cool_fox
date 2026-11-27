@@ -168,6 +168,42 @@ fn sync_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0"))
 }
 
+#[cfg(windows)]
+fn sync_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_WIDE"))
+}
+
+/// Ask about disjoint page ranges, then reconstruct the same ordered spans
+/// as a single take. Never split a watch page or retire a partial one.
+#[cfg(windows)]
+fn take_heap_pages(written: &crate::watch::Tracked, start: usize, end: usize) -> Vec<(usize, usize)> {
+    use crate::watch::PAGE;
+    let first = start / PAGE;
+    let pages = end.div_ceil(PAGE) - first;
+    let grain = pages.div_ceil(4).max(256);
+    if pages <= grain {
+        return written.take(start, end);
+    }
+    let chunks: Vec<std::sync::Mutex<Vec<(usize, usize)>>> =
+        (0..pages.div_ceil(grain)).map(|_| Default::default()).collect();
+    crate::land::each_view(true, chunks.len(), &|i| {
+        let from = ((first + i * grain) * PAGE).max(start);
+        let to = ((first + ((i + 1) * grain).min(pages)) * PAGE).min(end);
+        *chunks[i].lock().unwrap_or_else(|e| e.into_inner()) = written.take(from, to);
+    });
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for chunk in chunks {
+        for (from, to) in chunk.into_inner().unwrap_or_else(|e| e.into_inner()) {
+            match ranges.last_mut() {
+                Some((_, last)) if *last == from => *last = to,
+                _ => ranges.push((from, to)),
+            }
+        }
+    }
+    ranges
+}
+
 /// Whether a submission's [`sync_heaps`] is done by a thread of its own
 /// beside the rest of the preparing (`VICTORY_HEAP_SYNC_ASIDE=0`: in front of
 /// it, as before).
@@ -307,6 +343,9 @@ pub(crate) fn sync_heaps() {
     let mut kinds = [0u64; 5];
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
+    let wide = sync_wide();
+    let page_grain = if wide { 2 } else { SYNC_PAGES };
+    let slot_grain = if wide { 128 } else { SYNC_AT_A_TIME };
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -324,8 +363,8 @@ pub(crate) fn sync_heaps() {
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        crate::land::each_view(true, before.len().div_ceil(slot_grain), &|n| {
+            for &index in before.chunks(slot_grain).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
@@ -340,7 +379,11 @@ pub(crate) fn sync_heaps() {
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
-        let taken = written.take(start as usize, end as usize);
+        let taken = if wide {
+            take_heap_pages(written, start as usize, end as usize)
+        } else {
+            written.take(start as usize, end as usize)
+        };
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
@@ -356,12 +399,12 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
-        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
+        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(page_grain).map(|_| Default::default()).collect();
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
+            for &(from, to) in parts.chunks(page_grain).nth(n).unwrap_or_default() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
@@ -451,8 +494,8 @@ pub(crate) fn sync_heaps() {
         }
         spent[1] += since(began);
         let began = std::time::Instant::now();
-        crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        crate::land::each_view(true, make.len().div_ceil(slot_grain), &|n| {
+            for &index in make.chunks(slot_grain).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
         });
