@@ -5692,4 +5692,1665 @@ mod tests {
         }
         m.write();
     }
+
+    #[test]
+    fn default_63_leaves_all_opt_in_passes_off() {
+        assert_eq!(DEFAULT, 63);
+        let opt_all = ALL & !WIDE;
+        assert_eq!(opt_all, 4031);
+
+        // Single module combining triggers for EXT_FOLD, MEM_FWD, LICM, BARRIERS, and SPEC_LICM:
+        // `DEFAULT = 63` must leave all four untouched while `ALL & !WIDE` (1983)
+        // triggers all four.
+        let build = || {
+            let mut k = kit();
+            let (i32t, void) = (k.m.int(32), k.m.void());
+            let bty = k.m.func_ty(void, vec![i32t, i32t]);
+            k.m.ptr(bty);
+            let barrier = k.m.function("dx.op.barrier", bty, Some(Attr::NoDuplicate), false);
+            let arr = k.m.array(4, i32t);
+            let priv_g = k.m.global("p_g", arr, 0);
+            let lds = k.m.global("s_g", arr, 3);
+            let (k0, k1, k4, k8, k9, k80) = (
+                k.m.i32(0),
+                k.m.i32(1),
+                k.m.i32(4),
+                k.m.i32(8),
+                k.m.i32(9),
+                k.m.i32(80),
+            );
+            let x = k.m.call(k.b, k.reads, vec![k0, k1]);
+            // EXT_FOLD trigger: `mul x, 8` -> `shl x, 3`.
+            let mul8 = k.m.bin(k.b, Bin::Mul, x, k8);
+            // MEM_FWD trigger: private store -> barrier -> private load (forwarded only under MEM_FWD).
+            let p0 = k.m.element(k.b, priv_g, k0);
+            k.m.store(k.b, p0, mul8);
+            // BARRIERS trigger: duplicate adjacent `barrier(9)` calls.
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            k.m.call(k.b, barrier, vec![k80, k9]);
+            let p0_after_bar = k.m.load(k.b, p0);
+            let lds0 = k.m.element(k.b, lds, k0);
+            k.m.store(k.b, lds0, p0_after_bar);
+            // LICM trigger: pure invariant `x + 4` inside loop header, plus
+            // SPEC_LICM trigger: pure invariant `x ^ 4` inside a conditional
+            // loop block.
+            let (head, guarded, latch, exit) = (
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+                k.m.new_block(),
+            );
+            k.m.terminate(k.b, Term::Br(head));
+            let idx = k.m.phi(head, i32t);
+            let inv = k.m.bin(head, Bin::Add, x, k4);
+            let cond = k.m.cmp(head, pred::NE, x, k0);
+            k.m.terminate(head, Term::CondBr(cond, guarded, latch));
+            let spec_inv = k.m.bin(guarded, Bin::Xor, x, k4);
+            let sum = k.m.bin(guarded, Bin::Add, inv, spec_inv);
+            let sum = k.m.bin(guarded, Bin::Add, sum, idx);
+            k.m.call(guarded, k.writes, vec![p0_after_bar, sum]);
+            k.m.terminate(guarded, Term::Br(latch));
+            let next = k.m.bin(latch, Bin::Add, idx, k1);
+            let more = k.m.cmp(latch, pred::IULT, next, k4);
+            k.m.terminate(latch, Term::CondBr(more, head, exit));
+            k.m.set_phi(idx, vec![(k0, k.b), (next, latch)]);
+            k.m.terminate(exit, Term::Ret);
+            (k.m, k.b, head, guarded, mul8, p0_after_bar, inv, spec_inv)
+        };
+
+        let inst_id = |v: V| match v {
+            V::Inst(id) => id,
+            other => panic!("expected V::Inst, got {other:?}"),
+        };
+        let count_barriers = |m: &Module, b: usize| {
+            m.blocks[b]
+                .body
+                .iter()
+                .filter(|&&id| {
+                    matches!(
+                        &m.insts[id as usize].op,
+                        Op::Call(f, _) if m.funcs[*f as usize].name == "dx.op.barrier"
+                    )
+                })
+                .count()
+        };
+
+        let (mut m_def, entry, head, guarded, mul8, p0_ld, inv, spec_inv) = build();
+        m_def.optimise(DEFAULT);
+        assert!(
+            matches!(m_def.insts[inst_id(mul8) as usize].op, Op::Bin(Bin::Mul, ..)),
+            "DEFAULT=63 must leave EXT_FOLD off"
+        );
+        assert!(
+            m_def.blocks[entry].body.contains(&inst_id(p0_ld)),
+            "DEFAULT=63 must leave MEM_FWD off"
+        );
+        assert!(
+            m_def.blocks[head].body.contains(&inst_id(inv)),
+            "DEFAULT=63 must leave LICM off"
+        );
+        assert!(
+            m_def.blocks[guarded].body.contains(&inst_id(spec_inv)),
+            "DEFAULT=63 must leave SPEC_LICM off"
+        );
+        assert_eq!(count_barriers(&m_def, entry), 2, "DEFAULT=63 must leave BARRIERS off");
+
+        let (mut m_all, entry, head, guarded, mul8, p0_ld, inv, spec_inv) = build();
+        m_all.optimise(opt_all);
+        assert!(
+            matches!(m_all.insts[inst_id(mul8) as usize].op, Op::Bin(Bin::Shl, ..)),
+            "ALL&!WIDE must enable EXT_FOLD"
+        );
+        assert!(
+            !m_all.blocks[entry].body.contains(&inst_id(p0_ld)),
+            "ALL&!WIDE must enable MEM_FWD"
+        );
+        assert!(
+            m_all.blocks[entry].body.contains(&inst_id(inv))
+                && !m_all.blocks[head].body.contains(&inst_id(inv)),
+            "ALL&!WIDE must enable LICM"
+        );
+        assert!(
+            m_all.blocks[entry].body.contains(&inst_id(spec_inv))
+                && !m_all.blocks[guarded].body.contains(&inst_id(spec_inv)),
+            "ALL&!WIDE must enable SPEC_LICM"
+        );
+        assert_eq!(count_barriers(&m_all, entry), 1, "ALL&!WIDE must enable BARRIERS");
+    }
+
+    // ---- dxil.dll validation, hardware GPU parity & GPU timestamps ----
+
+    #[cfg(windows)]
+    mod hw_tests {
+        use super::*;
+        use crate::emit::host::{Dispatch, Host, Root, View};
+        use crate::emit::shader::Shader;
+        use crate::emit::{HostShader, lower, validator, with_shader_opt};
+        use crate::native::{
+            ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo,
+            UsedResource,
+        };
+        use crate::{io, ir, resource, structure};
+
+        /// All passes including opt-in `EXT_FOLD | MEM_FWD | LICM | BARRIERS | SPEC_LICM` (without `WIDE`).
+        const OPT_ALL: u32 = ALL & !WIDE;
+
+        fn hw_host() -> Option<Host> {
+            match Host::new(false) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    if std::env::var("VICTORY_REQUIRE_HW_GPU").is_ok_and(|v| v == "1") {
+                        panic!("VICTORY_REQUIRE_HW_GPU=1 but no SM 6.6 hardware GPU: {e}");
+                    }
+                    eprintln!("no SM 6.6 hardware device; skipped ({e})");
+                    None
+                }
+            }
+        }
+
+        fn validate_dxil(dxil: &[u8]) {
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                let mut copy = dxil.to_vec();
+                let ours = copy[4..20].to_vec();
+                v.validate(&mut copy).expect("dxil.dll validation failed");
+                assert_eq!(copy[4..20], ours[..], "DXIL container hash mismatch");
+            }
+        }
+
+        /// Builds a realistic SM 6.6 compute shader with a conditional-entry loop
+        /// containing loop-invariant CBV loads, heap handle creation, transcendental +
+        /// algebraic/shift/div-by-pow2/select/zext chains, a dynamic-divisor negative
+        /// control, and IEEE-754 NaN compare negation.
+        fn build_loop_licm_fold_cs(
+            passes: u32,
+            iters: u32,
+        ) -> (HostShader, usize, usize, std::time::Duration) {
+            let t0 = std::time::Instant::now();
+            let (dxil, inst_count, loop_insts) = with_shader_opt(passes, || {
+                let mut s = Shader::new(false);
+                s.threads = Some([64, 1, 1]);
+                s.user_data = 4;
+                let ud = s.user_data_handle();
+                let (e, i32t, f32t) = (s.entry, s.t.i32, s.t.f32);
+                let (k0, k1, k2, k3, k4, k5, k7, k8, k16, k31) = (
+                    s.m.i32(0),
+                    s.m.i32(1),
+                    s.m.i32(2),
+                    s.m.i32(3),
+                    s.m.i32(4),
+                    s.m.i32(5),
+                    s.m.i32(7),
+                    s.m.i32(8),
+                    s.m.i32(16),
+                    s.m.i32(31),
+                );
+                let yes = s.m.bool(true);
+                let no = s.m.bool(false);
+                let tid = s.op(e, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+                let cb0 =
+                    s.op(e, "cbufferLoadLegacy.i32", Attr::ReadOnly, s.t.cbuf_ret, 59, &[ud, k0]);
+                let seed = s.m.extract(e, cb0, 0);
+                let limit = s.m.extract(e, cb0, 1);
+                let dyn_div = s.m.extract(e, cb0, 2); // non-zero when loop runs; 0 when limit == 0
+                let fbits = s.m.extract(e, cb0, 3);
+                let enter = s.m.cmp(e, pred::IUGT, limit, k0);
+                let (head, exit) = (s.m.new_block(), s.m.new_block());
+                s.m.terminate(e, Term::CondBr(enter, head, exit));
+
+                let i_phi = s.m.phi(head, i32t);
+                let acc_phi = s.m.phi(head, i32t);
+                let cb_in = s.op(
+                    head,
+                    "cbufferLoadLegacy.i32",
+                    Attr::ReadOnly,
+                    s.t.cbuf_ret,
+                    59,
+                    &[ud, k0],
+                );
+                let s_in = s.m.extract(head, cb_in, 0);
+                let base = s.m.bin(head, Bin::Add, tid, s_in);
+                let bf = s.m.cast(head, Cast::UiToFp, base, f32t);
+                let s1 = s.op(head, "unary.f32", Attr::ReadNone, f32t, 13, &[bf]); // sin
+                let c1 = s.op(head, "unary.f32", Attr::ReadNone, f32t, 12, &[bf]); // cos
+                let s1_sq = s.m.bin(head, Bin::Mul, s1, s1);
+                let c1_sq = s.m.bin(head, Bin::Mul, c1, c1);
+                let sc_sum = s.m.bin(head, Bin::Add, s1_sq, c1_sq);
+                let sq = s.op(head, "unary.f32", Attr::ReadNone, f32t, 24, &[sc_sum]);
+                let inv_bits = s.m.cast(head, Cast::Bitcast, sq, i32t);
+                let m8 = s.m.bin(head, Bin::Mul, base, k8);
+                let sh = s.m.bin(head, Bin::Shl, m8, k2);
+                let d8 = s.m.bin(head, Bin::UDiv, inv_bits, k8);
+                let r16 = s.m.bin(head, Bin::URem, d8, k16);
+                let a1 = s.m.bin(head, Bin::Add, r16, k3);
+                let a2 = s.m.bin(head, Bin::Add, a1, k5);
+                let a3 = s.m.bin(head, Bin::Sub, a2, k5);
+                let x1 = s.m.bin(head, Bin::Xor, a3, k7);
+                let x2 = s.m.bin(head, Bin::Xor, x1, k7);
+                let c_lt = s.m.cmp(head, pred::IULT, x2, k16);
+                let c_not = s.m.bin(head, Bin::Xor, c_lt, yes);
+                let c_mir = s.m.cmp(head, pred::IULE, k16, x2);
+                let z = s.m.cast(head, Cast::ZExt, c_mir, i32t);
+                let z1 = s.m.bin(head, Bin::And, z, k1);
+                let z_ne = s.m.cmp(head, pred::EQ, z1, k0);
+                let b_or = s.m.select(head, z_ne, yes, c_not);
+                let b_and = s.m.select(head, b_or, c_lt, no);
+                let pick = s.m.select(head, b_and, sh, x2);
+                let xf = s.m.cast(head, Cast::Bitcast, fbits, f32t);
+                let yf = s.m.f32(1.0f32.to_bits());
+                let f_lt = s.m.cmp(head, pred::OLT, xf, yf);
+                let f_not = s.m.bin(head, Bin::Xor, f_lt, yes);
+                let f_sel = s.m.select(head, f_not, k31, k4);
+                let safe_in_loop = s.m.bin(head, Bin::UDiv, i_phi, dyn_div);
+                let h_uav = s.heap_handle(head, k0, false, false, (11 | 0x1000, 0));
+                let _ = h_uav;
+
+                let step = s.m.bin(head, Bin::Add, pick, f_sel);
+                let step = s.m.bin(head, Bin::Add, step, safe_in_loop);
+                let step = s.m.bin(head, Bin::Xor, step, i_phi);
+                let next_acc = s.m.bin(head, Bin::Add, acc_phi, step);
+                let next_i = s.m.bin(head, Bin::Add, i_phi, k1);
+                let more = s.m.cmp(head, pred::IULT, next_i, limit);
+                s.m.terminate(head, Term::CondBr(more, head, exit));
+                s.m.set_phi(i_phi, vec![(k0, e), (next_i, head)]);
+                s.m.set_phi(acc_phi, vec![(seed, e), (next_acc, head)]);
+
+                let res = s.m.phi(exit, i32t);
+                s.m.set_phi(res, vec![(seed, e), (next_acc, head)]);
+                let uav = s.heap_handle(exit, k0, false, false, (11 | 0x1000, 0));
+                let byte_off = s.m.bin(exit, Bin::Shl, tid, k2);
+                let undef = s.m.undef(i32t);
+                let mask1 = s.m.i8(1);
+                s.op(
+                    exit,
+                    "rawBufferStore.i32",
+                    Attr::NoUnwind,
+                    s.t.void,
+                    140,
+                    &[uav, byte_off, undef, res, undef, undef, undef, mask1, k4],
+                );
+                s.m.terminate(exit, Term::Ret);
+                let module_passes = passes & MODULE;
+                if module_passes != 0 {
+                    s.m.optimise(module_passes);
+                }
+                let insts = s.m.census().counts[0] as usize;
+                let loop_insts = s.m.blocks[head].body.len();
+                let dxil = with_shader_opt(0, || s.finish());
+                let _ = iters;
+                (dxil, insts, loop_insts)
+            });
+            let elapsed = t0.elapsed();
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil,
+                user_data: (0..4)
+                    .map(|d| crate::emit::UserData {
+                        index: d,
+                        slot: 0,
+                        root: RootType::Constants,
+                        dword: d,
+                    })
+                    .collect(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
+            };
+            (shader, inst_count, loop_insts, elapsed)
+        }
+
+        /// Builds an SM 6.6 LDS + redundant barrier + non-aliasing UAV store compute shader.
+        fn build_lds_barrier_cs(passes: u32) -> (HostShader, usize, usize, std::time::Duration) {
+            let t0 = std::time::Instant::now();
+            let (dxil, inst_count, loop_insts) = with_shader_opt(passes, || {
+                let mut s = Shader::new(false);
+                s.threads = Some([64, 1, 1]);
+                s.user_data = 4;
+                s.lds_dwords = 64;
+                let ud = s.user_data_handle();
+                let lds = s.lds();
+                let (e, i32t, void) = (s.entry, s.t.i32, s.t.void);
+                let (k0, k1, k2, k4, k9, k11, k63, k80) = (
+                    s.m.i32(0),
+                    s.m.i32(1),
+                    s.m.i32(2),
+                    s.m.i32(4),
+                    s.m.i32(9),
+                    s.m.i32(11),
+                    s.m.i32(63),
+                    s.m.i32(80),
+                );
+                let tid = s.op(e, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+                let lane = s.m.bin(e, Bin::And, tid, k63);
+                let cb0 =
+                    s.op(e, "cbufferLoadLegacy.i32", Attr::ReadOnly, s.t.cbuf_ret, 59, &[ud, k0]);
+                let k = s.m.extract(e, cb0, 0);
+                let iters = s.m.extract(e, cb0, 1);
+                let uav = s.heap_handle(e, k0, false, false, (11 | 0x1000, 0));
+                let undef = s.m.undef(i32t);
+                let mask1 = s.m.i8(1);
+
+                let (head, exit) = (s.m.new_block(), s.m.new_block());
+                s.m.terminate(e, Term::Br(head));
+                let i_phi = s.m.phi(head, i32t);
+                let acc_phi = s.m.phi(head, i32t);
+                let my_ptr = s.m.element(head, lds, lane);
+                let peer = s.m.bin(head, Bin::Xor, lane, k1);
+                let peer_ptr = s.m.element(head, lds, peer);
+                let val1 = s.m.bin(head, Bin::Add, acc_phi, k);
+                let val2 = s.m.bin(head, Bin::Add, val1, lane);
+                s.m.store(head, my_ptr, val1);
+                s.m.store(head, my_ptr, val2);
+                let self_fwd = s.m.load(head, my_ptr);
+                s.op(head, "barrier", Attr::NoDuplicate, void, 80, &[k11]);
+                let mix = s.m.bin(head, Bin::Xor, self_fwd, i_phi);
+                s.op(head, "barrier", Attr::NoDuplicate, void, 80, &[k9]);
+                s.op(head, "barrier", Attr::NoDuplicate, void, 80, &[k9]);
+                let neighbor = s.m.load(head, peer_ptr);
+                s.op(head, "barrier", Attr::NoDuplicate, void, 80, &[k9]);
+                let next_acc = s.m.bin(head, Bin::Add, mix, neighbor);
+                let next_i = s.m.bin(head, Bin::Add, i_phi, k1);
+                let more = s.m.cmp(head, pred::IULT, next_i, iters);
+                s.m.terminate(head, Term::CondBr(more, head, exit));
+                s.m.set_phi(i_phi, vec![(k0, e), (next_i, head)]);
+                s.m.set_phi(acc_phi, vec![(tid, e), (next_acc, head)]);
+
+                let byte_off = s.m.bin(exit, Bin::Shl, tid, k2);
+                s.op(
+                    exit,
+                    "rawBufferStore.i32",
+                    Attr::NoUnwind,
+                    void,
+                    140,
+                    &[uav, byte_off, undef, next_acc, undef, undef, undef, mask1, k4],
+                );
+                let _ = k80;
+                s.m.terminate(exit, Term::Ret);
+                let module_passes = passes & MODULE;
+                if module_passes != 0 {
+                    s.m.optimise(module_passes);
+                }
+                let insts = s.m.census().counts[0] as usize;
+                let loop_insts = s.m.blocks[head].body.len();
+                let dxil = with_shader_opt(0, || s.finish());
+                (dxil, insts, loop_insts)
+            });
+            let elapsed = t0.elapsed();
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil,
+                user_data: (0..4)
+                    .map(|d| crate::emit::UserData {
+                        index: d,
+                        slot: 0,
+                        root: RootType::Constants,
+                        dword: d,
+                    })
+                    .collect(),
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: Vec::new(),
+                root_srvs: Vec::new(),
+                root_uavs: Vec::new(),
+                root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
+            };
+            (shader, inst_count, loop_insts, elapsed)
+        }
+
+        /// Lowers a synthetic RDNA2/GFX10 compute loop shader (with loop-invariant
+        /// VALU arithmetic, selects, and UAV store) using `passes`.
+        fn build_gfx10_loop_cs(passes: u32) -> (HostShader, std::time::Duration) {
+            let words: [u32; 22] = [
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+                0xBE8C_0380, // s_mov_b32 s12, 0 (i = 0)
+                0xBE8D_0301, // s_mov_b32 s13, s1 (iters)
+                0x7E04_0280, // v_mov_b32 v2, 0 (acc = 0)
+                // loop body (pc = 6):
+                0x4A06_0000, // v_add_nc_u32 v3, s0, v0
+                0x3406_0683, // v_lshlrev_b32 v3, 3, v3
+                0x4A06_0687, // v_add_nc_u32 v3, 7, v3
+                0x3A08_0685, // v_xor_b32 v4, 5, v3
+                0x3A08_0885, // v_xor_b32 v4, 5, v4
+                0x4A04_0902, // v_add_nc_u32 v2, v2, v4
+                0x4A04_040C, // v_add_nc_u32 v2, s12, v2
+                0x800C_810C, // s_add_u32 s12, s12, 1
+                0xBF0A_0D0C, // s_cmp_lt_u32 s12, s13
+                0xBF85_FFF6, // s_cbranch_scc1 -10 (back to pc=6)
+                // exit:
+                0x340A_0082, // v_lshlrev_b32 v5, 2, v0
+                0xE070_1000,
+                0x8002_0205, // buffer_store_dword v2, v5, s[8:11], 0 offen
+                0xBF81_0000, // s_endpgm
+                0xBF81_0000, // padding
+                0xBF81_0000,
+            ];
+            let code: Vec<u8> = words[..20].iter().flat_map(|w| w.to_le_bytes()).collect();
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 6,
+                layout: vec![
+                    RootParam {
+                        root: RootType::Constants,
+                        table_offset_dwords: 0,
+                        sgprs: 4,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    },
+                    RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 4,
+                        slot: 1,
+                    },
+                ],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 4,
+                    slot: 1,
+                }],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 5 << 1,
+                    threads: [32, 1, 1],
+                }),
+                code,
+            };
+            let t0 = std::time::Instant::now();
+            let lowered = with_shader_opt(passes, || {
+                let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+                let st = structure::structure(&p).expect("structure");
+                let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                    .expect("resource::track");
+                let io = io::raise(&p, &native).expect("io::raise");
+                lower::lower(&lower::Parts {
+                    native: &native,
+                    p: &p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    prims: Vec::new(),
+                    mesh_stride: 0,
+                })
+                .expect("lower")
+            });
+            let elapsed = t0.elapsed();
+            let shader = HostShader {
+                stage: HwStage::Cs,
+                dxil: lowered.dxil,
+                user_data: lowered.user_data,
+                samplers: lowered.samplers,
+                static_samplers: Vec::new(),
+                root_cbvs: lowered.root_cbvs,
+                root_srvs: lowered.root_srvs,
+                root_uavs: lowered.root_uavs,
+                root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
+            };
+            (shader, elapsed)
+        }
+
+        /// Executes a compute pipeline with D3D12 hardware GPU timestamp queries and
+        /// returns `(uav_output_first_run, median_gpu_us)`.
+        #[allow(clippy::too_many_arguments)]
+        fn dispatch_timed(
+            host: &Host,
+            shader: &HostShader,
+            root_consts: &[u32],
+            uav_dwords: u32,
+            extra_srvs: usize,
+            groups: [u32; 3],
+            warmups: usize,
+            samples: usize,
+        ) -> Result<(Vec<u32>, f64), String> {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            use windows::core::Interface;
+
+            let err = |e: windows::core::Error| e.message().to_string();
+            let (root, pso) = host.compute_pipeline(shader)?;
+            let dev = &host.device;
+            // SAFETY: standard D3D12 resource/command/query lifetime management;
+            // GPU completion is fenced before every map/readback.
+            unsafe {
+                let queue: ID3D12CommandQueue = dev
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .map_err(err)?;
+                let freq = queue.GetTimestampFrequency().map_err(err)?;
+                let alloc: ID3D12CommandAllocator = dev
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .map_err(err)?;
+                let list: ID3D12GraphicsCommandList = dev
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, &pso)
+                    .map_err(err)?;
+                list.Close().map_err(err)?;
+
+                let make_buf = |heap: D3D12_HEAP_TYPE, bytes: u64, flags, state| {
+                    let mut r: Option<ID3D12Resource> = None;
+                    let desc = D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: bytes,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: flags,
+                        ..Default::default()
+                    };
+                    dev.CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        state,
+                        None,
+                        &mut r,
+                    )
+                    .map_err(err)?;
+                    r.ok_or_else(|| "no buffer".to_owned())
+                };
+
+                let uav_bytes = u64::from(uav_dwords) * 4;
+                let uav = make_buf(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    uav_bytes,
+                    D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )?;
+                let uav_rb = make_buf(
+                    D3D12_HEAP_TYPE_READBACK,
+                    uav_bytes,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                let ts_rb = make_buf(
+                    D3D12_HEAP_TYPE_READBACK,
+                    16,
+                    D3D12_RESOURCE_FLAG_NONE,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                let view_heap: ID3D12DescriptorHeap = dev
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: (extra_srvs + 1) as u32,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    })
+                    .map_err(err)?;
+                let inc = dev.GetDescriptorHandleIncrementSize(
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                ) as usize;
+                let mut cpu = view_heap.GetCPUDescriptorHandleForHeapStart();
+                let mut keep_srvs = Vec::with_capacity(extra_srvs);
+                for _ in 0..extra_srvs {
+                    let srv = make_buf(
+                        D3D12_HEAP_TYPE_UPLOAD,
+                        256,
+                        D3D12_RESOURCE_FLAG_NONE,
+                        D3D12_RESOURCE_STATE_GENERIC_READ,
+                    )?;
+                    let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_UNKNOWN,
+                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                            Buffer: D3D12_BUFFER_SRV {
+                                FirstElement: 0,
+                                NumElements: 32,
+                                StructureByteStride: 4,
+                                Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                            },
+                        },
+                    };
+                    dev.CreateShaderResourceView(&srv, Some(&srv_desc), cpu);
+                    cpu.ptr += inc;
+                    keep_srvs.push(srv);
+                }
+                let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            NumElements: uav_dwords,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                            ..Default::default()
+                        },
+                    },
+                };
+                dev.CreateUnorderedAccessView(&uav, None, Some(&uav_desc), cpu);
+                let _ = &keep_srvs;
+                let mut qheap: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut qheap,
+                )
+                .map_err(err)?;
+                let qheap = qheap.ok_or_else(|| "no query heap".to_owned())?;
+                let fence: ID3D12Fence =
+                    dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+                let mut fence_val = 0u64;
+                let mut times_us = Vec::with_capacity(samples);
+                let mut first_out = Vec::new();
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match (u.root, u.slot) {
+                        (RootType::Constants, 0) => root_consts[u.dword as usize],
+                        (RootType::Table, _) => 0,
+                        _ => 0,
+                    };
+                }
+
+                for run_idx in 0..(warmups + samples) {
+                    alloc.Reset().map_err(err)?;
+                    list.Reset(&alloc, &pso).map_err(err)?;
+                    list.SetDescriptorHeaps(&[Some(view_heap.clone())]);
+                    list.SetComputeRootSignature(&root);
+                    list.SetComputeRoot32BitConstants(0, ud.len() as u32, ud.as_ptr().cast(), 0);
+                    list.EndQuery(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    list.Dispatch(groups[0], groups[1], groups[2]);
+                    list.EndQuery(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    list.ResolveQueryData(&qheap, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &ts_rb, 0);
+                    if run_idx == 0 {
+                        let barrier = D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                Transition: std::mem::ManuallyDrop::new(
+                                    D3D12_RESOURCE_TRANSITION_BARRIER {
+                                        pResource: std::mem::transmute_copy(&uav),
+                                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                    },
+                                ),
+                            },
+                        };
+                        list.ResourceBarrier(&[barrier]);
+                        list.CopyBufferRegion(&uav_rb, 0, &uav, 0, uav_bytes);
+                        let back = D3D12_RESOURCE_BARRIER {
+                            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                Transition: std::mem::ManuallyDrop::new(
+                                    D3D12_RESOURCE_TRANSITION_BARRIER {
+                                        pResource: std::mem::transmute_copy(&uav),
+                                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                                        StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                        StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    },
+                                ),
+                            },
+                        };
+                        list.ResourceBarrier(&[back]);
+                    }
+                    list.Close().map_err(err)?;
+                    queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+                    fence_val += 1;
+                    queue.Signal(&fence, fence_val).map_err(err)?;
+                    while fence.GetCompletedValue() < fence_val {
+                        if let Err(e) = dev.GetDeviceRemovedReason() {
+                            return Err(format!("device removed: {}", err(e)));
+                        }
+                        std::thread::yield_now();
+                    }
+                    if run_idx == 0 {
+                        let mut p = std::ptr::null_mut();
+                        uav_rb.Map(0, None, Some(&mut p)).map_err(err)?;
+                        first_out =
+                            std::slice::from_raw_parts(p.cast::<u32>(), uav_dwords as usize)
+                                .to_vec();
+                        uav_rb.Unmap(0, None);
+                    }
+                    if run_idx >= warmups {
+                        let mut p = std::ptr::null_mut();
+                        ts_rb.Map(0, None, Some(&mut p)).map_err(err)?;
+                        let ts = *p.cast::<[u64; 2]>();
+                        ts_rb.Unmap(0, None);
+                        let us = (ts[1].saturating_sub(ts[0]) as f64) * 1e6 / (freq as f64);
+                        times_us.push(us);
+                    }
+                }
+                times_us.sort_by(|a, b| a.total_cmp(b));
+                let median = times_us[times_us.len() / 2];
+                Ok((first_out, median))
+            }
+        }
+
+        #[test]
+        fn dxil_opt_hw_gpu_bit_exact_parity_and_validation() {
+            let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (loop_none, insts_loop_0, loop_body_0, _) = build_loop_licm_fold_cs(0, 64);
+            let (loop_def, insts_loop_def, loop_body_def, _) = build_loop_licm_fold_cs(DEFAULT, 64);
+            let (loop_all, insts_loop_all, loop_body_all, _) = build_loop_licm_fold_cs(OPT_ALL, 64);
+            assert!(
+                insts_loop_all < insts_loop_def && loop_body_all < loop_body_def,
+                "expected OPT_ALL ({OPT_ALL}) reduction over DEFAULT ({DEFAULT}): total {insts_loop_all}/{insts_loop_def} (none={insts_loop_0}), loop {loop_body_all}/{loop_body_def} (none={loop_body_0})"
+            );
+            validate_dxil(&loop_none.dxil);
+            validate_dxil(&loop_def.dxil);
+            validate_dxil(&loop_all.dxil);
+
+            let (lds_none, insts_lds_0, lds_body_0, _) = build_lds_barrier_cs(0);
+            let (lds_def, insts_lds_def, lds_body_def, _) = build_lds_barrier_cs(DEFAULT);
+            let (lds_all, insts_lds_all, lds_body_all, _) = build_lds_barrier_cs(OPT_ALL);
+            assert!(
+                insts_lds_all < insts_lds_def && lds_body_all < lds_body_def,
+                "expected LDS/barrier reduction over DEFAULT: total {insts_lds_all}/{insts_lds_def} (none={insts_lds_0}), loop {lds_body_all}/{lds_body_def} (none={lds_body_0})"
+            );
+            validate_dxil(&lds_none.dxil);
+            validate_dxil(&lds_def.dxil);
+            validate_dxil(&lds_all.dxil);
+
+            let (gfx_none, _) = build_gfx10_loop_cs(0);
+            let (gfx_def, _) = build_gfx10_loop_cs(DEFAULT);
+            let (gfx_all, _) = build_gfx10_loop_cs(OPT_ALL);
+            assert!(gfx_all.dxil.len() < gfx_none.dxil.len());
+            validate_dxil(&gfx_none.dxil);
+            validate_dxil(&gfx_def.dxil);
+            validate_dxil(&gfx_all.dxil);
+
+            let Some(host) = hw_host() else { return };
+
+            // 1) Loop + LICM + EXT_FOLD + NaN + guarded dynamic divisor parity:
+            for consts in [
+                [17, 64, 5, f32::NAN.to_bits()],
+                [42, 64, 3, 0.5f32.to_bits()],
+                [99, 0, 0, 2.0f32.to_bits()],
+            ] {
+                let (out0, _) =
+                    dispatch_timed(&host, &loop_none, &consts, 256, 0, [4, 1, 1], 1, 1).unwrap();
+                let (out_def, _) =
+                    dispatch_timed(&host, &loop_def, &consts, 256, 0, [4, 1, 1], 1, 1).unwrap();
+                let (out_all, _) =
+                    dispatch_timed(&host, &loop_all, &consts, 256, 0, [4, 1, 1], 1, 1).unwrap();
+                assert_eq!(out_def, out0, "loop shader DEFAULT parity mismatch for {consts:?}");
+                assert_eq!(out_all, out0, "loop shader OPT_ALL parity mismatch for {consts:?}");
+            }
+
+            // 2) LDS + redundant barrier elimination parity:
+            let lds_consts = [13, 32, 0, 0];
+            let (lds_out0, _) =
+                dispatch_timed(&host, &lds_none, &lds_consts, 256, 0, [4, 1, 1], 1, 1).unwrap();
+            let (lds_out_def, _) =
+                dispatch_timed(&host, &lds_def, &lds_consts, 256, 0, [4, 1, 1], 1, 1).unwrap();
+            let (lds_out_all, _) =
+                dispatch_timed(&host, &lds_all, &lds_consts, 256, 0, [4, 1, 1], 1, 1).unwrap();
+            assert_eq!(lds_out_def, lds_out0, "LDS/barrier DEFAULT parity mismatch");
+            assert_eq!(lds_out_all, lds_out0, "LDS/barrier OPT_ALL parity mismatch");
+
+            // 3) Real GFX10 translated compute loop parity:
+            let (root0, pso0) = host.compute_pipeline(&gfx_none).unwrap();
+            let (root_a, pso_a) = host.compute_pipeline(&gfx_all).unwrap();
+            let ud = vec![11u32, 32, 0, 0, 0, 0, 0, 0];
+            let g0 = host
+                .dispatch(
+                    &root0,
+                    &pso0,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud.clone()))],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let ga = host
+                .dispatch(
+                    &root_a,
+                    &pso_a,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(ga[0], g0[0], "GFX10 translated compute loop parity mismatch");
+            for (l, &got) in ga[0].iter().enumerate() {
+                let inv = (l as u32 + 11).wrapping_mul(8).wrapping_add(7);
+                let want: u32 =
+                    (0..32u32).map(|it| inv.wrapping_add(it)).fold(0u32, u32::wrapping_add);
+                assert_eq!(got, want, "lane {l} analytical mismatch");
+            }
+
+            // 4) Real GFX10 waterfall compute shader parity (`opt=0` vs `opt=OPT_ALL`):
+            let wf_build = |passes: u32| -> HostShader {
+                let words = crate::resource::tests::WATERFALL_JOINED_BUFFER_WAVE32;
+                let table = |user_data: u8| RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data,
+                    slot: user_data,
+                };
+                let range = |kind, table_offset_dwords, dwords, stride, user_data| UsedResource {
+                    kind,
+                    root: RootType::Table,
+                    table_offset_dwords,
+                    lower_bound: 0,
+                    stride,
+                    dwords,
+                    user_data,
+                    slot: user_data,
+                };
+                let native = NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64: false,
+                    vgprs: 32,
+                    layout: vec![table(0), table(1)],
+                    used: vec![
+                        range(ResourceType::Srv, 0, 4, 4, 0),
+                        range(ResourceType::Uav, 16, 4, 0, 0),
+                        range(ResourceType::Sampler, 0, 4, 0, 1),
+                    ],
+                    io: StageIo::Cs(ComputeIo {
+                        rsrc2: 2 << 1,
+                        threads: [32, 1, 1],
+                    }),
+                    code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+                };
+                let lowered = with_shader_opt(passes, || {
+                    let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+                    let st = structure::structure(&p).unwrap();
+                    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+                    let io = io::raise(&p, &native).unwrap();
+                    lower::lower(&lower::Parts {
+                        native: &native,
+                        p: &p,
+                        st: &st,
+                        io: &io,
+                        res: &res,
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        prims: Vec::new(),
+                        mesh_stride: 0,
+                    })
+                    .unwrap()
+                });
+                let shader = HostShader {
+                    stage: HwStage::Cs,
+                    dxil: lowered.dxil,
+                    user_data: lowered.user_data,
+                    samplers: lowered.samplers,
+                    static_samplers: Vec::new(),
+                    root_cbvs: lowered.root_cbvs,
+                    root_srvs: lowered.root_srvs,
+                    root_uavs: lowered.root_uavs,
+                    root_indexed_views: Vec::new(),
+                    half_views: Vec::new(),
+                };
+                validate_dxil(&shader.dxil);
+                shader
+            };
+            let wf0 = wf_build(0);
+            let wfa = wf_build(OPT_ALL);
+            assert!(wfa.dxil.len() < wf0.dxil.len(), "waterfall shader should shrink");
+            let first: Vec<u32> = (0..32).map(|i| 100 + i).collect();
+            let second: Vec<u32> = (0..32).map(|i| 200 + i).collect();
+            let wf_views = [
+                View::Buffer {
+                    data: &first,
+                    stride: crate::emit::host::Stride::Structured(4),
+                },
+                View::Buffer {
+                    data: &second,
+                    stride: crate::emit::host::Stride::Structured(4),
+                },
+                View::RawUav(32),
+            ];
+            let (wf_r0, wf_p0) = host.compute_pipeline(&wf0).unwrap();
+            let (wf_ra, wf_pa) = host.compute_pipeline(&wfa).unwrap();
+            let wf_ud0 = vec![0u32; wf0.user_data_dwords().max(1) as usize];
+            let wf_uda = vec![0u32; wfa.user_data_dwords().max(1) as usize];
+            let out_wf0 = host
+                .dispatch(
+                    &wf_r0,
+                    &wf_p0,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(wf_ud0))],
+                        views: &wf_views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let out_wfa = host
+                .dispatch(
+                    &wf_ra,
+                    &wf_pa,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(wf_uda))],
+                        views: &wf_views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            assert_eq!(out_wfa[0], out_wf0[0], "waterfall compute shader parity mismatch");
+        }
+
+        #[test]
+        fn split_lds_wave32_read_after_read_barrier_coalescing_and_parity() {
+            let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+
+            let dump_lds_pattern = |container: &[u8]| -> Option<String> {
+                let dxc = match std::env::var_os("VICTORY_PC_DXC") {
+                    Some(p) => std::path::PathBuf::from(p),
+                    None => validator::Validator::default_path()?.with_file_name("dxc.exe"),
+                };
+                if !dxc.exists() {
+                    return None;
+                }
+                let file = std::env::temp_dir().join(format!(
+                    "victory-rar-{}-{:?}.dxil",
+                    std::process::id(),
+                    std::thread::current().id()
+                ));
+                std::fs::write(&file, container).ok()?;
+                let out = std::process::Command::new(dxc)
+                    .arg("-dumpbin")
+                    .arg(&file)
+                    .output()
+                    .ok()?;
+                let _ = std::fs::remove_file(&file);
+                assert!(
+                    out.status.success(),
+                    "dxc -dumpbin failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let text = String::from_utf8_lossy(&out.stdout);
+                Some(
+                    text.lines()
+                        .filter_map(|line| {
+                            let t = line.trim_start();
+                            if t.contains("call void @dx.op.barrier(") {
+                                Some('B')
+                            } else if line.contains("load i32, i32 addrspace(3)*") {
+                                Some('R')
+                            } else if t.starts_with("store i32") && line.contains("addrspace(3)*") {
+                                Some('W')
+                            } else if t.contains("atomicrmw ") && line.contains("addrspace(3)*") {
+                                Some('A')
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )
+            };
+
+            let lower_split_lds_cs = |body: &[u32], passes: u32| -> HostShader {
+                let mut words = vec![
+                    0xBE85_0380, // s_mov_b32 s5, 0
+                    0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+                    125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
+                ];
+                words.extend_from_slice(body);
+                words.push(0xBF81_0000); // s_endpgm
+                let native = NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64: true,
+                    vgprs: 16,
+                    layout: vec![
+                        RootParam {
+                            root: RootType::Constants,
+                            table_offset_dwords: 0,
+                            sgprs: 4,
+                            base_register: 0,
+                            user_data: 0,
+                            slot: 0,
+                        },
+                        RootParam {
+                            root: RootType::Table,
+                            table_offset_dwords: 0,
+                            sgprs: 1,
+                            base_register: 0,
+                            user_data: 4,
+                            slot: 1,
+                        },
+                    ],
+                    used: vec![UsedResource {
+                        kind: ResourceType::Uav,
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        lower_bound: 0,
+                        stride: 0,
+                        dwords: 4,
+                        user_data: 4,
+                        slot: 1,
+                    }],
+                    io: StageIo::Cs(ComputeIo {
+                        rsrc2: (5 << 1) | (1 << 15), // 5 user SGPRs + 64 dwords LDS
+                        threads: [64, 1, 1],
+                    }),
+                    code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+                };
+                let lowered = with_shader_opt(passes, || {
+                    let p =
+                        ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+                    let st = structure::structure(&p).expect("structure");
+                    let res = resource::track(&p, &native.layout, native.stage, Some(&st))
+                        .expect("resource::track");
+                    let io = io::raise(&p, &native).expect("io::raise");
+                    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+                    let res_lower = lower::lower(&lower::Parts {
+                        native: &native,
+                        p: &p,
+                        st: &st,
+                        io: &io,
+                        res: &res,
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                        prims: Vec::new(),
+                        mesh_stride: 0,
+                    });
+                    lower::TEST_HOST_WAVE.set(was);
+                    res_lower.expect("lower split_lds Wave32")
+                });
+                assert_eq!(lowered.wave_size, Some(32), "expected Wave32 split_lds lowering");
+                let shader = HostShader {
+                    stage: HwStage::Cs,
+                    dxil: lowered.dxil,
+                    user_data: lowered.user_data,
+                    samplers: lowered.samplers,
+                    static_samplers: Vec::new(),
+                    root_cbvs: lowered.root_cbvs,
+                    root_srvs: lowered.root_srvs,
+                    root_uavs: lowered.root_uavs,
+                    root_indexed_views: Vec::new(),
+                    half_views: Vec::new(),
+                };
+                validate_dxil(&shader.dxil);
+                shader
+            };
+
+            let rar_words: [u32; 20] = [
+                0x3404_0082, // v2 = t * 4
+                0x3A06_00A0, // v3 = t ^ 32
+                0x3406_0682, // v3 = (t ^ 32) * 4
+                0xD834_0000,
+                0x0000_0002, // ds_write_b32 v2, v0
+                0xD8D8_0000,
+                0x0400_0003, // ds_read_b32 v4, v3
+                0xD8D8_0000,
+                0x0500_0002, // ds_read_b32 v5, v2
+                0x4A0E_0899, // v7 = v4 + 25
+                0xD834_0000,
+                0x0000_0702, // ds_write_b32 v2, v7
+                0xD8D8_0000,
+                0x0600_0003, // ds_read_b32 v6, v3
+                0xE070_1000,
+                0x8002_0402, // out[t] = v4
+                0xE070_1100,
+                0x8002_0502, // out[64 + t] = v5
+                0xE070_1200,
+                0x8002_0602, // out[128 + t] = v6
+            ];
+            let mut alu_between_words = rar_words.to_vec();
+            alu_between_words.insert(7, 0x7E10_0287);
+
+            let rar_end_words: [u32; 13] = [
+                0x3404_0082,
+                0x3A06_00A0,
+                0x3406_0682,
+                0xD834_0000,
+                0x0000_0002,
+                0xD8D8_0000,
+                0x0400_0003,
+                0xD8D8_0000,
+                0x0500_0002,
+                0xE070_1000,
+                0x8002_0402,
+                0xE070_1100,
+                0x8002_0502,
+            ];
+
+            let neg_wrwr_words: [u32; 16] = [
+                0x3404_0082,
+                0x3A06_00A0,
+                0x3406_0682,
+                0xD834_0000,
+                0x0000_0002,
+                0xD8D8_0000,
+                0x0400_0003,
+                0x4A0E_0899,
+                0xD834_0000,
+                0x0000_0702,
+                0xD8D8_0000,
+                0x0600_0003,
+                0xE070_1000,
+                0x8002_0402,
+                0xE070_1200,
+                0x8002_0602,
+            ];
+
+            let neg_atomic_words: [u32; 16] = [
+                0x3404_0082,
+                0x3A06_00A0,
+                0x3406_0682,
+                0x7E10_0287,
+                0xD834_0000,
+                0x0000_0002,
+                0xD8D8_0000,
+                0x0400_0003,
+                0xD800_0000,
+                0x0000_0802,
+                0xD8D8_0000,
+                0x0500_0002,
+                0xE070_1000,
+                0x8002_0402,
+                0xE070_1100,
+                0x8002_0502,
+            ];
+
+            let mut neg_uav_load_words = rar_words.to_vec();
+            neg_uav_load_words.splice(7..7, [0xE030_1000, 0x8002_0802]);
+
+            let forced_warp = std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+            let hw = hw_host();
+            let warp = Host::new(true).ok();
+
+            let check_192 = |out: &[u32], ctx: &str| {
+                for t in 0..64u32 {
+                    let i = t as usize;
+                    assert_eq!(
+                        [out[i], out[64 + i], out[128 + i]],
+                        [t ^ 32, t, t + 25],
+                        "{ctx}, thread {t}"
+                    );
+                }
+            };
+
+            for (label, body, unopt_pat, opt_pat) in [
+                ("adjacent_rar", rar_words.as_slice(), "BWBRBRBWBR", "BWBRRBWBR"),
+                (
+                    "pure_alu_between_reads",
+                    alu_between_words.as_slice(),
+                    "BWBRBRBWBR",
+                    "BWBRRBWBR",
+                ),
+                ("rar_before_ret", rar_end_words.as_slice(), "BWBRBR", "BWBRR"),
+                (
+                    "neg_write_between_reads",
+                    neg_wrwr_words.as_slice(),
+                    "BWBRBWBR",
+                    "BWBRBWBR",
+                ),
+                (
+                    "neg_atomic_between_reads",
+                    neg_atomic_words.as_slice(),
+                    "BWBRBABR",
+                    "BWBRBABR",
+                ),
+                (
+                    "neg_uav_load_between_reads",
+                    neg_uav_load_words.as_slice(),
+                    "BWBRBRBWBR",
+                    "BWBRBRBWBR",
+                ),
+            ] {
+                let s0 = lower_split_lds_cs(body, 0);
+                let sd = lower_split_lds_cs(body, DEFAULT);
+                let sb = lower_split_lds_cs(body, BARRIERS);
+                let sa = lower_split_lds_cs(body, OPT_ALL);
+                assert!(
+                    sa.dxil.len() <= s0.dxil.len(),
+                    "{label}: OPT_ALL passes should not grow DXIL ({} vs {})",
+                    sa.dxil.len(),
+                    s0.dxil.len()
+                );
+                if let Some(p0) = dump_lds_pattern(&s0.dxil) {
+                    let pd = dump_lds_pattern(&sd.dxil).expect("DEFAULT dump");
+                    let pb = dump_lds_pattern(&sb.dxil).expect("BARRIERS dump");
+                    let pa = dump_lds_pattern(&sa.dxil).expect("OPT_ALL dump");
+                    assert_eq!(p0, unopt_pat, "{label} mask=0 pattern");
+                    assert_eq!(pd, unopt_pat, "{label} mask=DEFAULT(63) leaves BARRIERS off");
+                    assert_eq!(pb, opt_pat, "{label} mask=BARRIERS pattern");
+                    assert_eq!(pa, opt_pat, "{label} mask=OPT_ALL pattern");
+                    eprintln!("{label}: opt=0 `{p0}`, DEFAULT `{pd}` -> BARRIERS `{pb}`, OPT_ALL `{pa}`");
+                }
+                for (host_name, host_opt) in [("hw", hw.as_ref()), ("warp", warp.as_ref())] {
+                    let Some(h) = host_opt else { continue };
+                    let Ok((r0, p0)) = h.compute_pipeline(&s0) else {
+                        if !forced_warp {
+                            assert_ne!(
+                                host_name, "hw",
+                                "{label}: hardware Wave32 GPU rejected PSO"
+                            );
+                        }
+                        continue;
+                    };
+                    let (rb, pb) = h.compute_pipeline(&sb).expect("BARRIERS PSO");
+                    let (ra, pa) = h.compute_pipeline(&sa).expect("OPT_ALL PSO");
+                    let run_one = |r: &_, p: &_, sh: &HostShader| -> Vec<u32> {
+                        let ud = vec![0u32; sh.user_data_dwords().max(1) as usize];
+                        h.dispatch(
+                            r,
+                            p,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(ud))],
+                                views: &[View::RawUav(192)],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .expect("dispatch")[0]
+                            .clone()
+                    };
+                    let out0 = run_one(&r0, &p0, &s0);
+                    let outb = run_one(&rb, &pb, &sb);
+                    let outa = run_one(&ra, &pa, &sa);
+                    assert_eq!(outb, out0, "{label} ({host_name}): BARRIERS vs 0 mismatch");
+                    assert_eq!(outa, out0, "{label} ({host_name}): OPT_ALL vs 0 mismatch");
+                    if label == "adjacent_rar"
+                        || label == "pure_alu_between_reads"
+                        || label == "neg_uav_load_between_reads"
+                    {
+                        check_192(&outa, &format!("{label} ({host_name})"));
+                    } else if label == "rar_before_ret" {
+                        for t in 0..64u32 {
+                            let i = t as usize;
+                            assert_eq!(
+                                [outa[i], outa[64 + i]],
+                                [t ^ 32, t],
+                                "{label} thread {t}"
+                            );
+                        }
+                    } else if label == "neg_atomic_between_reads" {
+                        for t in 0..64u32 {
+                            let i = t as usize;
+                            assert_eq!(
+                                [outa[i], outa[64 + i]],
+                                [t ^ 32, t + 7],
+                                "{label} thread {t}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Unconditional WARP execution (wave-width-neutral SM 6.6).
+            let warp = Host::new(true).expect("Microsoft D3D12 WARP adapter required");
+            let build_warp_rar_cs = |passes: u32| -> (HostShader, usize) {
+                let (dxil, barriers_left): (Vec<u8>, usize) = with_shader_opt(passes, || {
+                    let mut s = Shader::new(false);
+                    s.threads = Some([64, 1, 1]);
+                    s.user_data = 1;
+                    s.lds_dwords = 64;
+                    let lds = s.lds();
+                    let (e, i32t, void) = (s.entry, s.t.i32, s.t.void);
+                    let (k0, k2, k4, k9, k25, k32, k64, k128, k80) = (
+                        s.m.i32(0),
+                        s.m.i32(2),
+                        s.m.i32(4),
+                        s.m.i32(9),
+                        s.m.i32(25),
+                        s.m.i32(32),
+                        s.m.i32(64),
+                        s.m.i32(128),
+                        s.m.i32(80),
+                    );
+                    let _ = k80;
+                    let tid = s.op(e, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+                    let partner = s.m.bin(e, Bin::Xor, tid, k32);
+                    let self_ptr = s.m.element(e, lds, tid);
+                    let peer_ptr = s.m.element(e, lds, partner);
+
+                    s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[k9]);
+                    s.m.store(e, self_ptr, tid);
+                    s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[k9]);
+                    let r_peer = s.m.load(e, peer_ptr);
+                    s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[k9]);
+                    let r_self = s.m.load(e, self_ptr);
+                    let overwritten = s.m.bin(e, Bin::Add, r_peer, k25);
+                    s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[k9]);
+                    s.m.store(e, self_ptr, overwritten);
+                    s.op(e, "barrier", Attr::NoDuplicate, void, 80, &[k9]);
+                    let r_after = s.m.load(e, peer_ptr);
+
+                    let uav = s.heap_handle(e, k0, false, false, (11 | 0x1000, 0));
+                    let undef = s.m.undef(i32t);
+                    let mask1 = s.m.i8(1);
+                    for (base, val) in [(k0, r_peer), (k64, r_self), (k128, r_after)] {
+                        let idx = s.m.bin(e, Bin::Add, tid, base);
+                        let off = s.m.bin(e, Bin::Shl, idx, k2);
+                        s.op(
+                            e,
+                            "rawBufferStore.i32",
+                            Attr::NoUnwind,
+                            void,
+                            140,
+                            &[uav, off, undef, val, undef, undef, undef, mask1, k4],
+                        );
+                    }
+                    s.m.terminate(e, Term::Ret);
+                    let module_passes = passes & MODULE;
+                    if module_passes != 0 {
+                        s.m.optimise(module_passes);
+                    }
+                    let b_idx = crate::emit::census::KINDS
+                        .iter()
+                        .position(|&n| n == "barrier")
+                        .unwrap();
+                    let barriers_left = s.m.census().counts[b_idx] as usize;
+                    let dxil = with_shader_opt(0, || s.finish());
+                    (dxil, barriers_left)
+                });
+                validate_dxil(&dxil);
+                let shader = HostShader {
+                    stage: HwStage::Cs,
+                    dxil,
+                    user_data: Vec::new(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    root_indexed_views: Vec::new(),
+                    half_views: Vec::new(),
+                };
+                (shader, barriers_left)
+            };
+
+            let (w0, b_cnt0) = build_warp_rar_cs(0);
+            let (wd, b_cntd) = build_warp_rar_cs(DEFAULT);
+            let (wb, b_cntb) = build_warp_rar_cs(BARRIERS);
+            let (wa, b_cnta) = build_warp_rar_cs(OPT_ALL);
+            assert_eq!(b_cnt0, 5, "unoptimized fixture must have 5 barriers");
+            assert_eq!(b_cntd, 5, "DEFAULT=63 must keep all 5 barriers");
+            assert_eq!(b_cntb, 4, "BARRIERS fixture must coalesce 5 -> 4 barriers");
+            assert_eq!(b_cnta, 4, "OPT_ALL fixture must coalesce 5 -> 4 barriers");
+            for (lbl, sh) in [
+                ("warp_0", &w0),
+                ("warp_DEFAULT", &wd),
+                ("warp_BARRIERS", &wb),
+                ("warp_OPT_ALL", &wa),
+            ] {
+                let (r, p) = warp.compute_pipeline(sh).expect("WARP compute_pipeline");
+                let out = warp
+                    .dispatch(
+                        &r,
+                        &p,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            views: &[View::RawUav(192)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .expect("WARP dispatch");
+                check_192(&out[0], lbl);
+            }
+        }
+
+        #[test]
+        #[ignore = "GPU benchmark: cargo test --release -p victory-shader --locked bench_dxil_opt_hw_gpu -- --ignored --nocapture"]
+        fn bench_dxil_opt_hw_gpu() {
+            let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let host = hw_host().expect("hardware SM 6.6 GPU required for GPU benchmark");
+
+            let configs = [
+                ("opt=0 (none)", 0u32),
+                ("opt=DEFAULT (63)", DEFAULT),
+                ("opt=OPT_ALL (4031)", OPT_ALL),
+            ];
+
+            println!("\n=== Benchmark 1: Loop + LICM + EXT_FOLD + Select/ZExt (4096 groups x 64 threads, 256 iters) ===");
+            let loop_consts = [17u32, 256, 5, 0.5f32.to_bits()];
+            let mut ref_out = None;
+            for (label, mask) in configs {
+                let (shader, insts, loop_body, compile_t) = build_loop_licm_fold_cs(mask, 256);
+                validate_dxil(&shader.dxil);
+                let (out, gpu_us) = dispatch_timed(
+                    &host,
+                    &shader,
+                    &loop_consts,
+                    4096 * 64,
+                    0,
+                    [4096, 1, 1],
+                    5,
+                    25,
+                )
+                .unwrap();
+                match &ref_out {
+                    None => ref_out = Some(out),
+                    Some(r) => assert_eq!(&out, r, "parity failed for {label}"),
+                }
+                println!(
+                    "{label:<24} | insts={insts:4} (loop={loop_body:2}) | dxil={:5} B | build={:7.1} us | gpu_median={:8.2} us ({:.3} ms)",
+                    shader.dxil.len(),
+                    compile_t.as_secs_f64() * 1e6,
+                    gpu_us,
+                    gpu_us / 1e3,
+                );
+            }
+
+            println!("\n=== Benchmark 2: LDS + Redundant Barriers (4096 groups x 64 threads, 128 iters) ===");
+            let lds_consts = [13u32, 128, 0, 0];
+            let mut ref_out = None;
+            for (label, mask) in configs {
+                let (shader, insts, loop_body, compile_t) = build_lds_barrier_cs(mask);
+                validate_dxil(&shader.dxil);
+                let (out, gpu_us) = dispatch_timed(
+                    &host,
+                    &shader,
+                    &lds_consts,
+                    4096 * 64,
+                    0,
+                    [4096, 1, 1],
+                    5,
+                    25,
+                )
+                .unwrap();
+                match &ref_out {
+                    None => ref_out = Some(out),
+                    Some(r) => assert_eq!(&out, r, "parity failed for {label}"),
+                }
+                println!(
+                    "{label:<24} | insts={insts:4} (loop={loop_body:2}) | dxil={:5} B | build={:7.1} us | gpu_median={:8.2} us ({:.3} ms)",
+                    shader.dxil.len(),
+                    compile_t.as_secs_f64() * 1e6,
+                    gpu_us,
+                    gpu_us / 1e3,
+                );
+            }
+
+            println!("\n=== Benchmark 3: Real GFX10 Translated Compute Loop (8192 groups x 32 threads, 512 iters) ===");
+            let gfx_consts = [11u32, 512, 0, 0];
+            let mut ref_out = None;
+            for (label, mask) in configs {
+                let (shader, compile_t) = build_gfx10_loop_cs(mask);
+                let insts = crate::emit::census::take(&shader.dxil).map(|c| c.counts[0]);
+                validate_dxil(&shader.dxil);
+                let (out, gpu_us) = dispatch_timed(
+                    &host,
+                    &shader,
+                    &gfx_consts,
+                    8192 * 32,
+                    0,
+                    [8192, 1, 1],
+                    5,
+                    25,
+                )
+                .unwrap();
+                match &ref_out {
+                    None => ref_out = Some(out),
+                    Some(r) => assert_eq!(&out, r, "parity failed for {label}"),
+                }
+                println!(
+                    "{label:<24} | insts={insts:?} | dxil={:5} B | translate={:7.1} us | gpu_median={:8.2} us ({:.3} ms)",
+                    shader.dxil.len(),
+                    compile_t.as_secs_f64() * 1e6,
+                    gpu_us,
+                    gpu_us / 1e3,
+                );
+            }
+        }
+
+        #[test]
+        fn wave_ordered_lds_leader_election_preserved() {
+            let _one = crate::emit::valu_tests::ONE_AT_A_TIME
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let build = |passes: u32| -> (HostShader, usize) {
+                let (dxil, lds_loads) = with_shader_opt(passes, || {
+                    let mut s = Shader::new(false);
+                    s.threads = Some([32, 1, 1]);
+                    s.user_data = 4;
+                    s.lds_dwords = 8;
+                    let lds = s.lds();
+                    let (e, i32t, void) = (s.entry, s.t.i32, s.t.void);
+                    let (k0, k1, k3, k4, k16) = (
+                        s.m.i32(0),
+                        s.m.i32(1),
+                        s.m.i32(3),
+                        s.m.i32(4),
+                        s.m.i32(16),
+                    );
+                    let tid = s.op(e, "threadId.i32", Attr::ReadNone, i32t, 93, &[k0]);
+                    let uav = s.heap_handle(e, k0, false, false, (11 | 0x1000, 0));
+                    let mask4 = s.m.i8(0xf);
+
+                    let bucket = s.m.bin(e, Bin::And, tid, k3);
+                    let dyn_ptr = s.m.element(e, lds, bucket);
+                    s.m.store(e, dyn_ptr, tid);
+                    let dyn_win = s.m.load(e, dyn_ptr);
+                    let dyn_eq = s.m.cmp(e, pred::EQ, dyn_win, tid);
+                    let dyn_is_win = s.m.select(e, dyn_eq, k1, k0);
+
+                    let const_ptr = s.m.element(e, lds, k4);
+                    s.m.store(e, const_ptr, tid);
+                    let const_win = s.m.load(e, const_ptr);
+                    let const_eq = s.m.cmp(e, pred::EQ, const_win, tid);
+                    let const_is_win = s.m.select(e, const_eq, k1, k0);
+
+                    let byte_off = s.m.bin(e, Bin::Mul, tid, k16);
+                    let undef = s.m.undef(i32t);
+                    s.op(
+                        e,
+                        "rawBufferStore.i32",
+                        Attr::NoUnwind,
+                        void,
+                        140,
+                        &[
+                            uav,
+                            byte_off,
+                            undef,
+                            dyn_win,
+                            dyn_is_win,
+                            const_win,
+                            const_is_win,
+                            mask4,
+                            k4,
+                        ],
+                    );
+                    s.m.terminate(e, Term::Ret);
+                    let module_passes = passes & MODULE;
+                    if module_passes != 0 {
+                        s.m.optimise(module_passes);
+                    }
+                    let lds_loads = s.m.blocks[e]
+                        .body
+                        .iter()
+                        .filter(|&&id| matches!(s.m.insts[id as usize].op, Op::Load(_)))
+                        .count();
+                    let dxil = with_shader_opt(0, || s.finish());
+                    (dxil, lds_loads)
+                });
+                let shader = HostShader {
+                    stage: HwStage::Cs,
+                    dxil,
+                    user_data: (0..4)
+                        .map(|d| crate::emit::UserData {
+                            index: d,
+                            slot: 0,
+                            root: RootType::Constants,
+                            dword: d,
+                        })
+                        .collect(),
+                    samplers: Vec::new(),
+                    static_samplers: Vec::new(),
+                    root_cbvs: Vec::new(),
+                    root_srvs: Vec::new(),
+                    root_uavs: Vec::new(),
+                    root_indexed_views: Vec::new(),
+                    half_views: Vec::new(),
+                };
+                (shader, lds_loads)
+            };
+
+            let (none, loads_none) = build(0);
+            let (opt, loads_opt) = build(OPT_ALL);
+            assert_eq!(loads_none, 2, "unoptimized shader emits both LDS loads");
+            assert_eq!(
+                loads_opt, 2,
+                "OPT_ALL (with MEM_FWD) must preserve both dynamic and constant LDS loads after stores"
+            );
+            validate_dxil(&none.dxil);
+            validate_dxil(&opt.dxil);
+
+            let Some(host) = hw_host() else { return };
+            let (out_none, _) =
+                dispatch_timed(&host, &none, &[0; 4], 128, 0, [1, 1, 1], 1, 1).unwrap();
+            let (out_opt, _) =
+                dispatch_timed(&host, &opt, &[0; 4], 128, 0, [1, 1, 1], 1, 1).unwrap();
+
+            for b in 0..4usize {
+                let wins_none: u32 = (0..32usize)
+                    .filter(|l| (l & 3) == b)
+                    .map(|l| out_none[l * 4 + 1])
+                    .sum();
+                let wins_opt: u32 = (0..32usize)
+                    .filter(|l| (l & 3) == b)
+                    .map(|l| out_opt[l * 4 + 1])
+                    .sum();
+                if wins_none == 1 {
+                    assert_eq!(
+                        wins_opt, 1,
+                        "bucket {b}: opt elected {wins_opt} winners (expected 1, matching unopt)"
+                    );
+                }
+            }
+            let const_wins_none: u32 = (0..32usize).map(|l| out_none[l * 4 + 3]).sum();
+            let const_wins_opt: u32 = (0..32usize).map(|l| out_opt[l * 4 + 3]).sum();
+            if const_wins_none == 1 {
+                assert_eq!(
+                    const_wins_opt, 1,
+                    "const slot: opt elected {const_wins_opt} winners (expected 1, matching unopt)"
+                );
+            }
+        }
+    }
 }
