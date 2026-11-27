@@ -165,6 +165,23 @@ unsafe impl Sync for Through {}
 /// The copy buffers of [`alias`], by the placed view's texture.
 static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 
+/// `VICTORY_ALIAS_AFTER_UPLOAD=1`: an alias copy from a GPU-written source
+/// is done again after a CPU upload of the view in the same list (Vice-Tay
+/// #141, fixes stale probe and reflection textures). Unset: only the first
+/// use in a list copies, as before.
+fn alias_after_upload() -> bool {
+    #[cfg(test)]
+    if FORCE_ALIAS_AFTER_UPLOAD.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ALIAS_AFTER_UPLOAD").is_some_and(|v| v == "1"))
+}
+
+/// Tests that need [`alias_after_upload`] on whatever the environment says.
+#[cfg(test)]
+pub(crate) static FORCE_ALIAS_AFTER_UPLOAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Brings `placed`, the texture of a view the title placed in the memory
 /// of `source` in another format (`crate::resource::alias_of`), up to date
 /// with what the host wrote to `source`: the texels of every level and
@@ -274,7 +291,11 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    let new_source = if alias_after_upload() {
+        list.alias_source_changed(placed as usize, to, from)
+    } else {
+        list.first_use(placed as usize)
+    };
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -289,7 +310,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);

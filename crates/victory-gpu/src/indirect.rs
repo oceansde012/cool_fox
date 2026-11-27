@@ -882,6 +882,49 @@ void main() {
         }
     }
 
+    /// The timestamps around our compares (`host::card_pass_time`): a pair
+    /// taken, written around a compare of some pieces and resolved, gives
+    /// the ticks between them once the list has run; a pair handed out
+    /// again since gives nothing.
+    #[test]
+    fn warp_card_stamps_time_a_compare() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let Some(mut stamps) = crate::host::CardStamps::make(&warp.device) else {
+            panic!("the timestamps must be made on WARP");
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECES: u32 = 16;
+        let size = (64usize << 10) * PIECES as usize;
+        let (_now, _, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, _, differs_gpu) = warp.shared_buffer(4 * u64::from(PIECES));
+        let n = stamps.take();
+        // SAFETY: our open list on the harness's direct queue, live buffers,
+        // the compare's own root signature.
+        unsafe {
+            stamps.begin(&warp.list, n);
+            warp.list.SetComputeRootSignature(&compare.root);
+            warp.list.SetPipelineState(&compare.pso);
+            let constants = [0u32, 0, size as u32, PIECES, 0, 1];
+            warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+            warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+            warp.list.Dispatch(PIECES, 1, 1);
+            stamps.end(&warp.list, n);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the list has run.
+        assert!(unsafe { stamps.ticks(n) }.is_some(), "the pair gives its ticks");
+        for _ in 0..crate::host::CardStamps::PAIRS {
+            stamps.take();
+        }
+        // SAFETY: as above.
+        assert_eq!(unsafe { stamps.ticks(n) }, None, "a pair handed out again gives nothing");
+    }
+
     /// The compare of copies in the card's memory (`crate::host`), on the
     /// software adapter. Told 1 it flags the pieces whose bytes are not
     /// what was hashed last and leaves the hashes: a piece a shader changed
@@ -959,6 +1002,69 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// Compares of some pieces only (`host::heat`, `VICTORY_CARD_COMPARE_HOT`),
+    /// on the software adapter: a pass over hot pieces leaves the stored
+    /// hashes of the others alone, so a later compare of a piece it skipped
+    /// (a cover) still flags what a shader wrote there before; and once every
+    /// piece was looked at, a compare of all finds nothing.
+    #[test]
+    fn warp_a_piece_left_out_of_a_compare_is_flagged_by_a_later_one() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 5;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(4 * u64::from(PIECES));
+        let content: Vec<u8> = (0..size).map(|i| (i * 7 + i / 977) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        // Passes over pieces `first..first + pieces` (their results at their
+        // own dwords), then what `differs` holds (7: not written).
+        let run = |warp: &mut WarpHarness, passes: &[(u32, u32)], mode: u32| -> Vec<u32> {
+            // SAFETY: our open list, live buffers, the compare's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                for piece in 0..PIECES as usize {
+                    differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                }
+                warp.list.SetComputeRootSignature(&compare.root);
+                warp.list.SetPipelineState(&compare.pso);
+                warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                for &(first, pieces) in passes {
+                    let constants = [first, 0u32, size as u32, pieces, first * 4, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.Dispatch(pieces, 1, 1);
+                }
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            (0..PIECES as usize)
+                .map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+                .map(|d| if d == 7 { 7 } else { d & 1 })
+                .collect()
+        };
+        // SAFETY (each): inside the mapping.
+        let set = |piece: usize, value: u8| unsafe { now_ptr.add(piece * PIECE + 333).write_volatile(value) };
+        // The hashes, whole (as when a copy's hashes are made).
+        run(&mut warp, &[(0, PIECES)], 0);
+        // A submission writes pieces 1 and 3; its compare reads 1 and 2 only.
+        set(1, content[PIECE + 333] ^ 1);
+        set(3, content[3 * PIECE + 333] ^ 1);
+        assert_eq!(run(&mut warp, &[(1, 2)], 2), [7, 1, 0, 7, 7]);
+        // The next writes piece 1 again; its compare reads 1, and a cover of
+        // the pieces left out before (0, 3, 4) runs too.
+        set(1, content[PIECE + 333] ^ 2);
+        assert_eq!(run(&mut warp, &[(0, 1), (1, 1), (3, 2)], 2), [0, 1, 7, 1, 0]);
+        // Every piece looked at since: nothing more.
+        assert_eq!(run(&mut warp, &[(0, PIECES)], 1), [0, 0, 0, 0, 0]);
     }
 
     /// What the passes over copies in the card's memory cost on the card
