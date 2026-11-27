@@ -3172,7 +3172,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, STENCIL, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -3180,6 +3180,8 @@ impl State {
         else {
             return false;
         };
+        // The view the program reads at a place of a table, its texture's
+        // description, and its place in the bound view heap.
         let entry = |kind: ResourceType, (slot, offset): (u8, u32)| {
             t.used.iter().find(|u| {
                 u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
@@ -3189,9 +3191,8 @@ impl State {
             };
             let view = crate::descriptor::view(table + u64::from(offset) * 4)?;
             let view = crate::descriptor::host::placed_texture(&view).unwrap_or(view);
-            let resource = match (kind, view) {
-                (ResourceType::Srv, View::Shader(r, desc)) if desc.as_ref().is_none_or(is_depth_srv) => r,
-                (ResourceType::Uav, View::Unordered(r, ..)) => r,
+            let resource = match (kind, &view) {
+                (ResourceType::Srv, View::Shader(r, _)) | (ResourceType::Uav, View::Unordered(r, ..)) => *r,
                 _ => return None,
             };
             let start = match self.ambient_tables.iter().find(|m| m.0 == slot) {
@@ -3201,31 +3202,59 @@ impl State {
             let host = crate::resource::host_resource(resource as This)?;
             // SAFETY: a live resource.
             let desc = unsafe { host.GetDesc() };
-            Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
+            Some((view, desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
         };
-        let Some((of, image)) = entry(ResourceType::Uav, at) else {
+        let Some((_, of, image)) = entry(ResourceType::Uav, at) else {
             once!(?role, "no stand-in for the indirect light: missing image UAV");
             return false;
         };
         // Only the resolve reads the depth: the others' root signature has no
         // table for it (their image's own UAV was bound there before).
         let depth = if role == Role::Resolve {
-            let Some((seen, depth)) = entry(ResourceType::Srv, DEPTH) else {
-                once!(?role, "no stand-in for the indirect light: missing depth SRV");
-                return false;
+            // Two-dimensional, one sample, of the light's size.
+            let fits = |d: &D3D12_RESOURCE_DESC| {
+                d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+                    && d.SampleDesc.Count == 1
+                    && (d.Width, d.Height) == (of.Width, of.Height)
             };
-            if seen.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
-                || seen.SampleDesc.Count != 1
-                || (seen.Width, seen.Height) != (of.Width, of.Height)
-            {
-                once!(?role, "no stand-in for the indirect light: depth dimensions differ");
-                return false;
-            }
+            // The depth plane of a depth texture: at DEPTH, or else
+            // wherever the program reads one through its tables.
+            let found = crate::ambient::title_depth()
+                .then(|| {
+                    std::iter::once(DEPTH)
+                        .chain(
+                            t.used
+                                .iter()
+                                .filter(|u| u.kind == ResourceType::Srv && u.root == RootType::Table)
+                                .map(|u| (u.slot, u.table_offset_dwords)),
+                        )
+                        .filter_map(|place| entry(ResourceType::Srv, place))
+                        .find(|(view, d, _)| {
+                            fits(d)
+                                && d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
+                                && matches!(view, View::Shader(_, desc) if desc.as_ref().is_none_or(is_depth_srv))
+                        })
+                })
+                .flatten();
+            let depth = match found {
+                Some((_, _, depth)) => depth,
+                // What is at STENCIL, as before: the light raised all the same.
+                None => {
+                    let Some((_, _, depth)) = entry(ResourceType::Srv, STENCIL).filter(|(_, d, _)| fits(d)) else {
+                        once!(?role, "no stand-in for the indirect light: no depth");
+                        return false;
+                    };
+                    if crate::ambient::title_depth() {
+                        once!(?role, "the stand-in for the indirect light found no depth plane: it reads the stencil's view, as before");
+                    }
+                    depth
+                }
+            };
             Some(depth)
         } else {
             None
@@ -4914,6 +4943,18 @@ mod tests {
         desc[0] = DXGI_FORMAT_R24_UNORM_X8_TYPELESS.0 as u32;
         desc[1] = D3D12_SRV_DIMENSION_TEXTURE2DARRAY.0 as u32;
         assert!(!is_depth_srv(&desc));
+    }
+
+    /// What the title has where the stand-in for the indirect light looked
+    /// for the depth (`crate::ambient::STENCIL`, run guards-now-bis2): the
+    /// stencil plane of a D32S8 texture. Its depth plane, at
+    /// `crate::ambient::DEPTH` (guards-now-bis4), is depth.
+    #[test]
+    fn the_resolves_stencil_view_is_not_its_depth() {
+        let stencil = [22, 4, 5768, 0, 0, 1, 1, 0, 0, 0];
+        assert!(!is_depth_srv(&stencil));
+        let depth = [21, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+        assert!(is_depth_srv(&depth));
     }
 
     #[test]

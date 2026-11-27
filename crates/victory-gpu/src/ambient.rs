@@ -70,11 +70,31 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
 /// Where the resolve writes the diffuse light (R9G9B9E5 as 32-bit integers)
 /// and reads the scene's depth, and where the other writes the light of
 /// visible surfaces: root parameter and place in its table, in dwords.
+///
+/// [`DEPTH`] is the depth plane of the title's D32S8 depth (register 59);
+/// [`STENCIL`] its stencil plane (register 213, X32_TYPELESS_G8X24_UINT),
+/// which was read as the depth before ([`title_depth`]).
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
-pub(crate) const DEPTH: (u8, u32) = (0, 464);
+pub(crate) const DEPTH: (u8, u32) = (0, 688);
+pub(crate) const STENCIL: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+
+/// Whether the resolve's passes read the title's depth: the depth plane of a
+/// depth texture the resolve's program reads, of the light's size, at
+/// [`DEPTH`] or else where the program has one (`VICTORY_AMBIENT_DEPTH`, on;
+/// 0: the view at [`STENCIL`], as before; A/B-able). With none found, the
+/// view at [`STENCIL`] too: the light is raised all the same, and the
+/// magenta of the probes' memory taken out.
+pub(crate) fn title_depth() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_AMBIENT_DEPTH") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_DEPTH").is_none_or(|v| v != "0"))
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
