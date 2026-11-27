@@ -86,6 +86,7 @@ pub(crate) fn skip_on() -> bool {
 /// pieces of (the 174 MB ring, 0x1900000, 0x564000) are left as they are.
 pub(crate) fn left_on_card(span: (u64, u64), offset: usize) -> bool {
     listed(span.1)
+        && caught(span)
         && sent()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -96,6 +97,23 @@ pub(crate) fn left_on_card(span: (u64, u64), offset: usize) -> bool {
 /// How long a piece of [`left_on_card`]'s copies the title sent up keeps
 /// landing: about ten seconds.
 const SENT_FRAMES: u64 = 300;
+
+/// Says in the log each copy a listed length catches, the first time: a
+/// length is no name, and another buffer of the same size would be left on
+/// the card too. Always true.
+fn caught(span: (u64, u64)) -> bool {
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(u64, u64)>>> = OnceLock::new();
+    let mut seen = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if seen.insert(span) {
+        let of_length = seen.iter().filter(|s| s.1 == span.1).count();
+        tracing::info!(
+            "a host copy of a listed length stays on the card (VICTORY_LAND_NOT): {:#x}+{:#x}, {of_length} of that length so far",
+            span.0,
+            span.1
+        );
+    }
+    true
+}
 
 /// Offsets `ranges` of the copy of `span` were sent up: their pieces land
 /// for a while ([`left_on_card`]).
