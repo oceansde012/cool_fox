@@ -80,7 +80,10 @@ pub(crate) fn skip_on() -> bool {
 /// chain's 0x1412200 bytes (21 MB fetched a frame) and three buffers shaders
 /// fill (0x2d00000, 0x5265c0, 0x1cc000: 14 MB a frame; the first of them
 /// has a piece or two sent up now and then, which keep landing): n-ab-land,
-/// -3.0 and -2.6 ms a frame, -5.6 together, the same draws a frame.
+/// -3.0 and -2.6 ms a frame, -5.6 together, the same draws a frame. Then
+/// 0x3200000 (the title and the shaders write pieces apart), 0xc00000 and
+/// 0x2a3000, 11 MB a frame: n-ab-landc, 39.0 -> 37.5 ms. Copies both write
+/// pieces of (the 174 MB ring, 0x1900000, 0x564000) are left as they are.
 pub(crate) fn left_on_card(span: (u64, u64), offset: usize) -> bool {
     listed(span.1)
         && sent()
