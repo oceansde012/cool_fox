@@ -2005,6 +2005,9 @@ struct CardWork {
     /// The timestamps of [`card_pass_time`], if it is on and they could be
     /// made.
     stamps: Option<CardStamps>,
+    /// With [`heat_on`]: the fence signalled behind each cover (a compare of
+    /// owed pieces, [`heat`]) and the last value given.
+    cover: Option<(ID3D12Fence, u64)>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -2306,6 +2309,9 @@ struct CardRange {
     /// Looked at by `crate::picked`, and not declared: what is found changed
     /// there was written through a view nobody declared. Not landed.
     picked: bool,
+    /// Of a cover ([`heat`]): the first submission that owed the piece; 0
+    /// for a declared range.
+    owed_since: u64,
 }
 
 impl CardPlan {
@@ -2342,6 +2348,9 @@ struct CardPlan {
     /// With [`card_pass_time`]: the timestamp pairs its lists took, and
     /// whether each is the compare's.
     stamped: Vec<(u64, bool)>,
+    /// The submission it is for (of a cover the thread that lands flights
+    /// made: the last one started then).
+    number: u64,
 }
 
 /// One piece of submission-time work, in recorded order.
@@ -2681,6 +2690,68 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     pieces.sort_unstable();
     pieces.dedup();
     pieces
+}
+
+/// Whether compares read only the declared pieces found changed lately
+/// ([`heat`], `VICTORY_CARD_COMPARE_HOT=<D>`; off by default). Only with
+/// [`relay`], whose landing thread holds back the flights that owe pieces,
+/// and not with [`relay_copy`], whose fetches run beside later flights (the
+/// covers have not been looked at with that).
+fn heat_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = heat::deadline().is_some() && relay() && !relay_copy();
+        if heat::deadline().is_some() {
+            tracing::info!(
+                on,
+                deadline = heat::deadline(),
+                hot = heat::hot_span(),
+                "compares of copies in the card's memory read only pieces found changed lately (VICTORY_CARD_COMPARE_HOT; \
+                 needs the relay, not with VICTORY_RELAY_COPY=1)"
+            );
+        }
+        on
+    })
+}
+
+/// The book of [`heat`]: the owed pieces, the covers on the card, what
+/// compares found. Taken after [`QUEUE_ORDER`] and [`CARD_WORK`] where those
+/// are held, and inside [`line`]'s lock by the thread that lands flights
+/// (which then takes nothing else).
+static HEAT: Mutex<Option<heat::Book<std::sync::Weak<crate::shadow::Shadow>, CardPlan>>> = Mutex::new(None);
+
+/// Pieces owed now ([`heat`]); 0 with it off.
+fn heat_owed() -> usize {
+    if !heat_on() {
+        return 0;
+    }
+    HEAT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, heat::Book::owed)
+}
+
+/// The runs of pieces of `span` (of `shadow`) whose `chosen` says they are
+/// read, each as the compare takes it: its first piece, its pieces, and the
+/// offsets of the span the pieces hold.
+fn chosen_parts(shadow: &crate::shadow::Shadow, span: &crate::shadow::CardSpan, chosen: &[bool]) -> Vec<crate::shadow::CardSpan> {
+    let mut parts = Vec::new();
+    let mut i = 0u32;
+    while i < span.pieces {
+        if !chosen.get(i as usize).copied().unwrap_or(true) {
+            i += 1;
+            continue;
+        }
+        let from = i;
+        while i < span.pieces && chosen.get(i as usize).copied().unwrap_or(true) {
+            i += 1;
+        }
+        parts.push(crate::shadow::CardSpan {
+            from: shadow.card_piece(span, from).0 as u32,
+            to: shadow.card_piece(span, i - 1).1 as u32,
+            first: span.first + from,
+            pieces: i - from,
+            skew: span.skew,
+        });
+    }
+    parts
 }
 
 #[cfg(test)]
@@ -3474,6 +3545,9 @@ fn late_threads() {
     });
 }
 
+/// Threads in [`relay_wait`] now.
+static RELAY_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// With [`relay`]: waits until `done` says so of the line, looked at each
 /// time flights have landed. Counted as a settle for `why`, and its time
 /// as waiting for the card. The caller may hold the submission lock: the
@@ -3496,9 +3570,12 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
         WHY_FENCE => "waiting for landings: a blocking fence wait",
         _ => "waiting for landings: another reason",
     });
+    // (The thread that lands flights then covers owed pieces at once, `heat`.)
+    RELAY_WAITERS.fetch_add(1, Ordering::AcqRel);
     while !done(&line) {
         line = LINE_LANDED.wait(line).unwrap_or_else(|e| e.into_inner());
     }
+    RELAY_WAITERS.fetch_sub(1, Ordering::AcqRel);
     drop(line);
     stood(waiting);
     working(was_working);
@@ -3545,6 +3622,17 @@ fn relay_worker() {
         fail(format_args!("no event for the thread that lands submissions sent ahead (VICTORY_RELAY=1)"));
     };
     let mut fetch: Option<RelayFetch> = None;
+    // With `heat_on`: the fence behind the compares of owed pieces.
+    let cover_fence = heat_on().then(|| host.card_cover_fence()).flatten();
+    /// What the thread does next, besides landing.
+    enum Wait {
+        /// The host's fence reaches the value (a flight has run).
+        Card(u64),
+        /// The cover fence reaches the value (`heat`).
+        Cover(u64),
+        /// A flight owes pieces nothing will cover soon: cover them.
+        Force,
+    }
     loop {
         let next = {
             let mut line = line();
@@ -3563,10 +3651,44 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
-                let n = landable(&fences, completed);
+                let run = landable(&fences, completed);
+                let mut n = run;
+                // With `heat`: a flight that owes pieces lands no earlier
+                // than a compare of them has run (and its results with it).
+                let mut covers = Vec::new();
+                let mut held = heat::Hold::Free;
+                if let Some(fence) = &cover_fence {
+                    // SAFETY: a plain query.
+                    let done = unsafe { fence.GetCompletedValue() };
+                    let mut book = HEAT.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(book) = book.as_mut() {
+                        let mut last = None;
+                        for (i, item) in line.line[..run].iter().enumerate() {
+                            if let Late::Run(flight) = item {
+                                held = book.hold(flight.number, done);
+                                if held != heat::Hold::Free {
+                                    n = i;
+                                    break;
+                                }
+                                last = Some(flight.number);
+                            }
+                        }
+                        if let Some(last) = last.filter(|_| n > 0) {
+                            covers = book.take_landed(last, done);
+                        }
+                    }
+                }
                 if n == 0 {
-                    // The first thing is a flight the card has not run.
-                    break Err(fences[0].unwrap_or(0));
+                    break Err(match held {
+                        // The first thing is a flight the card has not run.
+                        heat::Hold::Free => Wait::Card(fences[0].unwrap_or(0)),
+                        heat::Hold::Cover(value) => Wait::Cover(value),
+                        // Nothing more is coming that the card has not run,
+                        // or someone waits for this: no point in waiting.
+                        heat::Hold::Uncovered if run == fences.len() || RELAY_WAITERS.load(Ordering::Acquire) > 0 => Wait::Force,
+                        // Later submissions may take the pieces when due.
+                        heat::Hold::Uncovered => Wait::Card(fences[run..].iter().flatten().next().copied().unwrap_or(0)),
+                    });
                 }
                 line.settling = true;
                 let items: Vec<Late> = line.line.drain(..n).collect();
@@ -3580,12 +3702,30 @@ fn relay_worker() {
                 if card_steps::stage() > 0 {
                     line.landing = card_steps::writers(&items);
                 }
-                break Ok(items);
+                break Ok((items, covers));
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
-            Err(target) => {
+            Ok((items, covers)) => host.relay_land(items, covers, &mut fetch),
+            Err(Wait::Force) => {
+                heat::count(heat::stat::HELD, 1);
+                host.card_cover_all();
+            }
+            Err(Wait::Cover(value)) => {
+                heat::count(heat::stat::HELD, 1);
+                let waiting = std::time::Instant::now();
+                // SAFETY: the cover fence and this thread's event.
+                let waited = cover_fence.as_ref().map(|fence| unsafe {
+                    fence.SetEventOnCompletion(value, event).map(|()| {
+                        WaitForSingleObject(event, INFINITE);
+                    })
+                });
+                if !matches!(waited, Some(Ok(()))) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                heat::count(heat::stat::HELD_US, waiting.elapsed().as_micros() as u64);
+            }
+            Err(Wait::Card(target)) => {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
@@ -3814,6 +3954,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod heat;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -4368,6 +4509,10 @@ impl Host {
                         Some(stamps)
                     })
                     .flatten(),
+                cover: match heat_on() {
+                    true => Some((self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?, 0)),
+                    false => None,
+                },
             })
         }
     }
@@ -4384,7 +4529,13 @@ impl Host {
     /// `relay`).
     /// `picked`: ranges that may be written too, and ranges to look at
     /// (`crate::picked`).
-    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool) -> Option<CardPlan> {
+    /// `number`: the submission's number among those started.
+    ///
+    /// With [`heat_on`] the compare reads only the declared pieces found
+    /// changed lately; the book in [`heat`] says which, and which pieces left
+    /// out before a cover compares now, in a list of its own put on the queue
+    /// ahead of this submission's sends and lists.
+    fn card_before(&self, declared: &[Declared], picked: &crate::picked::Ranges, flown: bool, number: u64) -> Option<CardPlan> {
         use std::sync::Arc;
         if !crate::shadow::cards() {
             return None;
@@ -4408,7 +4559,8 @@ impl Host {
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
-        if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
+        // (Owed pieces may be due: their cover is made below.)
+        if declared.is_empty() && dirty.is_empty() && looked.is_empty() && heat_owed() == 0 {
             return None;
         }
         let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
@@ -4426,6 +4578,81 @@ impl Host {
                 if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
                     dirty.push((shadow.clone(), Vec::new()));
                 }
+            }
+        }
+        // The declared ranges, each byte once (the copy-back joins them):
+        // the copy, the range, as the compare takes it, and whether the copy
+        // has its hashes.
+        let mut cards: Vec<(Arc<crate::shadow::Shadow>, (usize, usize), crate::shadow::CardSpan, bool)> = Vec::new();
+        for (shadow, ranges) in &declared {
+            let mut sorted = ranges.clone();
+            sorted.sort_unstable();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            for (from, to) in sorted {
+                match spans.last_mut() {
+                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
+                    _ => spans.push((from, to)),
+                }
+            }
+            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
+            for (from, to) in spans {
+                if let Some(span) = shadow.card_span(from, to) {
+                    cards.push((shadow.clone(), (from, to), span, twin));
+                }
+            }
+        }
+        // With `heat_on`: per declared range with hashes, the pieces this
+        // compare reads; and the owed pieces a cover compares now, ahead of
+        // the sends (they hash pieces again) and of this submission's lists.
+        let mut chosen: Vec<Option<Vec<bool>>> = vec![None; cards.len()];
+        if let Some(deadline) = heat_on().then(heat::deadline).flatten() {
+            let mut book = HEAT.lock().unwrap_or_else(|e| e.into_inner());
+            let book = book.get_or_insert_with(Default::default);
+            let index: Vec<usize> = (0..cards.len()).filter(|&i| cards[i].3).collect();
+            let spans: Vec<heat::Span<std::sync::Weak<crate::shadow::Shadow>>> = index
+                .iter()
+                .map(|&i| {
+                    let (shadow, _, span, _) = &cards[i];
+                    heat::Span {
+                        copy: shadow.id(),
+                        handle: Arc::downgrade(shadow),
+                        pieces: (0..span.pieces)
+                            .map(|p| {
+                                let (lo, hi) = shadow.card_piece(span, p);
+                                (span.first + p, lo, hi)
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
+            // The pieces the sends below hash again, as they cut them (all
+            // of a copy hashed whole).
+            let rehashed: std::collections::HashMap<u64, Option<Vec<(u32, u32)>>> = dirty
+                .iter()
+                .map(|(shadow, ranges)| {
+                    let runs = (!whole.iter().any(|s| Arc::ptr_eq(s, shadow))).then(|| {
+                        ranges
+                            .iter()
+                            .map(|&(a, b)| {
+                                let run = shadow.card_run(a, b);
+                                (run.first, run.first + run.pieces)
+                            })
+                            .collect()
+                    });
+                    (shadow.id(), runs)
+                })
+                .collect();
+            let again = |copy: u64, piece: u32| {
+                rehashed.get(&copy).is_some_and(|runs| runs.as_ref().is_none_or(|r| r.iter().any(|&(a, b)| a <= piece && piece < b)))
+            };
+            let planned = book.plan(number, deadline, heat::hot_span(), &spans, &again, flown);
+            for (i, c) in index.into_iter().zip(planned.chosen) {
+                chosen[i] = Some(c);
+            }
+            if !planned.covers.is_empty()
+                && let Some((value, cover)) = self.card_cover(work, &planned.covers, number, sent_as)
+            {
+                book.add_cover(value, &planned.covers, cover);
             }
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
@@ -4556,40 +4783,37 @@ impl Host {
             looks,
             sends: own.map(send::Own::memory),
             stamped,
+            number,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
-            let mut sorted = ranges.clone();
-            sorted.sort_unstable();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            for (from, to) in sorted {
-                match spans.last_mut() {
-                    Some(last) if from <= last.1 => last.1 = last.1.max(to),
-                    _ => spans.push((from, to)),
-                }
-            }
-            let twin = shadow.card_sides().is_some_and(|(_, before, _)| before.is_some());
-            for (from, to) in spans {
-                let Some(span) = shadow.card_span(from, to) else {
-                    continue;
-                };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
-                if compared {
-                    compared_of(shadow.span(), span.pieces);
-                }
+        for ((shadow, declared, span, twin), chosen) in cards.iter().zip(chosen) {
+            // The runs of pieces the compare reads: all of them, or with
+            // `heat_on` those chosen (none may be).
+            let parts = match chosen {
+                Some(chosen) => chosen_parts(shadow, span, &chosen),
+                None => vec![*span],
+            };
+            let mut read = 0;
+            for part in parts {
+                let compared = *twin && u64::from(at + part.pieces) * 4 <= work.differs.2;
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
-                    declared: (from, to),
-                    span,
+                    declared: *declared,
+                    span: part,
                     at,
                     compared,
                     picked: false,
+                    owed_since: 0,
                 });
                 if compared {
-                    at += span.pieces;
+                    at += part.pieces;
+                    read += part.pieces;
                 }
+            }
+            if read > 0 {
+                compared_of(shadow.span(), read);
             }
         }
         for (shadow, from, len) in looked {
@@ -4605,6 +4829,7 @@ impl Host {
                     at,
                     compared: true,
                     picked: true,
+                    owed_since: 0,
                 });
                 at += span.pieces;
             }
@@ -4707,6 +4932,174 @@ impl Host {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
+    }
+
+    /// A cover ([`heat`]): the owed pieces `taken` are compared on the card
+    /// now, in a list of ours put on the queue at once (behind everything
+    /// sent so far, ahead of whatever is sent next), storing the hashes it
+    /// makes; then the cover fence is signalled. The caller holds
+    /// [`QUEUE_ORDER`] (`sent_as` is its count) and `work`'s lock. Gives the
+    /// fence's value and the plan that lands what the compare flags (with the
+    /// first flight that owed one of the pieces); `None` if no piece's copy
+    /// is alive (nothing to land). Where the results have no room the pieces
+    /// are fetched whole when they land, uncompared (value 0: done).
+    fn card_cover(
+        &self,
+        work: &mut CardWork,
+        taken: &[heat::Taken<std::sync::Weak<crate::shadow::Shadow>>],
+        number: u64,
+        sent_as: u64,
+    ) -> Option<(u64, CardPlan)> {
+        let mut pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, u32, heat::Owed)> =
+            taken.iter().filter_map(|(_, handle, piece, owed)| Some((handle.upgrade()?, *piece, *owed))).collect();
+        if pieces.is_empty() {
+            return None;
+        }
+        pieces.sort_by_key(|(shadow, piece, _)| (std::sync::Arc::as_ptr(shadow) as usize, *piece));
+        let room = u64::from(work.taken) + pieces.len() as u64 <= work.differs.2 / 4;
+        let mut at = work.taken;
+        let ranges: Vec<CardRange> = pieces
+            .iter()
+            .map(|(shadow, piece, owed)| {
+                let span = shadow.card_run(owed.lo, owed.hi);
+                debug_assert_eq!((span.first, span.pieces), (*piece, 1));
+                let r = CardRange {
+                    shadow: shadow.clone(),
+                    declared: (shadow.span().0 as usize + owed.lo, shadow.span().0 as usize + owed.hi),
+                    span,
+                    at,
+                    compared: room,
+                    picked: false,
+                    owed_since: owed.first,
+                };
+                if room {
+                    at += 1;
+                }
+                r
+            })
+            .collect();
+        let mut plan = CardPlan {
+            ranges,
+            check: None,
+            _synced: Vec::new(),
+            lists: Vec::new(),
+            sent_as,
+            looks: None,
+            sends: None,
+            stamped: Vec::new(),
+            number,
+        };
+        work.out += 1;
+        if !room {
+            return Some((0, plan));
+        }
+        work.taken = at;
+        let Some((fence, value)) = work.cover.as_mut().map(|(fence, value)| {
+            *value += 1;
+            (fence.clone(), *value)
+        }) else {
+            fail(format_args!("no fence for the compares of owed pieces (VICTORY_CARD_COMPARE_HOT)"));
+        };
+        let Some(cover) = work.check.pop().or_else(|| self.make_prelude()) else {
+            fail(format_args!("no host list for the compare of owed pieces of host copies in the card's memory"));
+        };
+        let stamp = work.stamps.as_mut().map(CardStamps::take);
+        if let Some(n) = stamp {
+            plan.stamped.push((n, true));
+        }
+        let (allocator, list) = &cover;
+        // SAFETY: the list's last run finished (it came back with its plan,
+        // which is done when its submission or landing has run); live buffers
+        // (the plan holds the copies); the compare's own root signature; the
+        // fence is ours.
+        let recorded = unsafe {
+            (|| -> windows::core::Result<()> {
+                allocator.Reset()?;
+                list.Reset(allocator, None)?;
+                if let (Some(stamps), Some(n)) = (&work.stamps, stamp) {
+                    stamps.begin(list, n);
+                }
+                list.SetComputeRootSignature(&work.root);
+                list.SetPipelineState(&work.pso);
+                list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                // Pieces of one copy that follow each other in one pass; a
+                // copy's pieces count as one compare of it.
+                let mut i = 0;
+                let mut read: Option<(usize, (u64, u64), u32)> = None;
+                while i < plan.ranges.len() {
+                    let r = &plan.ranges[i];
+                    let mut j = i + 1;
+                    while j < plan.ranges.len()
+                        && std::sync::Arc::ptr_eq(&plan.ranges[j].shadow, &r.shadow)
+                        && plan.ranges[j].span.first == r.span.first + (j - i) as u32
+                    {
+                        j += 1;
+                    }
+                    if let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) {
+                        let run = crate::shadow::CardSpan { pieces: (j - i) as u32, ..r.span };
+                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
+                        card_pass(list, &run, size as u32, r.at, 2);
+                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                        let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
+                        match read.as_mut() {
+                            Some((c, _, n)) if *c == copy => *n += run.pieces,
+                            _ => {
+                                if let Some((_, of, n)) = read.replace((copy, r.shadow.span(), run.pieces)) {
+                                    compared_of(of, n);
+                                }
+                            }
+                        }
+                    }
+                    i = j;
+                }
+                if let Some((_, of, n)) = read.take() {
+                    compared_of(of, n);
+                }
+                if let (Some(stamps), Some(n)) = (&work.stamps, stamp) {
+                    stamps.end(list, n);
+                }
+                list.Close()?;
+                self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+                self.queue.Signal(&fence, value)?;
+                Ok(())
+            })()
+        };
+        if let Err(e) = recorded {
+            fail(format_args!("the compare of owed pieces of host copies in the card's memory could not be sent ({e})"));
+        }
+        plan.lists.push((true, cover));
+        Some((value, plan))
+    }
+
+    /// The thread that lands flights holds one back that owes pieces no
+    /// cover took, and nothing else will come to take them soon (the card has
+    /// run the line, or a thread waits for landings): it covers every owed
+    /// piece itself ([`heat`]).
+    fn card_cover_all(&self) {
+        let order = QUEUE_ORDER.lock().unwrap_or_else(|e| e.into_inner());
+        let sent_as = *order;
+        let mut work = CARD_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(work) = work.as_mut() else {
+            return;
+        };
+        let mut book = HEAT.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(book) = book.as_mut() else {
+            return;
+        };
+        let taken = book.take_all();
+        if taken.is_empty() {
+            return;
+        }
+        heat::count(heat::stat::FORCED_LISTS, 1);
+        if let Some((value, cover)) = self.card_cover(work, &taken, STARTED.load(Ordering::Acquire), sent_as) {
+            book.add_cover(value, &taken, cover);
+        }
+    }
+
+    /// The fence the covers are signalled on ([`heat`]), if there is one.
+    fn card_cover_fence(&self) -> Option<ID3D12Fence> {
+        CARD_WORK.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(|w| w.cover.as_ref().map(|c| c.0.clone()))
     }
 
     /// The plan's submission has run and its results were read
@@ -4818,8 +5211,13 @@ impl Host {
             // Pieces caught while a later flight was at them (`torn`).
             let suspects = fetch.as_ref().map(|f| &f.suspects);
             let mut seen = std::collections::HashSet::new();
+            // What the compares found, for the book of `heat`.
+            let mut book = heat_on().then(|| HEAT.lock().unwrap_or_else(|e| e.into_inner()));
             for &(plan, behind) in plans {
                 plan.picked_found(differs);
+                // A declared range read in parts (`heat`), and a cover's
+                // pieces of one copy, count as one compare.
+                let mut compare: Option<((usize, (usize, usize)), (u64, u64), u32)> = None;
                 let flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
@@ -4862,11 +5260,32 @@ impl Host {
                     }
                     crate::shadow::CARD_STATS[2].fetch_add(u64::from(r.span.pieces), Ordering::Relaxed);
                     if r.compared {
-                        let changed = (0..r.span.pieces)
+                        let changed: Vec<u32> = (0..r.span.pieces)
                             .filter(|&p| differs.get((r.at + p) as usize).is_some_and(|&d| torn::flagged(d)))
-                            .count();
-                        found_of(r.shadow.span(), changed as u32);
+                            .collect();
+                        if let Some(book) = book.as_mut().and_then(|b| b.as_mut()) {
+                            for &p in &changed {
+                                book.found(r.shadow.id(), r.span.first + p, plan.number);
+                            }
+                            if r.owed_since > 0 && !changed.is_empty() {
+                                heat::count(heat::stat::FOUND, changed.len() as u64);
+                                heat::STATS[heat::stat::WAITED]
+                                    .fetch_max(plan.number.saturating_sub(r.owed_since), Ordering::Relaxed);
+                            }
+                        }
+                        let key = (copy, if r.owed_since > 0 { (0, 0) } else { r.declared });
+                        match compare.as_mut() {
+                            Some((k, _, n)) if *k == key => *n += changed.len() as u32,
+                            _ => {
+                                if let Some((_, of, n)) = compare.replace((key, r.shadow.span(), changed.len() as u32)) {
+                                    found_of(of, n);
+                                }
+                            }
+                        }
                     }
+                }
+                if let Some((_, of, n)) = compare.take() {
+                    found_of(of, n);
                 }
             }
         }
@@ -5054,7 +5473,9 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
-    fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
+    /// `covers`: compares of pieces these flights owed ([`heat`]), which
+    /// have run: what they flagged lands with them.
+    fn relay_land(&self, items: Vec<Late>, covers: Vec<CardPlan>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {
@@ -5077,7 +5498,13 @@ impl Host {
                         last_notes(&runs)
                     ));
                 }
-                let plans: Vec<(&CardPlan, u64)> = flights.iter().filter_map(|f| Some((f.card.as_ref()?, f.fence))).collect();
+                // A cover ran behind every flight that owed its pieces: no
+                // earlier fetch holds all of what it flags (`land::Had`).
+                let plans: Vec<(&CardPlan, u64)> = flights
+                    .iter()
+                    .filter_map(|f| Some((f.card.as_ref()?, f.fence)))
+                    .chain(covers.iter().map(|c| (c, u64::MAX)))
+                    .collect();
                 // (Each byte once: the ranges are joined.)
                 let mut back: Vec<Declared> = Vec::new();
                 for flight in &flights {
@@ -5112,6 +5539,10 @@ impl Host {
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
             }
+        }
+        // The covers' lists and results are free (they were merged above).
+        for cover in covers {
+            self.card_done(cover);
         }
         // In the order given: what tells the title the card is done.
         stage.next("landing: read-backs, telling the title");
@@ -5888,7 +6319,7 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
-        let card = self.card_before(&declared, &picked, flown);
+        let card = self.card_before(&declared, &picked, flown, this_submission);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -9224,6 +9655,7 @@ impl Meter {
             }
         }
         compared_line(frames);
+        heat::line(frames);
         {
             let [own, asking, still, all] =
                 [0, 1, 2, 3].map(|i| crate::texture::REFRESH_WAITS[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
