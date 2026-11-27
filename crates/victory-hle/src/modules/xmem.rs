@@ -645,7 +645,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     if n.checked_mul(PAGE).filter(|&s| s > 0).is_none() {
         return 0;
     }
-    // (VIctory) In sections of `per` pages at most ([`section_pages`]).
+    // (VICTORY_SECTION_MB) In sections of `per` pages at most ([`section_pages`]).
     let per = section_pages();
     let mut sections: Vec<Arc<Section>> = Vec::new();
     for start in (0..n).step_by(per) {
@@ -716,8 +716,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// (VIctory; the finding and the cure are RyanCase94's and CuteBooty's,
 /// fxceless/victory-fork#1089 and #1274, and KainanP's, Marvisak/VIctory#3177.)
 /// How many pages one section holds at most: `VICTORY_SECTION_MB` MiB of them
-/// (0: one section for a whole request, as before), 2 MiB unless set, one
-/// section under Wine.
+/// (0: one section for a whole request, as before), 0 MiB unless set;
+/// set `VICTORY_SECTION_MB=2` to turn it on (recommended).
 ///
 /// The title asks for its 6.1 GiB of pages in one call and maps them a 64 KiB
 /// page at a time: one section with views by the hundred thousand. Windows'
@@ -736,7 +736,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 fn section_pages() -> usize {
     static PAGES: LazyLock<usize> = LazyLock::new(|| {
         let mb = std::env::var("VICTORY_SECTION_MB").ok().and_then(|v| v.trim().parse::<usize>().ok());
-        pages_per_section(mb.unwrap_or(if on_wine() { 0 } else { 2 }))
+        pages_per_section(mb.unwrap_or(0))
     });
     *PAGES
 }
