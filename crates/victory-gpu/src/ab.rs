@@ -55,14 +55,14 @@ struct Phase {
     draws: u64,
 }
 
-/// The frames' mean, median and nine tenths.
-fn summary(frames: &mut [f32]) -> (f32, f32, f32) {
+/// The frames' mean, median, nine tenths and one tenth.
+fn summary(frames: &mut [f32]) -> (f32, f32, f32, f32) {
     if frames.is_empty() {
-        return (0.0, 0.0, 0.0);
+        return (0.0, 0.0, 0.0, 0.0);
     }
     let mean = frames.iter().sum::<f32>() / frames.len() as f32;
     frames.sort_by(f32::total_cmp);
-    (mean, frames[frames.len() / 2], frames[frames.len() * 9 / 10])
+    (mean, frames[frames.len() / 2], frames[frames.len() * 9 / 10], frames[frames.len() / 10])
 }
 
 /// The title's present ends on this thread. `change`: called when another
@@ -96,10 +96,10 @@ pub(crate) fn presented(change: impl Fn(&str, bool, bool)) {
     }
     let bits = |number: u64| (number % (1 << asked.switches.len())) as u32;
     let (was, will) = (bits(p.number), bits(number));
-    let (mean, median, most) = summary(&mut p.frames);
+    let (mean, median, most, least) = summary(&mut p.frames);
     let on: Vec<&str> = asked.switches.iter().enumerate().filter(|(n, _)| was >> n & 1 != 0).map(|(_, s)| s.as_str()).collect();
     tracing::info!(
-        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame",
+        "A/B phase {} bits {was} on [{}]: {} frames, mean {mean:.1} ms, median {median:.1}, p90 {most:.1}, {:.0} draws a frame, p10 {least:.1}",
         p.number,
         on.join(" "),
         p.frames.len(),
@@ -124,8 +124,8 @@ mod tests {
         assert!(parse("10").is_none());
         assert!(parse("x,VICTORY_A").is_none());
         assert!(parse("0,VICTORY_A").is_none());
-        assert_eq!(summary(&mut [30.0, 10.0, 20.0]), (20.0, 20.0, 30.0));
-        assert_eq!(summary(&mut []), (0.0, 0.0, 0.0));
+        assert_eq!(summary(&mut [30.0, 10.0, 20.0]), (20.0, 20.0, 30.0, 10.0));
+        assert_eq!(summary(&mut []), (0.0, 0.0, 0.0, 0.0));
         assert_eq!(pick("VICTORY_NONE_SUCH"), None);
     }
 }
