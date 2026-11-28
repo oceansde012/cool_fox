@@ -14,13 +14,14 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
-/// Bound dynamic raw views to their host buffer. Set VICTORY_RAW_VIEW_CLAMP=0
-/// to use the requested range without querying the host width. From
+/// Bound dynamic raw views to their host buffer. By default the requested
+/// range is used without querying the host width; set VICTORY_RAW_VIEW_CLAMP=1
+/// to clamp to the host width. From
 /// fxceless/victory-fork pull request 1266 by lichenlang89 (dd5e8c9e), as
 /// carried in CuteBooty/victory-8gb.
 fn raw_view_clamp() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEW_CLAMP").is_some_and(|v| v == "1"))
 }
 
 /// A set of a heap's slots, a bit for each: no lock (a pass that went through
