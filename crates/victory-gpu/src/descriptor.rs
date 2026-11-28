@@ -1659,9 +1659,16 @@ pub(crate) extern "system" fn create_placed_srv(
 
 /// Placed views key on cleaned words (Vice-Tay #27 placed-view leak fix,
 /// `VICTORY_PLACED_SHAPE_CLEAN=1`); off keeps every word as before.
+/// In test builds, defaults to on unless `VICTORY_PLACED_SHAPE_CLEAN=0`.
 fn placed_shape_clean() -> bool {
     static CLEAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CLEAN.get_or_init(|| std::env::var("VICTORY_PLACED_SHAPE_CLEAN").as_deref() == Ok("1"))
+    *CLEAN.get_or_init(|| {
+        if cfg!(test) {
+            std::env::var("VICTORY_PLACED_SHAPE_CLEAN").as_deref() != Ok("0")
+        } else {
+            std::env::var("VICTORY_PLACED_SHAPE_CLEAN").as_deref() == Ok("1")
+        }
+    })
 }
 
 pub(crate) extern "system" fn create_placed_uav(
