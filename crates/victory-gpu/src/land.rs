@@ -750,5 +750,7 @@ fn for_pages(title: usize, parts: &[(usize, usize)], mut f: impl FnMut(usize, us
 
 #[cfg(feature = "diagnostics")]
 pub(crate) mod probe;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod under_who;
 #[cfg(test)]
 mod tests;

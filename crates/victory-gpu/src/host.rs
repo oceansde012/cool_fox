@@ -2911,6 +2911,10 @@ fn blamed(why: usize, us: u64) {
 fn log_blame(frames: f64) {
     let all = BLAME.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let wide = WIDE_WRITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    if crate::land::under_who::on() {
+        let by: Vec<((usize, usize), u64, String)> = wide.iter().map(|((a, b, _), (n, what))| ((*a, *b), *n, what.clone())).collect();
+        crate::land::under_who::log(frames, &by);
+    }
     let mut all: Vec<_> = all.into_iter().collect();
     all.sort_unstable_by_key(|(_, (_, us, _))| std::cmp::Reverse(*us));
     for ((kind, why, len, from, size), (n, us, at)) in all.into_iter().take(5) {
@@ -4639,6 +4643,13 @@ impl Host {
                         upcheck::declared(r.shadow.id(), r.span.from as usize, r.span.to as usize);
                     }
                     for p in 0..r.span.pieces {
+                        #[cfg(feature = "diagnostics")]
+                        if land::under_who::on() {
+                            let (lo, hi) = r.shadow.card_piece(&r.span, p);
+                            let start = r.shadow.span().0 as usize;
+                            let changed = fetched.binary_search(&(copy, r.span.first + p)).is_ok();
+                            land::under_who::declared(start + lo, start + hi, changed);
+                        }
                         if fetched.binary_search(&(copy, r.span.first + p)).is_err() {
                             continue;
                         }
