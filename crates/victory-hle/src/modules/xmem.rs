@@ -180,6 +180,27 @@ pub extern "system" fn XMemVirtualAlloc(
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
+    // Write-combined: memory the title's CPU writes and does not read.
+    if !at.is_null() && asked & 0x400 != 0 {
+        victory_gpu::title_memory_write_combined(at as usize, size);
+    }
+    if port_on() && size >= 64 << 20 && flags & ADDRESS_32BIT != 0 {
+        tracing::info!(
+            size,
+            at = format_args!("{at:p}"),
+            placeholder,
+            constrained,
+            kind = format_args!("{kind:#x}"),
+            flags = format_args!("{flags:#x}"),
+            "renderer port 1: a large 32-bit reservation"
+        );
+    }
+    // (This build of the title reserves its 185 MB graphics heap without the
+    // 64 KiB page flag, so not as a placeholder: a reservation without
+    // commit counts too.)
+    if port_on() && !at.is_null() && (placeholder || kind & MEM_COMMIT == 0) && constrained && flags & ADDRESS_32BIT != 0 {
+        LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+    }
     note_protection(asked, kind, flags, at as usize, size);
     at
 }
@@ -642,55 +663,64 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n.checked_mul(PAGE).filter(|&s| s > 0).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    }
+    // (VICTORY_SECTION_MB) In sections of `per` pages at most ([`section_pages`]).
+    let per = section_pages();
+    let mut sections: Vec<Arc<Section>> = Vec::new();
+    for start in (0..n).step_by(per) {
+        let pages = (n - start).min(per);
+        let size = pages * PAGE;
+        // A pagefile-backed section of `size` bytes, its pages committed when
+        // first mapped or written (`commit`): the title asks for 6.1
+        // GiB at once, which a busy host often cannot commit (error 1450).
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free until
+                // touched, and committing a reserved one page by page costs a
+                // wineserver request each that scans every range committed so
+                // far: commit it whole there.
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
+            // (The sections made so far close as `sections` drops.)
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        // For the GPU side's in-place census: only a committed section can be
+        // opened as a host heap.
+        victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+        sections.push(Arc::new(Section {
+            handle,
+            pages,
+            window: std::sync::OnceLock::new(),
+            committed: (0..pages.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
+        }));
     }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    // For the GPU side's in-place census: only a committed section can be
-    // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section {
-        handle,
-        pages: n,
-        window: std::sync::OnceLock::new(),
-        committed: (0..n.div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
-    });
     let mut table = page_table_mut();
     let first = table.next_page;
     table.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
-            section: section.clone(),
-            index,
+            section: sections[index / per].clone(),
+            index: index % per,
         };
         table.pages.insert(first + index * FRAMES, slice);
     }
@@ -702,6 +732,42 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         unsafe { pages.add(index).write(first + index * FRAMES) };
     }
     1
+}
+
+/// (VIctory; the finding and the cure are RyanCase94's and CuteBooty's,
+/// fxceless/victory-fork#1089 and #1274, and KainanP's, Marvisak/VIctory#3177.)
+/// How many pages one section holds at most: `VICTORY_SECTION_MB` MiB of them
+/// (0: one section for a whole request, as before), 0 MiB unless set;
+/// set `VICTORY_SECTION_MB=2` to turn it on (recommended).
+///
+/// The title asks for its 6.1 GiB of pages in one call and maps them a 64 KiB
+/// page at a time: one section with views by the hundred thousand. Windows'
+/// worker that rebuilds large pages trades a section's pages one at a time,
+/// walks the section's views for each, and holds the section's lock
+/// meanwhile, which every map and unmap of the title's pages waits for. Here,
+/// running through the world (Ryzen 9 9950X3D, 150 s): 211,000 unmaps of
+/// 182 us and 205,000 maps of 114 us each, 848 ms of mapping calls in every
+/// second, and 11-18 fps; standing still the same calls take 10 us. In
+/// sections of 2 MiB such a trade walks a few dozen views and holds one small
+/// section.
+///
+/// What goes by sections sees more of them: a run of pages for a mapping or a
+/// write ends at a section's end as it did at a request's ([`runs`]), and a
+/// DirectStorage write over such an end goes through `write_physical`.
+fn section_pages() -> usize {
+    static PAGES: LazyLock<usize> = LazyLock::new(|| {
+        let mb = std::env::var("VICTORY_SECTION_MB").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        pages_per_section(mb.unwrap_or(0))
+    });
+    *PAGES
+}
+
+/// `mb` MiB in pages; 0: no end.
+fn pages_per_section(mb: usize) -> usize {
+    match mb.saturating_mul(MIB / PAGE) {
+        0 => usize::MAX,
+        pages => pages,
+    }
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -1076,6 +1142,128 @@ pub(crate) fn lift_thread() {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static PORT_CONSTANTS_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`; the GPU side's half is
+/// `victory_gpu`'s `port`): read here for xmem's part, [`arrange`].
+fn port_on() -> bool {
+    #[cfg(test)]
+    if PORT_CONSTANTS_IN_TEST.get() {
+        return true;
+    }
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+/// The title's reservations of 64 KiB pages for 32-bit graphics memory:
+/// base and bytes (one, of 185 MB, in Grand Theft Auto VI).
+static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Pages given another place in their section so far by [`arrange`], and
+/// the times it found a page that was not fresh.
+static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Before `pages` are mapped at `base`: if `base` lies in a 32-bit graphics
+/// reservation ([`LOW_RESERVATIONS`]) whose pages are all one section of
+/// the same size, the page numbers are given the slices of that section in
+/// the reservation's address order (each page at its offset in the
+/// reservation), so that the reservation becomes one stretch of the section
+/// and the GPU side can open it as one heap.
+///
+/// Grand Theft Auto VI takes all the pages of its 185 MB heap in one call
+/// and maps its five pieces in another order than their addresses (run
+/// port1-1: "Scattered"). Only fresh slices are exchanged: never mapped,
+/// never written (no commit bit), so every page still reads as zeros and
+/// which slice a number names is not observable by the title.
+/// Why [`arrange`] left large mappings as they were (the first few times).
+fn arrange_note(base: usize, pages: usize, why: &str) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    if port_on() && pages >= 16 && SEEN.fetch_add(1, Ordering::Relaxed) < 12 {
+        tracing::info!(at = format_args!("{base:#x}"), pages, why, "renderer port 1: pages not arranged");
+    }
+}
+
+fn arrange(base: usize, pages: &[usize]) {
+    let Some((first, bytes)) = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
+    else {
+        arrange_note(base, pages.len(), "not in a 32-bit reservation");
+        return;
+    };
+    let mut table = page_table_mut();
+    let Some(section) = pages.first().and_then(|p| table.pages.get(p)).map(|s| s.section.clone()) else {
+        drop(table);
+        arrange_note(base, pages.len(), "no section");
+        return;
+    };
+    if section.pages * PAGE != bytes
+        || !pages.iter().all(|p| table.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section)))
+    {
+        let sizes = (section.pages * PAGE, bytes);
+        drop(table);
+        arrange_note(
+            base,
+            pages.len(),
+            if sizes.0 != sizes.1 { "section size differs from the reservation" } else { "pages from more than one section" },
+        );
+        if port_on() && pages.len() >= 16 {
+            tracing::info!(section_bytes = sizes.0, reservation = sizes.1, "renderer port 1: sizes");
+        }
+        return;
+    }
+    let fresh = |index: usize| section.committed[index / 64].load(Ordering::Acquire) >> (index % 64) & 1 == 0;
+    // Which number has which slice of the section.
+    let mut owner: HashMap<usize, usize> = table
+        .pages
+        .iter()
+        .filter(|(_, s)| Arc::ptr_eq(&s.section, &section))
+        .map(|(&number, s)| (s.index, number))
+        .collect();
+    let mut moved = 0u64;
+    for (i, number) in pages.iter().enumerate() {
+        let want = (base - first) / PAGE + i;
+        let Some(have) = table.pages.get(number).map(|s| s.index) else {
+            continue;
+        };
+        if have == want {
+            continue;
+        }
+        if !fresh(have) || !fresh(want) {
+            ARRANGED[1].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if let Some(other) = owner.get(&want).copied()
+            && let Some(slice) = table.pages.get_mut(&other)
+        {
+            slice.index = have;
+            owner.insert(have, other);
+        }
+        if let Some(slice) = table.pages.get_mut(number) {
+            slice.index = want;
+        }
+        owner.insert(want, *number);
+        moved += 1;
+    }
+    if moved > 0 {
+        let all = ARRANGED[0].fetch_add(moved, Ordering::Relaxed) + moved;
+        tracing::info!(
+            at = format_args!("{base:#x}"),
+            pages = pages.len(),
+            moved,
+            all,
+            not_fresh = ARRANGED[1].load(Ordering::Relaxed),
+            "renderer port 1: the title's 32-bit graphics pages given their section's slices in address order"
+        );
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -1088,6 +1276,11 @@ pub extern "system" fn XMemMapPhysicalPages(
     // the mapping call that holds them.
     // SAFETY: the title passes `n` page numbers, or null.
     let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) }.to_vec());
+    if port_on()
+        && let Some(pages) = &pages
+    {
+        arrange(base, pages);
+    }
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
     let _busy = Busy::begin();
@@ -1204,42 +1397,64 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
     let _costed = Costed::begin(None);
     lift_thread();
-    if side_by_side() <= 1 {
-        return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
-    }
-    // By the page: the address, and the one whose page it is to show.
-    let pages: Vec<(usize, Option<usize>)> = ranges
-        .iter()
-        .flat_map(|&(to, from, len)| {
-            (0..len as usize).step_by(PAGE).map(move |k| (to as usize + k, (from != 0).then_some(from as usize + k)))
-        })
-        .collect();
-    if pages.iter().any(|p| p.0 % PAGE != 0 || p.1.is_some_and(|from| from % PAGE != 0)) {
+    // A page stride preserves the alignment of each nonempty range.
+    if side_by_side() <= 1 || ranges.iter().any(|&(to, from, len)| {
+        len != 0 && (to % PAGE as u64 != 0 || from % PAGE as u64 != 0)
+    }) {
         return ranges.iter().all(|&(to, from, len)| map_alias(to, from, len));
     }
     let mut ok = true;
-    let mut at = 0;
-    while at < pages.len() {
+    alias_groups(ranges, |group| {
         let _busy = Busy::begin();
         let mut physical = physical();
-        let mut ops: Vec<Op> = Vec::new();
-        let mut touched = std::collections::HashSet::new();
-        for &(to, from) in &pages[at..] {
-            // A page the group changes already, or one it would be mapped
-            // from: after it.
-            if ops.len() == GROUP || touched.contains(&to) || from.is_some_and(|from| touched.contains(&from)) {
-                break;
-            }
+        let mut ops = Vec::with_capacity(group.len());
+        for &(to, from) in group {
             let slice = from.map(|from| physical.slice_at(from));
             ok &= !matches!(slice, Some(None));
-            touched.insert(to);
             ops.push(Op::new(to, slice.flatten()));
-            at += 1;
         }
         let _changing = victory_gpu::title_memory_remapping();
         ok &= change(&mut physical, ops);
-    }
+    });
     ok
+}
+
+/// Expand aligned ranges one independent group at a time. Only the addresses
+/// are planned here. Resolving the backing pages still takes the mapping lock.
+fn alias_groups(ranges: &[(u64, u64, u64)], mut visit: impl FnMut(&[(usize, Option<usize>)])) {
+    let mut group = [(0, None); GROUP];
+    let mut count = 0;
+    // Destinations generally advance together. Track that run as a range
+    // of page numbers and keep just the scattered destinations in the set.
+    let mut consecutive = 0..0;
+    let mut scattered = std::collections::HashSet::new();
+    for &(to, from, len) in ranges {
+        for offset in (0..len as usize).step_by(PAGE) {
+            let dest = to as usize + offset;
+            let source = (from != 0).then_some(from as usize + offset);
+            let page = dest / PAGE;
+            let touched = |page| {
+                consecutive.contains(&page) || (!scattered.is_empty() && scattered.contains(&page))
+            };
+            if count == GROUP || touched(page) || source.is_some_and(|at| touched(at / PAGE)) {
+                visit(&group[..count]);
+                count = 0;
+                scattered.clear();
+            }
+            if count == 0 {
+                consecutive = page..page + 1;
+            } else if consecutive.end == page {
+                consecutive.end += 1;
+            } else {
+                scattered.insert(page);
+            }
+            group[count] = (dest, source);
+            count += 1;
+        }
+    }
+    if count != 0 {
+        visit(&group[..count]);
+    }
 }
 
 /// Maps (page number not 0) or unmaps each address; false if a page is not
@@ -2024,6 +2239,31 @@ mod tests {
     }
 
     #[test]
+    fn the_32_bit_heap_gets_its_slices_in_address_order() {
+        PORT_CONSTANTS_IN_TEST.set(true);
+        // As the title's heap: a 32-bit reservation of 64 KiB pages, all of
+        // its pages from one call, mapped piece by piece in another order.
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 4 * PAGE, MEM_RESERVE | PAGES_64K, GRAPHICS | ADDRESS_32BIT, PAGE_READWRITE);
+        assert!(!base.is_null() && (base as usize) < 1 << 32);
+        let pages = allocate(4);
+        let index = |number: usize| page_table().pages.get(&number).map(|s| s.index);
+        let at = |page: usize| base.wrapping_byte_add(page * PAGE);
+        // The last two pages' place first, from the array's start.
+        arrange(at(2) as usize, &pages[..2]);
+        assert_eq!(XMemMapPhysicalPages(at(2), 2, pages.as_ptr()), at(2));
+        arrange(base as usize, &pages[2..]);
+        assert_eq!(XMemMapPhysicalPages(base, 2, pages[2..].as_ptr()), base);
+        assert_eq!([index(pages[0]), index(pages[1]), index(pages[2]), index(pages[3])], [Some(2), Some(3), Some(0), Some(1)]);
+        // Mapped already: nothing moves any more.
+        arrange(base as usize, &pages[..2]);
+        assert_eq!(index(pages[0]), Some(2));
+        // SAFETY: mapped read-write.
+        unsafe { at(3).cast::<u32>().write(7) };
+        assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
     fn physical_pages_map_alias_and_unmap() {
         let mut pages = [0usize; 3];
         let mut n = 3;
@@ -2202,6 +2442,34 @@ mod tests {
             assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
         }
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn alias_groups_split_at_capacity_and_at_dependencies() {
+        let page = PAGE as u64;
+        // Include a gap, a duplicate destination, repeated read-only sources,
+        // an unmap used as a later source, a zero length, and a partial page.
+        let ranges = [
+            (100 * page, 500 * page, (GROUP as u64 + 1) * page),
+            (200 * page, 0, 1),
+            (180 * page, 500 * page, page),
+            (180 * page, 700 * page, page),
+            (181 * page, 180 * page, page),
+            (190 * page, 500 * page, page),
+            (191 * page, 500 * page, page),
+            (193 * page, 0, page),
+            (192 * page, 193 * page, page),
+            (1, 1, 0),
+        ];
+        let mut groups = Vec::new();
+        alias_groups(&ranges, |group| groups.push(group.to_vec()));
+        assert_eq!(groups.iter().map(Vec::len).collect::<Vec<_>>(), [GROUP, 3, 1, 4, 1]);
+        let expected = ranges.into_iter().flat_map(|(to, from, len)| {
+            (0..len as usize).step_by(PAGE).map(move |k| {
+                (to as usize + k, (from != 0).then_some(from as usize + k))
+            })
+        });
+        assert!(groups.into_iter().flatten().eq(expected));
     }
 
     /// Many pages in one call: mapped, moved over each other's addresses,
@@ -2525,6 +2793,33 @@ mod tests {
         assert!(busy_after(true, ms(15), ms(250)) && !busy_after(true, ms(12), ms(250)));
         // A window without a call, then one short one.
         assert!(!busy_after(true, ms(5), ms(4000)));
+    }
+
+    #[test]
+    fn a_request_is_made_of_sections_of_two_mebibytes() {
+        assert_eq!(pages_per_section(2), 32);
+        assert_eq!(pages_per_section(0), usize::MAX);
+        if section_pages() != 32 {
+            return; // set otherwise for this run of the tests
+        }
+        // 70 pages: sections of 32, 32 and 6; each page a slice of its own.
+        let pages = allocate(70);
+        let slices: Vec<Slice> = {
+            let table = page_table();
+            pages.iter().map(|p| table.pages[p].clone()).collect()
+        };
+        assert!(slices.iter().enumerate().all(|(i, s)| s.index == i % 32 && s.section.pages == if i < 64 { 32 } else { 6 }));
+        assert!(Arc::ptr_eq(&slices[0].section, &slices[31].section) && !Arc::ptr_eq(&slices[31].section, &slices[32].section));
+        // A write over a section's end lands whole, and no single window covers it.
+        let data: Vec<u8> = (0..3 * PAGE).map(|i| (i % 251) as u8).collect();
+        assert!(page_window(&pages, 30 * PAGE + 7, 3 * PAGE).is_none());
+        assert!(write_physical(&pages, 30 * PAGE + 7, &data));
+        let mut read = Vec::new();
+        for p in &pages[30..34] {
+            read.extend_from_slice(&page_bytes(*p));
+        }
+        assert_eq!(&read[7..7 + 3 * PAGE], &data[..]);
+        assert_eq!(XMemFreePhysicalPages(70, pages.as_ptr()), 1);
     }
 
     #[test]

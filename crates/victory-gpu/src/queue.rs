@@ -952,6 +952,17 @@ extern "system" fn present(
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            // `VICTORY_EARLY_DEPTH`: what became of the console's early depth
+            // test in the pixel programs translated so far.
+            let [given, off, exports] = victory_shader::emit::early_depth_counts();
+            if given + off + exports > 0 {
+                tracing::info!(
+                    given,
+                    off,
+                    exports,
+                    "pixel programs translated so far whose console code tests depth before them: given the host's early test (VICTORY_EARLY_DEPTH=1), left with the late test (switch off), left with it as they write depth or stencil"
+                );
+            }
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -1000,6 +1011,8 @@ extern "system" fn present(
             Shown { frame, resource },
         );
         called.end();
+        #[cfg(windows)]
+        crate::draw::bvh_input_report();
         #[cfg(feature = "diagnostics")]
         frame_ends();
         return S_OK;
@@ -1044,6 +1057,8 @@ extern "system" fn present(
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     called.end();
+    #[cfg(windows)]
+    crate::draw::bvh_input_report();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
     S_OK

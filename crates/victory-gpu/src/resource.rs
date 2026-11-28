@@ -121,6 +121,9 @@ pub(crate) struct AllocationInfo {
 
 const _: () = assert!(size_of::<HeapProperties>() == 20);
 const _: () = assert!(size_of::<HeapDesc>() == 48);
+// placed_resource_words copies the two field spans on either side of the padding.
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, alignment) == 8);
+const _: () = assert!(std::mem::offset_of!(ResourceDesc, flags) == 48);
 const _: () = assert!(size_of::<ResourceDesc>() == 56);
 
 const BUFFER: u32 = 1;
@@ -2942,9 +2945,13 @@ static PLACED_TEXTURES: std::sync::Mutex<std::collections::BTreeMap<(u64, [u32; 
 
 /// The placed textures asked for with filler words set, as asked
 /// (address and description): for [`PLACED_TWINS`].
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 static PLACED_RAW: std::sync::Mutex<std::collections::BTreeSet<(u64, [u32; 14])>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Most variants [`PLACED_RAW`] keeps; past it the set starts over.
+#[cfg(all(windows, feature = "diagnostics"))]
+const PLACED_RAW_CAP: usize = 1 << 14;
 
 /// Placed textures asked for a second time with other filler words in
 /// their description: each was a second resource and host copy before the
@@ -3034,6 +3041,7 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // that fills at world entry. They are not part of what a texture is.
     // `VICTORY_PLACED_FILLER=1`: kept in the key, as before.
     static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
     let raw = *desc;
     let mut key = *desc;
     if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
@@ -3044,8 +3052,15 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // How many resources the filler alone would have added (a count for
     // the log: `placed_filler_twins`).
+    // Only a diagnostics build reads the count, so only it keeps the variants,
+    // and not past a cap: every filler variant the title ever passed was a
+    // set entry (about 100 bytes each, 1M of them in a synthetic load test).
+    #[cfg(feature = "diagnostics")]
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.len() >= PLACED_RAW_CAP {
+            seen.clear();
+        }
         if seen.insert((address, raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
                 let mut blank = *r;
@@ -3794,6 +3809,99 @@ mod tests {
             let at = row * 256;
             assert_eq!(read[at..at + 16], bytes[at..at + 16], "row {row}");
         }
+    }
+
+    /// An earlier title-memory upload must not suppress a later alias copy
+    /// from a GPU-written probe atlas into the same sampled texture.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn alias_after_title_upload_copies_the_gpu_atlas() {
+        crate::texture::FORCE_ALIAS_AFTER_UPLOAD.store(true, std::sync::atomic::Ordering::Relaxed);
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows::Win32::Graphics::Direct3D12::*;
+
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut source = null;
+        let mut view = null;
+        let source_desc = ResourceDesc {
+            flags: 4,
+            ..texture(4, 4, 42, 1)
+        };
+        assert_eq!(
+            create_committed(
+                null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
+            ),
+            S_OK
+        );
+        assert_eq!(
+            create_at_address(
+                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null.cast(), &RESOURCE_IIDS[0], &mut view,
+            ),
+            S_OK
+        );
+        resource(view).host.placed.store(true, Relaxed);
+        assert_eq!(alias_of(view), Some(source));
+        let written = host_resource(source).unwrap();
+        let sampled = host_resource(view).unwrap();
+        let (upload, data) = host.upload_buffer(1024).unwrap();
+        let seed = host.new_list().unwrap();
+        let packed_light = 0x8c02_0100_u32;
+        // SAFETY: four rows of four texels in the upload's 1024 mapped bytes.
+        unsafe {
+            for row in 0..4 {
+                for x in 0..4 {
+                    data.add(row * 256 + x * 4).cast::<u32>().write_unaligned(packed_light);
+                }
+            }
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(written),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&upload),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: written.GetDesc().Format,
+                            Width: 4,
+                            Height: 4,
+                            Depth: 1,
+                            RowPitch: 256,
+                        },
+                    },
+                },
+            };
+            crate::list::ensure_state(&seed, source, D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+            seed.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        seed.close();
+        host.execute(&[&seed]);
+
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, view, sampled);
+        assert!(crate::texture::alias(&list, view, source));
+        crate::list::ensure_state(&list, view, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
+        let (readback, rows) = crate::capture::read_back(&host.device, &list.list, sampled).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: the completed copy contains at least one 32-bit texel.
+        let actual = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let texel = mapped.cast::<u8>().add(rows.Offset as usize).cast::<u32>().read_unaligned();
+            readback.Unmap(0, None);
+            texel
+        };
+        resource_release(view);
+        resource_release(source);
+        assert_eq!(actual, packed_light, "the sampled texture kept the CPU upload instead of the GPU atlas");
     }
 
     /// A 16-bit depth texture the title also asks unordered access for gets

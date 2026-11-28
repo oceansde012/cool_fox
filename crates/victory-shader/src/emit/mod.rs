@@ -123,7 +123,7 @@ pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, SLOT_TABLE_STRIDES, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
-    raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
+    constants_raw, raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
@@ -155,6 +155,86 @@ pub fn loop_limit() -> u32 {
 pub fn helper_own() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0"))
+}
+
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER` of a console pixel program: the
+/// depth and stencil tests (and the depth write) run before the program, as
+/// HLSL's `[earlydepthstencil]` asks.
+pub(crate) const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+/// `DB_SHADER_CONTROL`'s Z_EXPORT_ENABLE, STENCIL_TEST_VAL_EXPORT_ENABLE and
+/// STENCIL_OP_VAL_EXPORT_ENABLE: the program writes depth or stencil.
+const DEPTH_STENCIL_EXPORT: u32 = 0b111;
+
+#[cfg(test)]
+thread_local! {
+    /// [`early_depth`] for the tests of one thread.
+    static EARLY_DEPTH_FOR_TESTS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_EARLY_DEPTH=1`: a pixel program whose console code tests depth and
+/// stencil before it runs ([`DEPTH_BEFORE_SHADER`]) gets D3D12's early
+/// depth-stencil test too (DXIL shader flag ForceEarlyDepthStencil). Without
+/// it the host tests after the program wherever the program writes to
+/// unordered views or discards, and its writes to unordered views land for
+/// pixels the depth test then rejects. The title's transparent pass (glass)
+/// keeps its nearest depth and motion with 64-bit atomics into a texture that
+/// a later full-screen draw writes into the scene depth and motion vectors
+/// with the depth test off: glass behind a character's hair took the hair's
+/// place there, and the heat-haze and in-scattering pass
+/// (731a39171b568298), which picks its effect by each pixel's distance, read
+/// those pixels at the glass's (or the world's beyond it) distance. Off by
+/// default. Part of the translation: the shader cache keys on it
+/// (`victory-gpu`'s does, while it is on).
+pub fn early_depth() -> bool {
+    #[cfg(test)]
+    if let Some(on) = EARLY_DEPTH_FOR_TESTS.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_some_and(|v| v == "1"))
+}
+
+/// What a pixel program gets of its console code's early depth test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EarlyDepth {
+    /// The console tests after the program (or it is no pixel program).
+    NotAsked,
+    /// D3D12's early test ([`early_depth`] on).
+    Given,
+    /// The late test: [`early_depth`] is off.
+    Off,
+    /// The late test: the program writes depth or stencil, which the early
+    /// test would not take.
+    Exports,
+}
+
+/// [`EarlyDepth`] of a pixel program with `db_shader_control` and these
+/// outputs, with [`early_depth`] `on`. Pure, for testing.
+pub(crate) fn early_depth_of(db_shader_control: u32, outputs: &[container::SigElement], on: bool) -> EarlyDepth {
+    if db_shader_control & DEPTH_BEFORE_SHADER == 0 {
+        EarlyDepth::NotAsked
+    } else if db_shader_control & DEPTH_STENCIL_EXPORT != 0
+        // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_StencilRef.
+        || outputs.iter().any(|o| (17..=20).contains(&o.kind))
+    {
+        EarlyDepth::Exports
+    } else if on {
+        EarlyDepth::Given
+    } else {
+        EarlyDepth::Off
+    }
+}
+
+static EARLY_DEPTH_COUNTS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Pixel programs translated since the start whose console code tests depth
+/// before them ([`early_depth`]): given D3D12's early test, left with the
+/// late one because the switch is off, left with it because they write
+/// depth or stencil. (Translations served from the shader cache are not
+/// counted: a first run with the switch on translates every program anew.)
+pub fn early_depth_counts() -> [u64; 3] {
+    EARLY_DEPTH_COUNTS.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -206,21 +286,56 @@ pub fn builder_bounds() -> bool {
 /// is exact, so the switch is for telling a translator fault from a
 /// clean-up fault, and for measuring what the clean-up is worth.
 /// `VICTORY_SHADER_OPT`:
-/// - unset: every pass but the last one below (63).
+/// - unset: the default base passes (63).
 /// - `0`: none (the module as the lowering made it).
 /// - a number (decimal or `0x` hex): those passes; 1 dead code, 2 constants
 ///   and identities, 4 one instruction for one value, 8 what a branch taken
 ///   says about its condition, 16 one read for one place within a block,
 ///   32 a first-lane read of two host waves without the round that asks
-///   which half has a lane (where every lane has one).
+///   which half has a lane (where every lane has one),
 ///   64 the dwords of one console load read by one call for every four
-///   (not on unless asked: `127` is every pass with it).
+///   (not on unless asked),
+///   128 extended algebraic/bitwise/shift/compare/select folds and canonical
+///   comparison reuse/facts (not on unless asked),
+///   256 alias-aware private-global forwarding, shared-memory load reuse, and
+///   overwritten-store elimination (not on unless asked),
+///   512 pure loop-invariant code motion for guaranteed loop blocks and
+///   in-bounds constant-table loads (not on unless asked),
+///   1024 adjacent and read-after-read redundant barrier elimination (not on
+///   unless asked),
+///   2048 speculative loop-invariant hoisting of non-trapping ALU and pure
+///   math out of conditional loop blocks (not on unless asked: `4095` is
+///   every pass).
 ///
 /// Part of the translation: the shader cache keys on it (`victory-gpu`'s
 /// does).
 pub fn shader_opt() -> u32 {
+    #[cfg(test)]
+    if let Some(passes) = TEST_SHADER_OPT.with(std::cell::Cell::get) {
+        return passes & bitcode::opt::ALL;
+    }
     static PASSES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PASSES.get_or_init(|| parse_shader_opt(std::env::var("VICTORY_SHADER_OPT").ok().as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_SHADER_OPT: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with `shader_opt()` overridden to `passes` on the current thread
+/// (tests only; restores the previous override on unwind).
+#[cfg(test)]
+pub(crate) fn with_shader_opt<R>(passes: u32, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_SHADER_OPT.with(|c| c.set(self.0));
+        }
+    }
+    let prev = TEST_SHADER_OPT.with(|c| c.replace(Some(passes)));
+    let _guard = Reset(prev);
+    f()
 }
 
 /// On a host whose shaders run on the console's own kind of hardware (AMD
@@ -429,6 +544,16 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     emit(&c, &native, &p, &st, &io, &res)
 }
 
+/// On wave32 hosts (NVIDIA) these transmission volumetrics kernels are
+/// refused and their dispatches dropped (no volumetric light/fog, dark
+/// underwater); from foxhound pre.4/pre.5 (JokerAttack PR #16), last
+/// digest from trustno1-coder/VIctory-NVIDIA#101; changes translation,
+/// use own VICTORY_CACHE_DIR when toggling (`VICTORY_WAVE_VOLUMETRICS=1`).
+fn wave_volumetrics() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_VOLUMETRICS").is_some_and(|v| v == "1"))
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -456,6 +581,9 @@ pub fn emit(
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        if why {
+            eprintln!("WAVE64-SHADER digest={:02x?}", c.digest);
+        }
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
                 match r {
@@ -547,7 +675,16 @@ pub fn emit(
                 c.digest,
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
-            );
+            )
+            || (wave_volumetrics()
+                && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
+                && matches!(
+                    c.digest,
+                    [0x24, 0x12, 0x6c, 0x14, 0xdc, 0x76, 0x19, 0xb0, 0x82, 0xef, 0x57, 0x12, 0x96, 0x03, 0x88, 0x90]
+                        | [0x70, 0x99, 0xa5, 0x7f, 0xde, 0xd1, 0x42, 0x61, 0x3b, 0x44, 0xf4, 0x10, 0x46, 0x3d, 0x6b, 0xe6]
+                        | [0xf1, 0xf1, 0x61, 0xe4, 0x7e, 0xef, 0xa3, 0x64, 0x69, 0x18, 0x39, 0xfd, 0x72, 0x06, 0xcc, 0xf6]
+                        | [0x4f, 0xa5, 0x83, 0x20, 0xd7, 0x61, 0xbf, 0x55, 0x81, 0x20, 0xf9, 0x2c, 0x19, 0xd3, 0x84, 0xaa]
+                ));
         let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
@@ -858,6 +995,13 @@ fn emit_program(
         }
         _ => 0,
     };
+    // (as `lower` decides it, counted for a program that translates)
+    let early = match &native.io {
+        crate::native::StageIo::Ps { db_shader_control, .. } => {
+            early_depth_of(*db_shader_control, &outputs, early_depth())
+        }
+        _ => EarlyDepth::NotAsked,
+    };
     let l = lower::lower(&lower::Parts {
         native,
         p,
@@ -869,6 +1013,15 @@ fn emit_program(
         prims,
         mesh_stride,
     })?;
+    let counted = match early {
+        EarlyDepth::NotAsked => None,
+        EarlyDepth::Given => Some(0),
+        EarlyDepth::Off => Some(1),
+        EarlyDepth::Exports => Some(2),
+    };
+    if let Some(n) = counted {
+        EARLY_DEPTH_COUNTS[n].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -1179,11 +1332,21 @@ mod tests {
     fn the_clean_up_switch_parses_or_runs_every_pass() {
         let (all, usual) = (super::bitcode::opt::ALL, super::bitcode::opt::DEFAULT);
         assert_eq!(usual, 63, "the passes of the builds before the wide loads");
+        assert_eq!(all, 4095, "every pass including opt-in passes and WIDE");
         assert_eq!(parse_shader_opt(None), usual);
         assert_eq!(parse_shader_opt(Some("0")), 0);
         assert_eq!(parse_shader_opt(Some(" 1 ")), 1);
         assert_eq!(parse_shader_opt(Some("0x1")), 1);
-        assert_eq!(parse_shader_opt(Some("127")), all);
+        assert_eq!(parse_shader_opt(Some("128")), super::bitcode::opt::EXT_FOLD);
+        assert_eq!(parse_shader_opt(Some("256")), super::bitcode::opt::MEM_FWD);
+        assert_eq!(parse_shader_opt(Some("512")), super::bitcode::opt::LICM);
+        assert_eq!(parse_shader_opt(Some("1024")), super::bitcode::opt::BARRIERS);
+        assert_eq!(parse_shader_opt(Some("2048")), super::bitcode::opt::SPEC_LICM);
+        assert_eq!(
+            parse_shader_opt(Some("4031")),
+            all & !super::bitcode::opt::WIDE
+        );
+        assert_eq!(parse_shader_opt(Some("4095")), all);
         assert_eq!(parse_shader_opt(Some("0xffffffff")), all);
         assert_eq!(parse_shader_opt(Some("on")), usual);
     }
@@ -1263,6 +1426,123 @@ mod tests {
         let sfi0 = host.part(FourCC::SFI0).unwrap().data;
         let features = u64::from_le_bytes(sfi0.try_into().unwrap());
         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+    }
+
+    /// Which pixel programs keep the console's early depth test: those whose
+    /// `DB_SHADER_CONTROL` asks for it and that write neither depth nor
+    /// stencil, with the switch on.
+    #[test]
+    fn early_depth_is_given_where_the_console_tests_before_the_program() {
+        let el = |kind| SigElement {
+            name: "X".into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 1,
+            usage: 1,
+            half: false,
+        };
+        let target = [el(16)];
+        // The title's transparent pass: early Z then late Z, kill, run for
+        // no-op colour writes, depth before the program.
+        let glass = 0x1450;
+        assert_eq!(early_depth_of(glass, &target, true), EarlyDepth::Given);
+        assert_eq!(early_depth_of(glass, &target, false), EarlyDepth::Off);
+        // Early Z then late Z alone is the hardware's choice, not the title's.
+        assert_eq!(early_depth_of(0x50, &target, true), EarlyDepth::NotAsked);
+        assert_eq!(early_depth_of(0, &target, true), EarlyDepth::NotAsked);
+        // A depth or stencil export keeps the late test.
+        assert_eq!(early_depth_of(glass | 1, &target, true), EarlyDepth::Exports);
+        assert_eq!(early_depth_of(glass | 4, &target, true), EarlyDepth::Exports);
+        for kind in 17..=20 {
+            assert_eq!(early_depth_of(glass, &[el(16), el(kind)], true), EarlyDepth::Exports);
+        }
+    }
+
+    /// A pixel program whose console code tests depth before it declares
+    /// D3D12's early depth-stencil test (ShaderFlags bit 3) with
+    /// `VICTORY_EARLY_DEPTH` on, and not with it off nor where the console
+    /// tests after it; dxil.dll, where there is one, takes the declaration.
+    #[test]
+    fn the_consoles_early_depth_test_is_declared_with_the_switch() {
+        let translate = |db_shader_control: u32, on: bool| {
+            EARLY_DEPTH_FOR_TESTS.with(|c| c.set(Some(on)));
+            let words = [
+                0x7E00_02F2u32, // v_mov_b32 v0, 1.0
+                0xF800_180F,
+                0x0000_0000, // exp mrt0, v0, v0, v0, v0 done vm
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 1,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let target = SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            };
+            let osg1 = container::signature(&[target], false);
+            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+            let c = Container::parse(&bytes).unwrap();
+            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+            let st = structure::structure(&p).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+            let io = io::raise(&p, &native).unwrap();
+            let outputs = signature(c.part(FourCC::OSG1).unwrap().data).unwrap();
+            let lowered = lower::lower(&lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs,
+                prims: vec![],
+                mesh_stride: 0,
+            })
+            .unwrap();
+            let before = early_depth_counts();
+            let out = emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let after = early_depth_counts();
+            EARLY_DEPTH_FOR_TESTS.with(|c| c.set(None));
+            (lowered.early_depth, out.dxil, before, after)
+        };
+        let (given, dxil, before, after) = translate(0x1450, true);
+        assert!(given, "asked for and switched on: declared");
+        assert!(after[0] > before[0], "counted as given");
+        let (off, _, before, after) = translate(0x1450, false);
+        assert!(!off, "switched off: the late test, as before");
+        assert!(after[1] > before[1], "counted as left late");
+        let (late, _, _, _) = translate(0, true);
+        assert!(!late, "the console tests after the program: the late test");
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil.clone()).unwrap();
+        }
+        let _ = dxil;
     }
 
     /// A pixel program with an ordered section, as the console compiler
@@ -2327,6 +2607,135 @@ mod tests {
             }
             eprintln!("offsets {s0} and {s1}, four dwords a call: {wide}: {:x?}", &out[0][..28]);
             assert_eq!(out[0][..28], want[..], "offsets {s0} and {s1}, four dwords a call: {wide}");
+        }
+    }
+
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`): a table's constant buffer is
+    /// read as raw bytes through the raw twin of its slot, at a constant and
+    /// at a computed offset, and gives the dwords the constant buffer read
+    /// gives without the switch; the slot itself (a constant buffer view, of
+    /// other bytes here) is not read.
+    #[test]
+    #[cfg(windows)]
+    fn table_constant_buffers_read_as_raw_bytes_through_their_twins() {
+        let mut words: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (the constant buffer)
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20 (the UAV)
+            0xF428_0404,
+            0xFA00_0010, // s_buffer_load_dwordx4 s[16:19], s[8:11], 0x10
+            0xF420_0504,
+            0x0000_0000, // s_buffer_load_dword s20, s[8:11], s0
+        ];
+        for (out, s) in (16..21u32).enumerate() {
+            // v_mov_b32 v1, s<s>; buffer_store_dword v1, s[12:15], offset 4 * out
+            words.push(0x7E00_0000 | 1 << 17 | 0x001 << 9 | s);
+            words.push(0x38 << 26 | 0x1C << 18 | (4 * out as u32));
+            words.push(0x80 << 24 | (12 >> 2) << 16 | 1 << 8);
+        }
+        words.push(0xBF81_0000); // s_endpgm
+        let table = |kind, at| crate::UsedResource {
+            kind,
+            root: crate::RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![
+                crate::RootParam { root: crate::RootType::Constants, table_offset_dwords: 0, sgprs: 4, base_register: 0, user_data: 0, slot: 0 },
+                crate::RootParam { root: crate::RootType::Table, table_offset_dwords: 0, sgprs: 1, base_register: 0, user_data: 4, slot: 1 },
+            ],
+            used: vec![table(crate::ResourceType::Cbv, 0), table(crate::ResourceType::Uav, 8)],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo { rsrc2: 5 << 1, threads: [1, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        // The twins start at slot 2: the constant buffer's (slot 0) is 2, the UAV's (1) 3.
+        const TWINS: u32 = 2;
+        let lowered = |raw: bool| {
+            super::shader::CONSTANTS_RAW_HERE.set(Some(raw));
+            super::shader::RAW_VIEWS_HERE.set(Some(if raw { TWINS } else { 0 }));
+            let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let l = super::lower::lower(&super::lower::Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+            })
+            .unwrap();
+            super::shader::CONSTANTS_RAW_HERE.set(None);
+            super::shader::RAW_VIEWS_HERE.set(None);
+            l
+        };
+        let (before, after) = (lowered(false), lowered(true));
+        assert_ne!(before.dxil, after.dxil, "the switch changes the translation");
+        let data: Vec<u32> = (0..16u32).map(|i| 0x0101_0101u32.wrapping_mul(i + 3) ^ 0x4000_0000).collect();
+        let other: Vec<u32> = vec![0xdead_beef; 64];
+        let s0 = 8u32;
+        let want: Vec<u32> = vec![data[4], data[5], data[6], data[7], data[(s0 / 4) as usize]];
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        for (raw, l) in [(false, before), (true, after)] {
+            let mut dxil = l.dxil;
+            if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+                v.validate(&mut dxil).unwrap();
+            }
+            let Ok(host) = super::host::Host::new(true) else {
+                eprintln!("no software adapter; the dispatch is skipped");
+                return;
+            };
+            let cs = super::HostShader {
+                stage: super::HwStage::Cs,
+                dxil,
+                user_data: l.user_data,
+                samplers: Vec::new(),
+                static_samplers: Vec::new(),
+                root_cbvs: l.root_cbvs,
+                root_srvs: l.root_srvs,
+                root_uavs: l.root_uavs,
+                root_indexed_views: Vec::new(),
+            };
+            let (root, pso) = host.compute_pipeline(&cs).unwrap();
+            let views: Vec<super::host::View> = if raw {
+                vec![
+                    super::host::View::Cbv(&other),
+                    super::host::View::RawUav(8),
+                    super::host::View::Buffer { data: &data, stride: super::host::Stride::Raw },
+                    super::host::View::RawUav(8),
+                ]
+            } else {
+                vec![super::host::View::Cbv(&data), super::host::View::RawUav(8)]
+            };
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &super::host::Dispatch {
+                        roots: vec![(0, super::host::Root::Constants(vec![s0, 0, 0, 0, 0]))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            // The UAV is written where the program reads it: its twin with the switch.
+            let got = out.iter().find(|o| o[..5].iter().any(|&w| w != 0)).map(|o| o[..5].to_vec());
+            assert_eq!(got.as_deref(), Some(&want[..]), "switch {raw}: {out:x?}");
         }
     }
 

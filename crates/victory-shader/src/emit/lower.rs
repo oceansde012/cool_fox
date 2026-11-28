@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// Whether the program declares D3D12's early depth-stencil test.
+    #[cfg(test)]
+    pub early_depth: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1399,6 +1402,14 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        // The console's early depth test, where it asks for one and the
+        // switch is on (`VICTORY_EARLY_DEPTH`).
+        if let StageIo::Ps { db_shader_control, .. } = &x.native.io
+            && super::early_depth_of(*db_shader_control, &s.outputs, super::early_depth())
+                == super::EarlyDepth::Given
+        {
+            s.flags |= flags::EARLY_DEPTH_STENCIL;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -2452,6 +2463,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -6226,13 +6239,26 @@ impl<'a> Lower<'a> {
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            // (Renderer port 5: the twin of a constant buffer's slot is a
+            // raw view of its bytes, read as one.)
+            let as_raw = super::shader::constants_raw() && super::shader::raw_views() != 0;
+            let h = if as_raw {
+                self.handle(site, src, false, (11, 0))?
+            } else {
+                self.handle(site, src, false, (13, 0x1_0000))?
+            };
             let mut both = Vec::new();
+            let dwords = if as_raw { self.raw_dwords(h, addr, raw.len() as u32) } else { Vec::new() };
             for (k, &r) in raw.iter().enumerate() {
                 let b = self.cur;
-                let off = self.s.m.i32(4 * k as u32);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let x = self.cbuffer_dword(h, a);
+                let x = match dwords.get(k) {
+                    Some(&x) => x,
+                    None => {
+                        let off = self.s.m.i32(4 * k as u32);
+                        let a = self.s.m.bin(b, Bin::Add, addr, off);
+                        self.cbuffer_dword(h, a)
+                    }
+                };
                 both.push((x, r));
             }
             let both = self.end_guarded(at, &both);
@@ -6285,6 +6311,12 @@ impl<'a> Lower<'a> {
                     let sane = self.s.m.cmp(c, pred::IULT, x, most);
                     x = self.s.m.select(c, sane, x, zero);
                 }
+                self.write(inst, Reg::S(code + k as u8), x, None);
+            }
+            return Ok(());
+        }
+        if let Some(h) = self.constants_raw(site, src)? {
+            for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6756,6 +6788,62 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// Renderer port 5 (`VICTORY_PORT_CBV=1`, [`super::shader::constants_raw`]):
+    /// the handle a constant buffer `src` is read through as raw bytes, or
+    /// `None` to read it as a constant buffer, as before.
+    ///
+    /// The console takes constant buffers on 16 bytes, the host on 256: the
+    /// layer copied each one the title's tables name into upload memory of
+    /// its own at every submission (some 23,000 a frame of the city, out of
+    /// the title's graphics memory, which renderer port 1 has the card read
+    /// in place), and each root one not on 256 bytes (64 KiB each). A raw
+    /// view starts on 16 bytes and a root SRV anywhere on 4, so read so the
+    /// card can take the title's bytes where they are:
+    /// - a table's (or one picked from the view heap): through the raw twin
+    ///   of its slot ([`super::shader::raw_views`]), which the host makes a
+    ///   raw view of the same bytes; a twin's reads end where the view does,
+    ///   as a constant buffer's do;
+    /// - a root one: as the root SRV `t<slot>` in [`super::shader::ROOT_CBV_SPACE`],
+    ///   which the host binds at the title's address like any root SRV.
+    ///
+    /// Anything else (a descriptor built otherwise, or chosen between kinds of
+    /// parameter) stays a constant buffer.
+    fn constants_raw(&mut self, site: Site, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constants_raw() {
+            return Ok(None);
+        }
+        if let Source::Built { address, .. } = src {
+            if self.root_copy.is_some() {
+                return Ok(None);
+            }
+            let Some(&rp) = self.x.native.layout.get(address.param) else {
+                return Ok(None);
+            };
+            let kind = self.x.native.used.iter().find(|u| u.user_data == rp.user_data).map(|u| u.kind);
+            if rp.root == RootType::Descriptor && matches!(kind, Some(ResourceType::Cbv) | None) {
+                return Ok(Some(self.s.root_srv_handle(rp.slot)));
+            }
+            return Ok(None);
+        }
+        if super::shader::raw_views() == 0 {
+            return Ok(None);
+        }
+        let x = self.x;
+        let scalar = &self.scalar;
+        let through_heap = src.leaves().iter().all(|leaf| match leaf {
+            Source::Loaded { load, .. } | Source::Fetched { load, .. } => scalar
+                .get(load)
+                .and_then(|a| x.native.layout.get(a.param))
+                .is_some_and(|p| matches!(p.root, RootType::Table | RootType::ResourceHeap)),
+            _ => false,
+        });
+        if !through_heap {
+            return Ok(None);
+        }
+        // (Raw, so `raw_twin` gives the twin's index.)
+        Ok(Some(self.handle(site, src, false, (11, 0))?))
     }
 
     /// The dword at a computed byte address of a constant buffer.
@@ -11710,7 +11798,11 @@ impl<'a> Lower<'a> {
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let raw = self.constants_raw(site, src)?;
+            let h = match raw {
+                Some(h) => h,
+                None => self.handle(site, src, false, (13, 0x1_0000))?,
+            };
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -11725,7 +11817,10 @@ impl<'a> Lower<'a> {
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = match raw {
+                    Some(_) => self.raw_dwords(h, a, 1)[0],
+                    None => self.cbuffer_dword(h, a),
+                };
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

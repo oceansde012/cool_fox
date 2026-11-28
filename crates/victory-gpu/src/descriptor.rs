@@ -217,6 +217,8 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     STARTED.call_once(|| {
         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
             crate::cores::keep_on_fast_cores("victory-heap-sync");
+            // (The submitting thread waits for its rounds.)
+            let mut priority = crate::cores::Priority::new();
             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
             /// A round is over, however it ends.
             struct Over;
@@ -245,6 +247,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
                     }
                 }
                 drop(r);
+                priority.keep();
                 let _over = asked.then(|| {
                     last = std::time::Instant::now();
                     Over
@@ -266,6 +269,79 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
     drop(rounds);
     SYNC_ROUNDS.1.notify_all();
     SyncedHeaps(Some(mine))
+}
+
+/// Renderer port #7 (`crate::port_journal`, from renderer patch #4): [`begin_sync_heaps`] for a
+/// submission that needs round `mark` (one that began after what it waits
+/// for was written, `crate::port_journal::round_after`): asked for if it has not
+/// been. 0: as [`begin_sync_heaps`].
+#[cfg(windows)]
+pub(crate) fn begin_sync_heaps_after(mark: u64) -> SyncedHeaps {
+    if mark == 0 || !sync_aside() {
+        return begin_sync_heaps();
+    }
+    // (The thread is started by the first `begin_sync_heaps`.)
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        drop(rounds);
+        return begin_sync_heaps();
+    }
+    let asked = rounds.0 < mark;
+    rounds.0 = rounds.0.max(mark);
+    drop(rounds);
+    if asked {
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::LATE_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        crate::port_journal::STATS[crate::port_journal::EARLY_ROUNDS].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    SyncedHeaps(Some(mark))
+}
+
+/// Renderer port #7: the number of a round of the heaps' records that
+/// begins after this call, asked for if none is waiting to begin (at the
+/// title's submit: the round runs while the submission waits in the line).
+/// 0 if the records are not synced by a thread of their own (or it has not
+/// started yet).
+#[cfg(windows)]
+pub(crate) fn round_after_now() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    let (round, ask) = crate::port_journal::round_after(rounds.0, rounds.1);
+    if ask {
+        rounds.0 = round;
+        drop(rounds);
+        SYNC_ROUNDS.1.notify_all();
+        crate::port_journal::STATS[crate::port_journal::ROUNDS_ASKED].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    round
+}
+
+/// Renderer port #7: the number of the first round that begins after this
+/// call, not asked for ([`begin_sync_heaps_after`] asks for it if nobody did).
+#[cfg(windows)]
+pub(crate) fn round_mark() -> u64 {
+    if !sync_aside() {
+        return 0;
+    }
+    let rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    if rounds.1 == 0 && rounds.0 == 0 {
+        return 0;
+    }
+    rounds.0 + 1
+}
+
+/// Whether `[at, at + len)` touches the title memory of a placed
+/// shader-visible heap of descriptors.
+#[cfg(windows)]
+pub(crate) fn in_shader_heap(at: usize, len: usize) -> bool {
+    let (from, to) = (at as u64, at as u64 + len as u64);
+    SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner()).iter().any(|&(start, end, _)| from < end && start < to)
 }
 
 #[cfg(windows)]
@@ -305,6 +381,8 @@ pub(crate) fn sync_heaps() {
     let mut spent = [0u64; 3];
     let since = |at: std::time::Instant| at.elapsed().as_nanos() as u64;
     let mut kinds = [0u64; 5];
+    let mut job_ns = [0u64; 3];
+    let profile = sync_profile();
     let mut wait: Vec<u32> = Vec::new();
     let frame = crate::frame::current();
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -324,8 +402,10 @@ pub(crate) fn sync_heaps() {
         // since: a shader may pick them by index.
         let before = host.copied_before(frame);
         let of_tables = std::sync::atomic::AtomicU64::new(0);
-        crate::land::each_view(true, before.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in before.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        let (pages_a_job, records_a_job) = sync_jobs();
+        let phase = profile.then(|| crate::timeline::span("the heaps' records: those that waited"));
+        crate::land::each_view(true, before.len().div_ceil(records_a_job), &|n| {
+            for &index in before.chunks(records_a_job).nth(n).unwrap_or_default() {
                 if host.copied_tabled(index, frame) {
                     of_tables.fetch_add(1, Relaxed);
                 } else {
@@ -333,6 +413,9 @@ pub(crate) fn sync_heaps() {
                 }
             }
         });
+        if let Some(phase) = phase {
+            phase.end();
+        }
         let of_tables = of_tables.into_inner();
         tabled += of_tables;
         mirrored += before.len() as u64 - of_tables;
@@ -340,7 +423,33 @@ pub(crate) fn sync_heaps() {
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
         let began = std::time::Instant::now();
-        let taken = written.take(start as usize, end as usize);
+        let phase = profile.then(|| crate::timeline::span("the heaps' records: asking"));
+        let taken = if sync_wide() {
+            let chunk = 64 * crate::watch::PAGE;
+            let chunks = take_chunks(start as usize, end as usize, chunk);
+            if chunks.len() > 2 {
+                let results: Vec<std::sync::Mutex<Vec<(usize, usize)>>> = (0..chunks.len())
+                    .map(|_| std::sync::Mutex::new(Vec::new()))
+                    .collect();
+                crate::land::each_view(true, chunks.len(), &|i| {
+                    let (from, to) = chunks[i];
+                    let mut part = written.take(from, to);
+                    results[i].lock().unwrap().append(&mut part);
+                });
+                let mut taken: Vec<(usize, usize)> = Vec::new();
+                for slot in results {
+                    taken.extend(slot.into_inner().unwrap());
+                }
+                taken
+            } else {
+                written.take(start as usize, end as usize)
+            }
+        } else {
+            written.take(start as usize, end as usize)
+        };
+        if let Some(phase) = phase {
+            phase.end();
+        }
         spent[0] += since(began);
         let mut parts: Vec<(usize, usize)> = Vec::new();
         for (range_from, range_end) in taken {
@@ -356,18 +465,23 @@ pub(crate) fn sync_heaps() {
         let began = std::time::Instant::now();
         let copied = host.copied_begin(step as usize);
         let samplers = heap.samplers();
-        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(SYNC_PAGES).map(|_| Default::default()).collect();
+        let found: Vec<std::sync::Mutex<SyncPart>> = parts.chunks(pages_a_job).map(|_| Default::default()).collect();
+        let phase = profile.then(|| crate::timeline::span("the heaps' records: pages read and compared"));
         crate::land::each_view(true, found.len(), &|n| {
             let mut out = SyncPart::default();
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
-            for &(from, to) in parts.chunks(SYNC_PAGES).nth(n).unwrap_or_default() {
+            for &(from, to) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
+                let at = profile.then(std::time::Instant::now);
                 page_bytes.resize(to - from, 0);
                 if !crate::host::read_into(from as *const u8, &mut page_bytes) {
                     continue;
+                }
+                if let Some(at) = at {
+                    out.ns[0] += since(at);
                 }
                 out.pages += 1;
                 out.views += u64::from(crate::watch::guarded(from, to));
@@ -384,9 +498,14 @@ pub(crate) fn sync_heaps() {
                 // Only the records that are not the ones last seen
                 // there (`host::Copied::changes`).
                 changed.clear();
+                let at = profile.then(std::time::Instant::now);
                 // SAFETY: the parts are ranges of the heap apart from one
                 // another, and only records that lie whole in one are its.
                 unsafe { copied.changes(first as u32, &records[..(count * step) as usize], &mut changed) };
+                if let Some(at) = at {
+                    out.ns[1] += since(at);
+                }
+                let at = profile.then(std::time::Instant::now);
                 for &index in &changed {
                     let at = (u64::from(index) - first) as usize * step as usize;
                     let word = |n: usize| {
@@ -429,9 +548,15 @@ pub(crate) fn sync_heaps() {
                         2
                     }] += 1;
                 }
+                if let Some(at) = at {
+                    out.ns[2] += since(at);
+                }
             }
             *found[n].lock().unwrap_or_else(|e| e.into_inner()) = out;
         });
+        if let Some(phase) = phase {
+            phase.end();
+        }
         drop(copied);
         for part in found {
             let mut part = part.into_inner().unwrap_or_else(|e| e.into_inner());
@@ -448,14 +573,21 @@ pub(crate) fn sync_heaps() {
             for (kind, n) in kinds.iter_mut().zip(part.kinds) {
                 *kind += n;
             }
+            for (ns, n) in job_ns.iter_mut().zip(part.ns) {
+                *ns += n;
+            }
         }
         spent[1] += since(began);
         let began = std::time::Instant::now();
-        crate::land::each_view(true, make.len().div_ceil(SYNC_AT_A_TIME), &|n| {
-            for &index in make.chunks(SYNC_AT_A_TIME).nth(n).unwrap_or_default() {
+        let phase = profile.then(|| crate::timeline::span("the heaps' records: made"));
+        crate::land::each_view(true, make.len().div_ceil(records_a_job), &|n| {
+            for &index in make.chunks(records_a_job).nth(n).unwrap_or_default() {
                 host.mirror(index, start + u64::from(index) * step, false);
             }
         });
+        if let Some(phase) = phase {
+            phase.end();
+        }
         spent[2] += since(began);
         if !wait.is_empty() {
             host.copied_wait(frame, std::mem::take(&mut wait));
@@ -473,7 +605,48 @@ pub(crate) fn sync_heaps() {
     for (count, n) in SYNCED_KINDS.iter().zip(kinds) {
         count.fetch_add(n, Relaxed);
     }
+    if profile {
+        for (count, n) in SYNC_JOBS_NS.iter().zip(job_ns) {
+            count.fetch_add(n, Relaxed);
+        }
+    }
 }
+
+#[cfg(windows)]
+fn sync_profile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_PROFILE"))
+}
+
+/// Of [`sync_heaps`]'s page jobs since the last frame line, on all threads:
+/// nanoseconds reading pages, comparing them with what was last seen, and
+/// sorting out the records that changed.
+#[cfg(windows)]
+static SYNC_JOBS_NS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Pages and records [`sync_heaps`] gives a thread at a time
+/// (`VICTORY_SYNC_FINE=1`: [`SYNC_PAGES_FINE`] and [`SYNC_AT_A_TIME_FINE`];
+/// otherwise [`SYNC_PAGES`] and [`SYNC_AT_A_TIME`], as before).
+///
+/// A round for a submission finds a dozen pages or so: by eight a job that
+/// was two jobs, on two of the six threads, while the submission waited
+/// for the round (2 to 3.4 ms at a time, run city4).
+#[cfg(windows)]
+fn sync_jobs() -> (usize, usize) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    #[cfg(feature = "diagnostics")]
+    let picked = crate::ab::pick("VICTORY_SYNC_FINE");
+    #[cfg(not(feature = "diagnostics"))]
+    let picked = None;
+    let fine = picked.unwrap_or_else(|| *ON.get_or_init(|| crate::switch::on("VICTORY_SYNC_FINE")));
+    if fine { (SYNC_PAGES_FINE, SYNC_AT_A_TIME_FINE) } else { (SYNC_PAGES, SYNC_AT_A_TIME) }
+}
+
+#[cfg(windows)]
+const SYNC_PAGES_FINE: usize = 2;
+
+#[cfg(windows)]
+const SYNC_AT_A_TIME_FINE: usize = 64;
 
 /// Of those mirrored, since the last frame line: no view, a view of an object,
 /// another, a sampler; waited and no draw came.
@@ -493,6 +666,8 @@ struct SyncPart {
     make: Vec<u32>,
     wait: Vec<u32>,
     kinds: [u64; 5],
+    /// Nanoseconds reading, comparing, sorting out ([`SYNC_JOBS_NS`]).
+    ns: [u64; 3],
 }
 
 /// Pages [`sync_heaps`] gives a thread at a time.
@@ -522,6 +697,7 @@ static SYNC_SPLIT: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::draw::in_place_indirect_line(frames);
     let [twins, moved, lost] = [0, 1, 2].map(|i| host::TWINS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if twins > 0 {
         tracing::info!(
@@ -534,8 +710,22 @@ pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros, tabled, later, waited] = [0, 1, 2, 3, 4, 5, 6].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let split = [0, 1, 2, 3, 4].map(|i| SYNC_SPLIT[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64);
     let kinds = [0, 1, 2, 3, 4].map(|i| SYNCED_KINDS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let jobs = [0, 1, 2].map(|i| SYNC_JOBS_NS[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / 1e6 / frames);
+    let quick = [0, 1].map(|i| host::SPANS_QUICK[i].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if pages == 0 {
         return;
+    }
+    if sync_profile() || quick.iter().any(|&n| n > 0.0) {
+        tracing::info!(
+            "the heaps' records' jobs per frame (VICTORY_SYNC_FINE={}): on all threads {:.2} ms reading pages, {:.2} comparing, \
+             {:.2} sorting out; writes of slots {:.0} leaving the spans alone (VICTORY_SPANS_QUICK), {:.0} under their lock",
+            u8::from(sync_jobs().0 == SYNC_PAGES_FINE),
+            jobs[0],
+            jobs[1],
+            jobs[2],
+            quick[0],
+            quick[1]
+        );
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
@@ -840,9 +1030,17 @@ impl View {
 /// without the address: as many as the title has kinds of textures and
 /// buffers, however often it moves them).
 /// `VICTORY_VIEW_INLINE=0`: every view is an entry, as before.
+#[cfg_attr(test, derive(Default))]
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// How many entries of [`list`](Self::list) hold a constant buffer view
+    /// and how many a view of placed memory (freed ones included, as they
+    /// still hold their view until reused), kept as entries change rather
+    /// than counted for the memory line: that walk over every entry took
+    /// up to 49 ms at 30 million entries.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    address_entries: [u64; 2],
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -850,6 +1048,11 @@ struct Views {
     /// The shapes of views of placed memory, and where each is.
     shapes: Vec<Shape>,
     shape_index: std::collections::BTreeMap<Shape, u32>,
+    /// Entries of views that no resource releases (constant buffer views
+    /// and views of placed memory that did not fit a record), oldest first,
+    /// with the generation each was made at: past [`ownerless_cap`] the
+    /// oldest is freed, so they cannot grow for the whole run.
+    ownerless: std::collections::VecDeque<(u32, u32)>,
 }
 
 /// Read far more often than written: every slot a draw reads through a
@@ -858,12 +1061,34 @@ struct Views {
 /// or shape) and a released resource take it alone.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
+    #[cfg(all(windows, feature = "diagnostics"))]
+    address_entries: [0, 0],
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
+    ownerless: std::collections::VecDeque::new(),
 });
+
+/// How many table entries of views without a resource are kept
+/// ([`Views::ownerless`]). Once the shapes of placed views are full (the
+/// title makes far more of them than it has kinds of textures: 4,194,304
+/// after half an hour of play), every placed view it writes becomes such an
+/// entry, some 15,000 a second: kept for the run they took 16.7 GB after 70
+/// minutes and the frame rate fell by half. A descriptor names the view it
+/// was written with for a frame or a few, so the oldest of a million are
+/// long out of use; one naming a freed entry reads as stale (no view).
+/// `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (default 0: all, as before; Vice-Tay uses 1048576).
+fn ownerless_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_OWNERLESS_VIEWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
@@ -992,11 +1217,59 @@ impl Views {
     /// The record words of `view` as a table entry: its entry (a new or a
     /// freed one if the view is not there yet) and that entry's generation.
     fn entry(&mut self, view: View) -> [u32; 2] {
+        self.entry_kept(view, ownerless_cap())
+    }
+
+    /// [`entry`](Self::entry), keeping at most `cap` entries of views
+    /// without a resource (0: all).
+    fn entry_kept(&mut self, view: View, cap: usize) -> [u32; 2] {
+        let ownerless = view.resources() == [0, 0] && matches!(view, View::Constant(..) | View::Placed(..));
+        let fresh = !self.index.contains_key(&view);
+        let words = self.entry_made(view);
+        if ownerless && fresh {
+            self.ownerless.push_back((words[0], words[1]));
+            while cap != 0 && self.ownerless.len() > cap {
+                let (i, generation) = self.ownerless.pop_front().expect("longer than cap");
+                self.free_ownerless(i, generation);
+            }
+        }
+        words
+    }
+
+    /// Frees entry `i` if it still holds the view it had at `generation`
+    /// (it may have been freed and made again for another view since).
+    fn free_ownerless(&mut self, i: u32, generation: u32) {
+        let Some((view, current)) = self.list.get(i as usize).cloned() else {
+            return;
+        };
+        if current != generation || self.index.get(&view) != Some(&i) {
+            return;
+        }
+        self.index.remove(&view);
+        self.list[i as usize].1 = ((generation + 1) & GENERATIONS).max(1);
+        self.free.push(i);
+    }
+
+    /// Counts `view` in or out of [`address_entries`](Self::address_entries).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn count_address(&mut self, view: &View, added: bool) {
+        let kind = match view {
+            View::Constant(..) => 0,
+            View::Placed(..) => 1,
+            _ => return,
+        };
+        let n = &mut self.address_entries[kind];
+        *n = if added { *n + 1 } else { n.saturating_sub(1) };
+    }
+
+    fn entry_made(&mut self, view: View) -> [u32; 2] {
         let i = match self.index.get(&view) {
             Some(&i) => i,
             None => {
                 let i = match self.free.pop() {
                     Some(i) => {
+                        #[cfg(all(windows, feature = "diagnostics"))]
+                        self.count_address(&self.list[i as usize].0.clone(), false);
                         self.list[i as usize].0 = view.clone();
                         i
                     }
@@ -1005,6 +1278,8 @@ impl Views {
                         self.list.len() as u32 - 1
                     }
                 };
+                #[cfg(all(windows, feature = "diagnostics"))]
+                self.count_address(&view, true);
                 for r in view.resources().into_iter().filter(|&r| r != 0) {
                     self.by_resource.entry(r).or_default().push(i);
                 }
@@ -1072,14 +1347,7 @@ pub(crate) fn views_kept() -> [u64; 8] {
     let views = views_read();
     let each = size_of::<(View, u32)>() as u64;
     let shape = size_of::<Shape>() as u64;
-    let (mut constants, mut placed) = (0, 0);
-    for (view, _) in &views.list {
-        match view {
-            View::Constant(..) => constants += 1,
-            View::Placed(..) => placed += 1,
-            _ => {}
-        }
-    }
+    let [constants, placed] = views.address_entries;
     [
         views.list.len() as u64,
         views.free.len() as u64,
@@ -1321,6 +1589,56 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// Copy only the fields of a placed resource description. Padding can differ
+/// between two views of the same texture and the caller may leave it unwritten.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    let mut fields = [0; 14];
+    // SAFETY: the caller supplies a 56-byte ResourceDesc, possibly unaligned.
+    // Dimension occupies word 0. Alignment through Flags occupy words 2..13.
+    unsafe {
+        fields[0] = src.read_unaligned();
+        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
+    }
+    Some(fields)
+}
+
+/// The words of a placed view's description with those its kind does not
+/// use set to zero. The first ten words are the PC's view description: for a
+/// shader resource view, the format, the dimension, the component mapping,
+/// a word of padding (the union that follows starts on 8 bytes) and the
+/// union's six words; for an unordered access view, the format, the
+/// dimension and the union's eight words. Each dimension uses only the head
+/// of the union, and the title leaves the rest unwritten: run vt-shapes saw
+/// 131,392 values in word 3 and 36,413 in word 9 of a million shapes, each
+/// a new shape for the same view. Words 10 and on (the address and the
+/// console's own fields) are kept; an unknown dimension keeps all.
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    let mut d = words(desc)?;
+    // Words of the union each dimension uses (D3D12_BUFFER_SRV and the like).
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(d[1] as usize).copied())
+    } else {
+        // D3D12_SRV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D, cube, cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(d[1] as usize).copied())
+    };
+    if let Some(used) = used.filter(|_| d[1] != 0) {
+        if !unordered {
+            d[3] = 0;
+        }
+        d[start + used..10].fill(0);
+    }
+    Some(d)
+}
+
 /// Device methods 0x230 and 0x238: shader resource and unordered access
 /// views of memory the title placed itself, `(resource desc, view desc,
 /// handle)`.
@@ -1330,9 +1648,27 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if placed_shape_clean() {
+        if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
+            record(handle, View::Placed(false, resource, desc));
+        }
+    } else if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
+}
+
+/// Placed views key on cleaned words (Vice-Tay #27 placed-view leak fix,
+/// `VICTORY_PLACED_SHAPE_CLEAN=1`); off keeps every word as before.
+/// In test builds, defaults to on unless `VICTORY_PLACED_SHAPE_CLEAN=0`.
+fn placed_shape_clean() -> bool {
+    static CLEAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CLEAN.get_or_init(|| {
+        if cfg!(test) {
+            std::env::var("VICTORY_PLACED_SHAPE_CLEAN").as_deref() != Ok("0")
+        } else {
+            std::env::var("VICTORY_PLACED_SHAPE_CLEAN").as_deref() == Ok("1")
+        }
+    })
 }
 
 pub(crate) extern "system" fn create_placed_uav(
@@ -1341,7 +1677,11 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if placed_shape_clean() {
+        if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
+            record(handle, View::Placed(true, resource, desc));
+        }
+    } else if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1666,6 +2006,76 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// Two placed views alike but for the words their kind does not use
+    /// (the padding after the component mapping, the union's unused tail)
+    /// are one record; a used word still tells them apart.
+    #[test]
+    fn placed_views_ignore_unused_view_words() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        let resource = [1, 0, 0, 0, 0x4000, 0, 1, 0x10001, 0, 1, 0, 1, 0, 0];
+        // A structured buffer view: words 4-5 first element, 6 count, 7
+        // stride, 8 flags; 3 and 9 are not used.
+        let srv = [0, 1, 0x1688, 0, 16, 0, 64, 16, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        // An unordered buffer view: words 2-3 first element, 4 count, 5
+        // stride, 6-7 counter offset, 8 flags; 9 is not used.
+        let uav = [0, 1, 16, 0, 64, 16, 0, 0, 0, 0, 0x1000, 0x6, 0, 0, 0, 0];
+        for (unordered, create, desc, unused, used) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _), srv, [3usize, 9], 6usize),
+            (true, create_placed_uav, uav, [9, 9], 4),
+        ] {
+            create(null, &resource, &desc, handle);
+            let first = slot;
+            assert_eq!(view(handle), Some(View::Placed(unordered, resource, desc)));
+            let mut noisy = desc;
+            for w in unused {
+                noisy[w] = 0xdead_beef;
+            }
+            create(null, &resource, &noisy, handle);
+            assert_eq!(slot, first, "unused words left out");
+            let mut other = desc;
+            other[used] += 1;
+            create(null, &resource, &other, handle);
+            assert_ne!(slot, first, "a used word counts");
+        }
+        // A 2D texture view uses four words of the union (4-7): 8 and 9 go.
+        let mut tex = [28, 4, 0x1688, 0x77, 0, 1, 0, 0, 0x55, 0x66, 0x2000, 0x6, 0, 0, 0, 0];
+        create_placed_srv(null, &resource, &tex, handle);
+        tex[3] = 0;
+        (tex[8], tex[9]) = (0, 0);
+        assert_eq!(view(handle), Some(View::Placed(false, resource, tex)));
+    }
+
+    #[test]
+    fn placed_views_share_resources_across_description_padding() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let view_desc = [0u32; 16];
+        let null = std::ptr::null();
+        let mut resource = [3, 0, 0, 0, 8, 0, 8, 0x10001, 28, 1, 0, 0, 0, 0];
+        let expected = resource;
+        for (unordered, create) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _)),
+            (true, create_placed_uav),
+        ] {
+            create(null, &expected, &view_desc, handle);
+            let first = slot;
+            resource[1] = 0xaaaa_aaaa;
+            resource[13] = 0xbbbb_bbbb;
+            create(null, &resource, &view_desc, handle);
+            assert_eq!(slot, first);
+            assert_eq!(
+                view(handle),
+                Some(View::Placed(unordered, expected, view_desc))
+            );
+            let mut other = resource;
+            other[12] = 4;
+            create(null, &other, &view_desc, handle);
+            assert_ne!(slot, first);
+        }
+    }
+
     #[test]
     fn views_survive_copies() {
         let null = std::ptr::null();
@@ -1722,6 +2132,76 @@ mod tests {
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
     }
 
+    /// The counts of constant buffer and placed entries the memory line
+    /// reads follow the table as a walk over it would count: a freed entry
+    /// reused for another kind is counted out and in.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn diagnostic_counts_follow_distinct_entries_including_reused_slots() {
+        let walk = |views: &Views| {
+            let count = |f: fn(&View) -> bool| views.list.iter().filter(|(v, _)| f(v)).count() as u64;
+            [count(|v| matches!(v, View::Constant(..))), count(|v| matches!(v, View::Placed(..)))]
+        };
+        let mut views = Views::default();
+        // A slot freed by forget still holds the old resource view, with its
+        // new generation; it can be reused for a view without a resource.
+        views.list.push((View::Shader(1, None), 2));
+        views.free.push(0);
+        let constant = View::Constant(0x1234, 256);
+        assert_eq!(views.entry(constant.clone()), [0, 2]);
+        assert_eq!(views.entry(constant), [0, 2]);
+        let placed = View::Placed(false, [0; 14], [0; 16]);
+        let index = views.entry(placed.clone());
+        assert_eq!(views.entry(placed), index);
+        views.entry(View::Unordered(1, 2, None));
+        assert_eq!(views.address_entries, [1, 1]);
+        assert_eq!(views.address_entries, walk(&views));
+        // Under a cap of 2, placed views push the constant one out; its
+        // freed entry, reused, changes kind.
+        for n in 1..6u32 {
+            views.entry_kept(View::Placed(false, [n; 14], [n; 16]), 2);
+            assert_eq!(views.address_entries, walk(&views), "after placed view {n}");
+        }
+        views.entry_kept(View::Constant(0x5678, 512), 2);
+        assert_eq!(views.address_entries, walk(&views), "a constant view in a freed entry");
+    }
+
+    /// Entries of views no resource releases stay under their cap: the
+    /// oldest go stale, the newest still name their views, entries are
+    /// reused rather than added, and views of resources are never dropped.
+    #[test]
+    fn ownerless_entries_are_capped() {
+        let mut views = Views::default();
+        let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
+        let named = |views: &Views, words: [u32; 2], view: &View| {
+            views.list.get(words[0] as usize).is_some_and(|(v, g)| *g == words[1] && v == view)
+        };
+        let words: Vec<[u32; 2]> = (0..10).map(|n| views.entry_kept(placed(n), 4)).collect();
+        assert_eq!(views.index.len(), 4, "four kept");
+        assert!(views.list.len() <= 5, "entries reused, not added: {}", views.list.len());
+        for n in 0..6 {
+            assert!(!named(&views, words[n], &placed(n as u32)), "entry {n} stale");
+        }
+        for n in 6..10 {
+            assert!(named(&views, words[n], &placed(n as u32)), "entry {n} kept");
+        }
+        // The same view written again keeps its words.
+        assert_eq!(views.entry_kept(placed(9), 4), words[9]);
+        // A view of a resource is freed with the resource only.
+        let shader = View::Shader(0x1234, None);
+        let kept = views.entry_kept(shader.clone(), 4);
+        for n in 10..40 {
+            views.entry_kept(placed(n), 4);
+        }
+        assert!(named(&views, kept, &shader));
+        assert!(views.list.len() <= 6);
+        // 0 keeps them all.
+        for n in 40..60 {
+            views.entry_kept(placed(n), 0);
+        }
+        assert_eq!(views.index.len(), 1 + 4 + 20);
+    }
+
     /// The leak of run 65: a title that writes constant buffer views and
     /// views of placed memory at ever new addresses adds nothing to the
     /// table; one shape stands for all the placed views alike.
@@ -1734,7 +2214,8 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        // (Its padding words, 1 and 13, are zero: placed views leave them out.)
+        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
@@ -1823,5 +2304,148 @@ mod tests {
         // A size that does not match the count is not a placement.
         assert_eq!(create(desc, Placement { address, size: 7 }, &mut h), S_OK);
         assert_ne!(slot::<extern "system" fn(This) -> u64>(h, 0x48)(h), address);
+    }
+
+    /// Load test (`cargo test -p victory-gpu --lib --locked placed_view_shapes_load -- --ignored --nocapture`).
+    /// A million placed views whose descriptions differ only in padding words
+    /// make one shape; a million that really differ make a million. Then each
+    /// description word is varied alone, to list the words that tell shapes apart.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "load test: about a million table inserts"]
+    fn placed_view_shapes_load() {
+        use crate::loadprobe::{mix, private_bytes};
+        const N: u64 = 1_000_000;
+        let shapes = || VIEWS.read().unwrap().shapes.len();
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        // A 2D texture SRV (dimension 4): the union's words 4-7 are used; 3, 8 and 9 are padding.
+        let resource = [3, 0, 0, 0, 0x4321, 0, 0x4321, 0x10001, 28, 1, 0, 0, 0, 0];
+        let desc = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x2000, 0x6, 0, 0, 0, 0];
+        let before = (shapes(), private_bytes());
+        for n in 0..N {
+            let mut r = resource;
+            r[1] = mix(n);
+            r[13] = mix(n + N);
+            let mut d = desc;
+            (d[3], d[8], d[9]) = (mix(n + 2 * N), mix(n + 3 * N), mix(n + 4 * N));
+            let address = 0xd_0000_0000 + n * 0x1_0000;
+            (d[10], d[11]) = (address as u32, (address >> 32) as u32);
+            create_placed_srv(null, &r, &d, handle);
+        }
+        let padding = (shapes() - before.0, private_bytes().saturating_sub(before.1));
+        eprintln!("padding only: {N} views -> {} new shapes, private memory +{} KiB", padding.0, padding.1 >> 10);
+        // Control: the mip level (word 4) really differs.
+        let mid = (shapes(), private_bytes());
+        for n in 0..N / 10 {
+            let mut d = desc;
+            (d[4], d[5]) = (n as u32 + 1, 0);
+            create_placed_srv(null, &resource, &d, handle);
+        }
+        let control = (shapes() - mid.0, private_bytes().saturating_sub(mid.1));
+        eprintln!("control: {} really different views -> {} new shapes, private memory +{} KiB", N / 10, control.0, control.1 >> 10);
+        assert_eq!(control.0 as u64, N / 10, "views that differ are shapes");
+        // One word at a time, 64 values each, from a base the other tests do not use.
+        let mut identity = Vec::new();
+        for (name, count) in [("resource", 14usize), ("view", 16)] {
+            for w in 0..count {
+                if name == "view" && (w == 10 || w == 11) {
+                    continue; // the address
+                }
+                let base = shapes();
+                for v in 0..64u32 {
+                    let mut r = [3, 0, 0, 0, 0x7777, 0, 0x7777, 0x10001, 28, 1, 0, 0, 0, 0];
+                    let mut d = [28, 4, 0x1688, 0, 0, 1, 0, 0, 0, 0, 0x2000, 0x6, 0, 0, 0, 0];
+                    let v = 0x5000_0000 + v * 0x1111;
+                    if name == "resource" { r[w] = v } else { d[w] = v }
+                    create_placed_srv(null, &r, &d, handle);
+                }
+                let grew = shapes() - base;
+                eprintln!("{name} word {w:2}: 64 values -> {grew} shapes");
+                if grew > 2 {
+                    identity.push(format!("{name}[{w}]"));
+                }
+            }
+        }
+        eprintln!("words that tell shapes apart: {identity:?}");
+        assert!(padding.0 <= 4, "padding alone made {} shapes out of {N}", padding.0);
+    }
+}
+
+#[cfg(windows)]
+fn sync_wide() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_SYNC_WIDE"))
+}
+
+fn take_chunks(start: usize, end: usize, chunk: usize) -> Vec<(usize, usize)> {
+    assert!(chunk.is_power_of_two());
+    if start >= end {
+        return Vec::new();
+    }
+
+    let mut ranges = Vec::new();
+    let mut cur = start;
+
+    while cur < end {
+        let rem = cur % chunk;
+        let next = if rem == 0 {
+            cur.saturating_add(chunk)
+        } else {
+            cur.saturating_add(chunk - rem)
+        };
+        let to = next.min(end);
+        ranges.push((cur, to));
+        cur = to;
+    }
+
+    ranges
+}
+
+#[cfg(test)]
+mod take_chunk_tests {
+    use super::take_chunks;
+
+    #[test]
+    fn exact_cover() {
+        assert_eq!(take_chunks(0, 12, 4), vec![(0, 4), (4, 8), (8, 12)]);
+    }
+
+    #[test]
+    fn contiguous() {
+        let ranges = take_chunks(3, 21, 4);
+        assert_eq!(ranges.first().unwrap().0, 3);
+        assert_eq!(ranges.last().unwrap().1, 21);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn aligned_inner_boundaries() {
+        let ranges = take_chunks(3, 21, 4);
+        for pair in ranges.windows(2) {
+            assert_eq!(pair[0].1 % 4, 0);
+        }
+    }
+
+    #[test]
+    fn unaligned_ends() {
+        assert_eq!(
+            take_chunks(3, 21, 4),
+            vec![(3, 4), (4, 8), (8, 12), (12, 16), (16, 20), (20, 21)]
+        );
+    }
+
+    #[test]
+    fn single_partial_chunk() {
+        assert_eq!(take_chunks(5, 10, 4096), vec![(5, 10)]);
+    }
+
+    #[test]
+    fn empty() {
+        assert_eq!(take_chunks(10, 10, 4), Vec::new());
+        assert_eq!(take_chunks(11, 10, 4), Vec::new());
     }
 }
