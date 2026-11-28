@@ -1437,6 +1437,309 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// `ClearUnorderedAccessViewUint(view in the current heap, view, resource,
+/// values, count, rects)`: the view's record names the resource.
+///
+/// The title clears two things this way, once, when the world begins: a
+/// 21 MB buffer and an 80x45 texture (a value per 16x16 tile of the
+/// picture). Without the method both kept what their memory held.
+extern "system" fn clear_uav_uint(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: the title passes four values (null is tolerated).
+    #[cfg(windows)]
+    if let Some(&values) = unsafe { values.as_ref() } {
+        clear_uav(this, cpu, values, false, count, rects);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, cpu, values, count, rects);
+}
+
+/// `ClearUnorderedAccessViewFloat(...)`, as [`clear_uav_uint`].
+extern "system" fn clear_uav_float(
+    this: This,
+    _gpu: u64,
+    cpu: u64,
+    _resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    // SAFETY: as above.
+    #[cfg(windows)]
+    if let Some(values) = unsafe { values.as_ref() } {
+        clear_uav(this, cpu, values.map(f32::to_bits), true, count, rects);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, cpu, values, count, rects);
+}
+
+/// A clear of the unordered access view recorded at `cpu`, done as a copy
+/// from memory that holds the clear's texels (`values` as
+/// `ClearUnorderedAccessViewUint` puts them, or as floats' bits: only zeros
+/// for those): into its texture (the view's level and layers, or `rects` of
+/// them), or into its buffer's host copy as a shader's write.
+#[cfg(windows)]
+fn clear_uav(this: This, cpu: u64, values: [u32; 4], float: bool, count: u32, rects: *const Rect) {
+    use windows::Win32::Graphics::Direct3D12::*;
+    let (Some(list), Some(host)) = (host_list(this), crate::host::host()) else {
+        return;
+    };
+    let rects: &[Rect] = if count > 0 && !rects.is_null() {
+        // SAFETY: the title passes `count` rectangles.
+        unsafe { std::slice::from_raw_parts(rects, count as usize) }
+    } else {
+        &[]
+    };
+    let unsupported = |what: &str| {
+        static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if !said.iter().any(|s| s == what) {
+            tracing::warn!("a clear of an unordered access view left out: {what}");
+            said.push(what.to_owned());
+        }
+    };
+    let Some(view @ crate::descriptor::View::Unordered(resource, _, desc)) = crate::descriptor::view(cpu) else {
+        return unsupported("not a view of a resource");
+    };
+    let poison = match clear_mode() {
+        ClearMode::Off => return,
+        ClearMode::Clear => None,
+        ClearMode::Poison(byte, kinds) => Some((byte, kinds)),
+    };
+    let zero = values == [0; 4];
+    let resource = resource as This;
+    if crate::resource::buffer_bytes(resource).is_some() {
+        let poison = poison.filter(|p| p.1 & 1 != 0).map(|p| p.0);
+        // Its range, in its host copy: of a raw or structured view the
+        // first value is put in every dword, of a typed one an element.
+        let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+            return unsupported("a buffer without a host copy");
+        };
+        const RAW: u32 = 1;
+        let texel = match (poison, desc) {
+            (Some(byte), _) => Some(vec![byte; 4]),
+            _ if zero => None,
+            _ if float => return unsupported("floats other than zero"),
+            (_, Some(d)) if d[8] & RAW != 0 || d[5] > 0 => Some(values[0].to_le_bytes().to_vec()),
+            (_, Some(d)) => match texel_bits(crate::resource::pc_format(d[0]), values) {
+                Some(texel) => Some(texel),
+                None => return unsupported(&format!("values other than zero in format {}", d[0])),
+            },
+            (_, None) => return unsupported("a buffer view without a description"),
+        };
+        let each = texel.as_ref().map_or(1, Vec::len) as u64;
+        let Some(from) = clear_source(host, len, texel.as_deref(), len as u32, (len / each) as u32) else {
+            return;
+        };
+        list.keep(&from);
+        list.place_fill(&shadow, address, len, &from);
+        return;
+    }
+    if crate::resource::twin(resource).is_some() {
+        return unsupported("a depth texture's colour twin");
+    }
+    let Some(texture) = crate::resource::host_resource(resource) else {
+        return unsupported("a texture without a host copy");
+    };
+    // SAFETY: a live texture.
+    let t = unsafe { texture.GetDesc() };
+    let levels = u32::from(t.MipLevels.max(1));
+    let layers = if t.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(t.DepthOrArraySize) };
+    // The view's level, its layers (or slices of a volume) and plane.
+    const D1: u32 = 2;
+    const D1_ARRAY: u32 = 3;
+    const D2: u32 = 4;
+    const D2_ARRAY: u32 = 5;
+    const D3: u32 = 8;
+    let (level, first, n, plane) = match desc {
+        None => (0, 0, u32::MAX, 0),
+        Some(d) => match d[1] {
+            D1 => (d[2], 0, 1, 0),
+            D2 => (d[2], 0, 1, d[3]),
+            D1_ARRAY => (d[2], d[3], d[4], 0),
+            D2_ARRAY => (d[2], d[3], d[4], d[5]),
+            D3 => (d[2], d[3], d[4], 0),
+            _ => return unsupported("a view of another dimension"),
+        },
+    };
+    let poison = poison.filter(|p| p.1 & 2 != 0).map(|p| p.0);
+    let texel = if zero || poison.is_some() {
+        None
+    } else if float {
+        return unsupported("floats other than zero");
+    } else {
+        let format = desc.map(|d| crate::resource::pc_format(d[0])).filter(|&f| f != 0).unwrap_or(t.Format.0 as u32);
+        match texel_bits(format, values) {
+            Some(texel) => Some(texel),
+            None => return unsupported(&format!("values other than zero in format {format}")),
+        }
+    };
+    let volume = t.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let (layers_of, slices) = if volume { (0..1, Some((first, n))) } else { (first..first.saturating_add(n).min(layers), None) };
+    const COPY_DEST: u32 = 0x400;
+    ensure_state(list, resource, COPY_DEST);
+    for layer in layers_of {
+        let sub = level + layer * levels + plane * levels * layers;
+        let mut whole = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut row = 0u64;
+        // SAFETY: plain query; the out pointers are ours.
+        unsafe { host.device.GetCopyableFootprints(&t, sub, 1, 0, Some(&mut whole), None, Some(&mut row), None) };
+        let f = whole.Footprint;
+        if f.Width == 0 {
+            continue;
+        }
+        let texel_bytes = (row / u64::from(f.Width)).max(1) as u32;
+        if texel.as_ref().is_some_and(|t| t.len() as u32 != texel_bytes) {
+            return unsupported("values other than zero for a host texel of another size");
+        }
+        let texel = match poison {
+            Some(byte) => Some(vec![byte; texel_bytes as usize]),
+            None => texel.clone(),
+        };
+        // Rectangles (of the level), else all of it; slices of a volume.
+        let (z, depth) = match slices {
+            Some((first, n)) => (first.min(f.Depth), n.min(f.Depth - first.min(f.Depth))),
+            None => (0, f.Depth),
+        };
+        let boxes: Vec<[u32; 4]> = if rects.is_empty() {
+            vec![[0, 0, f.Width, f.Height]]
+        } else {
+            rects
+                .iter()
+                .map(|r| [r.left.max(0) as u32, r.top.max(0) as u32, (r.right.max(0) as u32).min(f.Width), (r.bottom.max(0) as u32).min(f.Height)])
+                .filter(|b| b[0] < b[2] && b[1] < b[3])
+                .collect()
+        };
+        for [left, top, right, bottom] in boxes {
+            let (width, height) = (right - left, bottom - top);
+            let pitch = (width * texel_bytes).next_multiple_of(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT);
+            let bytes = u64::from(pitch) * u64::from(height) * u64::from(depth);
+            let Some(from) = clear_source(host, bytes, texel.as_deref(), pitch, width) else {
+                return;
+            };
+            list.keep(&from);
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: a borrowed pointer the location never releases.
+                pResource: unsafe { std::mem::transmute_copy(&from) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: 0,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT { Format: f.Format, Width: width, Height: height, Depth: depth, RowPitch: pitch },
+                    },
+                },
+            };
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+            };
+            // SAFETY: an open list; live resources, the region inside both.
+            unsafe { list.list.CopyTextureRegion(&dst, left, top, z, &src, None) };
+        }
+    }
+    list.texture_written(resource);
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq)]
+enum ClearMode {
+    Clear,
+    Off,
+    /// The byte, and of what: 1 buffers, 2 textures.
+    Poison(u8, u8),
+}
+
+/// What a clear of an unordered access view does: nothing, as before
+/// (default); clears (`VICTORY_CLEAR_UAV=1`); or, to see what the title clears,
+/// fills it with bytes 0x3f instead (`VICTORY_CLEAR_UAV=poison`, or
+/// `poison:<byte in hex>[:buffer|:texture]`).
+#[cfg(windows)]
+fn clear_mode() -> ClearMode {
+    static MODE: std::sync::OnceLock<ClearMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_CLEAR_UAV").as_deref() {
+        Ok("1") => ClearMode::Clear,
+        Ok("0") => ClearMode::Off,
+        Ok("poison") => ClearMode::Poison(0x3f, 3),
+        Ok(v) if v.starts_with("poison:") => {
+            let mut parts = v[7..].split(':');
+            let byte = parts.next().and_then(|b| u8::from_str_radix(b, 16).ok()).unwrap_or(0x3f);
+            let kinds = match parts.next() {
+                Some("buffer") => 1,
+                Some("texture") => 2,
+                _ => 3,
+            };
+            ClearMode::Poison(byte, kinds)
+        }
+        _ => ClearMode::Off,
+    })
+}
+
+/// One texel of `format` with the low bits of each of `values` in its
+/// channels, as `ClearUnorderedAccessViewUint` writes them; `None` for a
+/// format not known here.
+fn texel_bits(format: u32, values: [u32; 4]) -> Option<Vec<u8>> {
+    let bits: &[u32] = match format {
+        1..=4 => &[32; 4],
+        5..=8 => &[32; 3],
+        9..=14 => &[16; 4],
+        15..=18 => &[32; 2],
+        23..=25 => &[10, 10, 10, 2],
+        26 => &[11, 11, 10],
+        27..=32 => &[8; 4],
+        33..=38 => &[16; 2],
+        39..=43 => &[32],
+        48..=52 => &[8; 2],
+        53..=59 => &[16],
+        60..=64 => &[8],
+        _ => return None,
+    };
+    let (mut texel, mut at) = (0u128, 0);
+    for (&value, &n) in values.iter().zip(bits) {
+        texel |= u128::from(value & (u32::MAX >> (32 - n))) << at;
+        at += n;
+    }
+    Some(texel.to_le_bytes()[..(at / 8) as usize].to_vec())
+}
+
+/// A buffer of at least `bytes` to copy a clear from: zeros (one on the card,
+/// kept and grown), or rows of `pitch` bytes with `width` texels `texel`.
+#[cfg(windows)]
+fn clear_source(
+    host: &crate::host::Host,
+    bytes: u64,
+    texel: Option<&[u8]>,
+    pitch: u32,
+    width: u32,
+) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+    let Some(texel) = texel else {
+        static ZEROS: std::sync::Mutex<Option<(ID3D12Resource, u64)>> = std::sync::Mutex::new(None);
+        let mut zeros = ZEROS.lock().unwrap_or_else(|e| e.into_inner());
+        if zeros.as_ref().is_none_or(|z| z.1 < bytes) {
+            let size = bytes.next_power_of_two().max(1 << 20);
+            // (A buffer made on the card holds zeros.)
+            *zeros = Some((host.uav_buffer(size)?, size));
+        }
+        return zeros.as_ref().map(|z| z.0.clone());
+    };
+    let (buffer, data) = host.upload_buffer(bytes)?;
+    let row: Vec<u8> = texel.iter().copied().cycle().take(texel.len() * width as usize).collect();
+    for at in (0..bytes as usize).step_by(pitch as usize) {
+        // SAFETY: the buffer's mapping holds `bytes`; a row fits in a pitch.
+        unsafe { std::ptr::copy_nonoverlapping(row.as_ptr(), data.add(at), row.len().min(bytes as usize - at)) };
+    }
+    Some(buffer)
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
@@ -2257,7 +2560,7 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
 /// layout): IUnknown 3, object 4, device child 1, list 1, graphics list 96
 /// (59 as on PC, then console ones), then versions 1-6 (6 + 1 + 1 + 11 + 3
 /// + 13): 140 slots.
-const METHODS: [(usize, *const ()); 52] = [
+const METHODS: [(usize, *const ()); 54] = [
     (0, list_query as *const ()),
     (2, list_release as *const ()),
     (7, object::parent_device as *const ()),      // 0x38
@@ -2298,6 +2601,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (50, state::targets as *const ()),            // 0x190
     (51, clear_dsv as *const ()),                 // 0x198
     (52, clear_rtv as *const ()),                 // 0x1a0
+    (53, clear_uav_uint as *const ()),            // 0x1a8
+    (54, clear_uav_float as *const ()),           // 0x1b0
     (59, execute_indirect as *const ()),          // 0x1d8 indirect
     (60, copy_memory as *const ()),               // 0x1e0
     (68, state::depth_bounds as *const ()),       // 0x220 depth bounds
@@ -2382,6 +2687,18 @@ static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A clear's values go into a texel's channels by their low bits, as
+    /// `ClearUnorderedAccessViewUint` puts them.
+    #[test]
+    fn clear_values_fill_the_channels_low_bits_first() {
+        // R32_UINT, R16G16B16A16_FLOAT, R11G11B10_FLOAT, R8G8B8A8_UNORM.
+        assert_eq!(texel_bits(42, [0x1234_5678, 9, 9, 9]), Some(vec![0x78, 0x56, 0x34, 0x12]));
+        assert_eq!(texel_bits(10, [0x1_3c00, 0, 0xbc00, 1]), Some(vec![0, 0x3c, 0, 0, 0, 0xbc, 1, 0]));
+        assert_eq!(texel_bits(26, [0x7ff, 0, 0x3ff, 0]), Some(0xffc0_07ffu32.to_le_bytes().to_vec()));
+        assert_eq!(texel_bits(28, [0x1ff, 2, 3, 4]), Some(vec![0xff, 2, 3, 4]));
+        assert_eq!(texel_bits(71, [0; 4]), None);
+    }
 
     #[test]
     fn every_inline_command_falls_back_to_the_table() {

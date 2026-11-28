@@ -1058,6 +1058,9 @@ fn frame_ends() {
         if switch == "VICTORY_ASYNC_SUBMIT" && was && !will {
             behind::leave();
         }
+        if switch.starts_with("VICTORY_PLACE_") && was != will {
+            crate::cores::placing(switch, will);
+        }
     });
 }
 

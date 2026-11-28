@@ -48,6 +48,9 @@ pub(crate) struct Shadow {
     /// a range holds in part cannot say so in `copied`. Locked inside
     /// `copied`'s lock.
     ranged: Mutex<[(usize, usize, u64); 2]>,
+    /// What of the copy is known to hold every write the journal holds
+    /// ([`crate::watch::Stamp`], [`Shadow::fresh`]).
+    stamp: crate::watch::Stamp,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -83,6 +86,9 @@ pub(crate) struct Shadow {
     unsized_asks: AtomicU64,
     /// Whether shaders were ever declared to write it.
     written: std::sync::atomic::AtomicBool,
+    /// Who was declared to write it ([`WRITER_LANDS`]): [`BY_UNLANDED`],
+    /// [`BY_OTHERS`], both.
+    writers: AtomicU8,
     /// A number no other copy has had. Its address is no name for a copy:
     /// one let go and another made may share it.
     id: u64,
@@ -126,6 +132,9 @@ struct Card {
     sent: Mutex<SentRuns>,
     /// Whether something was put into `dirty` since it was last taken.
     touched: std::sync::atomic::AtomicBool,
+    /// The copy itself, once it is one of [`CARDED`]: what goes into
+    /// [`TOUCHED`] when `touched` is set.
+    me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -306,8 +315,38 @@ pub(crate) fn card_room_kept() -> u64 {
     card_limits().1.min(SEEN).saturating_sub(CARD_BYTES[0].load(Ordering::Relaxed) + CARD_REFUSED[1].load(Ordering::Relaxed))
 }
 
-/// The copies in the card's memory.
-static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+/// The copies in the card's memory, each with the title memory it copies
+/// (from, to).
+static CARDED: Mutex<Vec<(usize, usize, std::sync::Weak<Shadow>)>> = Mutex::new(Vec::new());
+
+/// Of [`CARDED`], those whose `touched` was set since [`card_dirty`] last
+/// took them (each once).
+static TOUCHED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
+
+/// `shadow`, which has a card side, is one of [`CARDED`].
+fn note_carded(shadow: &Arc<Shadow>) {
+    let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push((start, end, Arc::downgrade(shadow)));
+    if let Some(card) = &shadow.card {
+        let _ = card.me.set(Arc::downgrade(shadow));
+        // (Changed before it was one: taken as if after.)
+        if card.touched.load(Ordering::Acquire) {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(shadow));
+        }
+    }
+}
+
+/// Whether only the copies in the card's memory that matter are looked at
+/// (`VICTORY_CARD_NEAR=0`: every one of [`CARDED`], as before): by
+/// [`card_dirty`] those in [`TOUCHED`], by [`send_copied`] those that hold
+/// some of the bytes.
+///
+/// With title buffers of 64 KiB and more on the card (`VICTORY_CARD_BUFFERS_MIN_KB=64`)
+/// there are some 3,700 of them, and each of the 16 submissions a frame, and each
+/// title buffer copy, took a hold of every one under the lock of all.
+fn card_near() -> bool {
+    crate::toggled!("VICTORY_CARD_NEAR")
+}
 
 /// Since the last frame line: bytes copied to card sides and the ranges
 /// they were; pieces compared on the card, pieces fetched and their
@@ -327,7 +366,7 @@ pub(crate) fn card_stats() -> [u64; 10] {
     for (i, stat) in CARD_STATS.iter().enumerate() {
         out[i] = stat.swap(0, Ordering::Relaxed);
     }
-    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|w| w.strong_count() > 0).count() as u64;
+    out[7] = CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|c| c.2.strong_count() > 0).count() as u64;
     out[8] = CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed);
@@ -617,13 +656,9 @@ impl SentRuns {
 /// be merged came after are dropped.
 pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)> {
     let mut out = Vec::new();
-    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
     let fetched = RELAY_FETCHED.load(Ordering::Acquire);
-    carded.retain(|weak| {
-        let Some(shadow) = weak.upgrade() else {
-            return false;
-        };
-        let ranges = shadow
+    let take = |shadow: &Shadow| -> Vec<(usize, usize)> {
+        shadow
             .card
             .as_ref()
             .filter(|c| c.touched.swap(false, Ordering::AcqRel))
@@ -637,7 +672,30 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
                 }
                 ranges
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    };
+    // (Those set from here on go to the next call.)
+    let touched = std::mem::take(&mut *TOUCHED.lock().unwrap_or_else(|e| e.into_inner()));
+    if card_near() {
+        for shadow in touched.iter().filter_map(std::sync::Weak::upgrade) {
+            let ranges = take(&shadow);
+            if !ranges.is_empty() {
+                out.push((shadow, ranges));
+            }
+        }
+        // The copies that went, let go of now and then.
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(64) {
+            CARDED.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| c.2.strong_count() > 0);
+        }
+        return out;
+    }
+    let mut carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded.retain(|(_, _, weak)| {
+        let Some(shadow) = weak.upgrade() else {
+            return false;
+        };
+        let ranges = take(&shadow);
         if !ranges.is_empty() {
             out.push((shadow, ranges));
         }
@@ -724,7 +782,14 @@ pub(crate) fn copy_all(copies: Vec<(usize, usize, usize)>) {
 /// CPU side held the same before or not. Left out is what shaders in the air
 /// may be writing (such a copy waits for them, or is done on the card).
 pub(crate) fn send_copied(dst: usize, len: usize) {
-    for shadow in carded_copies() {
+    let near: Vec<Arc<Shadow>> = if card_near() {
+        let end = dst + len;
+        let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+        carded.iter().filter(|c| c.0 < end && dst < c.1).filter_map(|c| c.2.upgrade()).collect()
+    } else {
+        carded_copies()
+    };
+    for shadow in near {
         let (start, end) = (shadow.start as usize, (shadow.start + shadow.len) as usize);
         let (from, to) = (dst.max(start), (dst + len).min(end));
         if from >= to {
@@ -740,7 +805,7 @@ pub(crate) fn send_copied(dst: usize, len: usize) {
 
 /// The copies in the card's memory (diagnostics: `crate::host::upcheck`).
 pub(crate) fn carded_copies() -> Vec<Arc<Shadow>> {
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(std::sync::Weak::upgrade).collect()
+    CARDED.lock().unwrap_or_else(|e| e.into_inner()).iter().filter_map(|c| c.2.upgrade()).collect()
 }
 
 /// Ranges in order, those that overlap or touch as one.
@@ -1317,8 +1382,37 @@ fn give_back(v: Vec<u8>) {
 }
 
 const NOT_WATCHED: u8 = 2;
+
 /// Watched, not by the kernel but by the guards, when last asked about.
 const GUARDED: u8 = 3;
+
+thread_local! {
+    /// Whether the shaders of the stage being bound on this thread have what
+    /// they write put into title memory (`crate::land::lands`); declared
+    /// writes are noted with it ([`Shadow::gpu_writes`]).
+    static WRITER_LANDS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// [`Shadow::writers`]: written by a pipeline `VICTORY_LAND_NOT_SHADERS` names, by
+/// another.
+const BY_UNLANDED: u8 = 1;
+const BY_OTHERS: u8 = 2;
+
+/// Writes declared on this thread are of shaders that land (`lands`) until
+/// the value returned is dropped.
+pub(crate) fn writer_lands(lands: bool) -> WriterLands {
+    WRITER_LANDS.set(lands);
+    WriterLands
+}
+
+/// See [`writer_lands`].
+pub(crate) struct WriterLands;
+
+impl Drop for WriterLands {
+    fn drop(&mut self) {
+        WRITER_LANDS.set(true);
+    }
+}
 
 // Fixed-size equality compiles to two SIMD comparisons on Windows x64.
 // Only the first or last unequal chunk needs a byte-wise search.
@@ -1354,7 +1448,34 @@ fn last_difference(a: &[u8], b: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod difference_tests {
-    use super::{first_difference, last_difference};
+    use super::{PIECE, Shadow, first_difference, last_difference};
+
+    #[test]
+    fn parallel_compare_includes_the_first_partial_piece() {
+        const LEN: usize = 48 << 20;
+        const START: u64 = 0x0012_3456_8000;
+        let before = vec![0u8; LEN];
+        let mut data = before.clone();
+        let changed = [0, PIECE - 1, 3 << 20, 20 << 20, 40 << 20, LEN - 1];
+        for at in changed {
+            data[at] = 1;
+        }
+
+        // The compare reads the copy directly, so it needs no D3D12 device.
+        let shadow = Shadow::unbacked(START, data.as_mut_ptr(), LEN as u64, false);
+        let found = shadow.differing(0, LEN, &before);
+        for at in changed {
+            assert!(
+                found.iter().any(|&(start, len)| (start..start + len).contains(&at)),
+                "missed change at {at:#x}"
+            );
+        }
+        for (start, len) in found {
+            assert!(changed.iter().any(|at| (start..start + len).contains(at)));
+            let end = start + len;
+            assert!(end == LEN || (START as usize + end).is_multiple_of(PIECE));
+        }
+    }
 
     /// The chunk searches agree with a byte-wise scan across chunk boundaries.
     #[test]
@@ -1467,6 +1588,7 @@ type Job = Box<dyn FnOnce() + Send>;
 struct Workers {
     jobs: Mutex<std::collections::VecDeque<Job>>,
     more: std::sync::Condvar,
+    thread_count: usize,
     /// How many jobs there are, for [`spin`].
     there: std::sync::atomic::AtomicUsize,
 }
@@ -1488,6 +1610,18 @@ fn spin(there: impl Fn() -> bool) {
     }
 }
 
+/// Whether [`wide`] wakes one kept thread for each job it can share, not
+/// all of them for any (off by default: all, as before; `VICTORY_WIDE_WAKE=1` turns it on; switched by
+/// `VICTORY_AB` too). Vice-Tay d60fc84f (readmet3xt-lab).
+fn wake_few() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_WIDE_WAKE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_WAKE").is_some_and(|v| v == "1"))
+}
+
 /// How many threads are kept for [`wide`].
 fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
@@ -1499,10 +1633,11 @@ fn workers() -> &'static Workers {
     let workers = WORKERS.get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
+        thread_count: wide_threads(),
         there: std::sync::atomic::AtomicUsize::new(0),
     });
     STARTED.call_once(|| {
-        for i in 0..wide_threads() {
+        for i in 0..workers.thread_count {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS.get().expect("made above");
@@ -1540,7 +1675,8 @@ fn wide(jobs: Vec<Job>) {
     }
     let workers = workers();
     let _wide = crate::timeline::span("work spread over threads");
-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+    let job_count = jobs.len();
+    let left = Arc::new((Mutex::new(job_count), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
@@ -1556,7 +1692,16 @@ fn wide(jobs: Vec<Job>) {
             }));
         }
     }
-    workers.more.notify_all();
+    // The calling thread also drains the queue. Wake helpers only for the
+    // jobs it can share; a busy helper checks for more work before sleeping.
+    let helpers = job_count - 1;
+    if helpers >= workers.thread_count || !wake_few() {
+        workers.more.notify_all();
+    } else {
+        for _ in 0..helpers {
+            workers.more.notify_one();
+        }
+    }
     loop {
         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
         match job {
@@ -2479,8 +2624,39 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Since the last frame line, with `VICTORY_REFRESH_CHECK=1`: refreshes left
+/// out that were checked ([`Shadow::skip_check`]), the bytes compared, blocks
+/// found differing (the first time in a row), blocks said stale; refreshes
+/// left out by a stamp where the journal would not have ([`Skip::StampAlone`]),
+/// and those of them that differed.
+pub(crate) static SKIP_CHECKED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+/// What left a refresh out, for [`Shadow::skip_check`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Skip {
+    /// The journal ([`Shadow::nothing_new`]), as without stamps.
+    Journal,
+    /// The copy's stamp, and the journal would have too.
+    StampAndJournal,
+    /// The copy's stamp, where the journal would have refreshed (or asked).
+    StampAlone,
+}
+
+impl Skip {
+    /// One in so many of the skips the journal makes too is checked.
+    const SAMPLE: usize = 16;
+}
+
+/// `VICTORY_REFRESH_CHECK=1`.
+fn refresh_checking() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1"))
+}
+
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // (Out of the journal's index before its memory goes.)
+        crate::watch::stamp_unregister(&self.stamp, self.start as usize, (self.start + self.len) as usize);
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2687,6 +2863,40 @@ mod landing_tests {
         copy.take_landed(from, to);
         assert_eq!(copy.take_dirty(), []);
         drop(room);
+    }
+}
+
+#[cfg(test)]
+mod touched_tests {
+    use super::{Shadow, card_dirty, note_carded};
+    use std::sync::Arc;
+
+    /// What a copy in the card's memory changed is taken by the first look
+    /// after the change, once, and no other copy's with it.
+    #[test]
+    fn only_the_copies_that_changed_are_taken() {
+        let mut sides = [vec![0u8; 4096], vec![0u8; 4096]];
+        let [one, two] = [0, 1].map(|i| Shadow::unbacked(0x7f00_0000 + i as u64 * 0x10000, sides[i].as_mut_ptr(), 4096, true));
+        note_carded(&one);
+        note_carded(&two);
+        let ours = |taken: Vec<(Arc<Shadow>, Vec<(usize, usize)>)>| {
+            let mut ours: Vec<(u64, Vec<(usize, usize)>)> = taken
+                .into_iter()
+                .filter(|(s, _)| Arc::ptr_eq(s, &one) || Arc::ptr_eq(s, &two))
+                .map(|(s, r)| (s.id, r))
+                .collect();
+            ours.sort();
+            ours
+        };
+        one.card_changed(16, 32);
+        one.card_changed(32, 64);
+        assert_eq!(ours(card_dirty(1)), [(one.id, vec![(16, 64)])]);
+        assert_eq!(ours(card_dirty(2)), []);
+        two.card_changed(0, 8);
+        one.card_changed(100, 200);
+        let mut both = vec![(one.id, vec![(100, 200)]), (two.id, vec![(0, 8)])];
+        both.sort();
+        assert_eq!(ours(card_dirty(3)), both);
     }
 }
 
@@ -2975,6 +3185,7 @@ impl Shadow {
             len,
             copied: Mutex::new(vec![0; pages as usize]),
             ranged: Mutex::default(),
+            stamp: Default::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -2985,6 +3196,7 @@ impl Shadow {
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
             unsized_asks: AtomicU64::new(0),
             written: Default::default(),
+            writers: AtomicU8::new(0),
             id: {
                 static NEXT: AtomicU64 = AtomicU64::new(1);
                 NEXT.fetch_add(1, Ordering::Relaxed)
@@ -3022,9 +3234,36 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.writers.fetch_or(if WRITER_LANDS.get() { BY_OTHERS } else { BY_UNLANDED }, Ordering::Relaxed);
+        self.cleared(list, address, len);
+    }
+
+    /// [`Shadow::gpu_writes`] of a clear of a view of the copy: landed as any
+    /// write, but no writer of its own for [`Shadow::not_landed`]. Scratch
+    /// that only shaders `VICTORY_LAND_NOT_SHADERS` names write (FSR4's 21 MB block,
+    /// cleared once when the world begins) stays on the card after it.
+    pub(crate) fn cleared(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.place.is_some() {
+            return;
+        }
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+    }
+
+    /// Whether what shaders wrote to this copy in the card's memory stays
+    /// there, not fetched nor put into title memory (`crate::land::not_on`):
+    /// only pipelines `VICTORY_LAND_NOT_SHADERS` names were ever declared to write
+    /// it; it is scratch-sized (1 MiB or more: a small buffer of the same
+    /// shaders may be one the title reads, and costs nothing to land); and
+    /// its memory is watched, so that no refresh takes title memory that the
+    /// title did not write (that would send it up over the card's).
+    pub(crate) fn not_landed(&self) -> bool {
+        self.card.is_some()
+            && self.len >= 1 << 20
+            && self.writers.load(Ordering::Relaxed) == BY_UNLANDED
+            && matches!(self.watched.load(Ordering::Relaxed), 1 | GUARDED)
+            && crate::land::not_on()
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -3329,7 +3568,8 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            // The first piece can begin before the copy.
+            at.saturating_sub((start + at) % PIECE).max(from)
         };
         let scan = &scan;
         std::thread::scope(|s| {
@@ -3591,6 +3831,10 @@ impl Shadow {
                 let (lo, hi) = ((stale[i] * PAGE).max(a), ((stale[i] + 1) * PAGE).min(e));
                 MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                 MERGED[2].fetch_add(runs.iter().map(|r| r.1 as u64).sum(), Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                if crate::land::under_who::on() {
+                    crate::land::under_who::merged((start, end - start), lo, runs.len());
+                }
                 self.card_changed_runs(runs.into_iter().map(|(r, m)| (lo - start + r, lo - start + r + m)));
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
@@ -3719,7 +3963,20 @@ impl Shadow {
     /// Whether [`Shadow::update`] of `[address, address + len)` would copy
     /// nothing, and knows it without asking anything
     /// (`crate::watch::nothing_new`). `false` if it would have to ask.
-    pub(crate) fn nothing_new(&self, address: usize, len: usize) -> bool {
+    ///
+    /// With stamps ([`crate::watch::stamps_armed`]) a yes stamps the range
+    /// ([`Shadow::fresh`]); the first yes puts the copy in the journal's
+    /// index of stamps instead.
+    pub(crate) fn nothing_new(self: &Arc<Self>, address: usize, len: usize) -> bool {
+        let same = self.looks_same(address, len);
+        if same {
+            self.skip_check(address, len, Skip::Journal);
+        }
+        same
+    }
+
+    /// [`Shadow::nothing_new`], unchecked.
+    fn looks_same(self: &Arc<Self>, address: usize, len: usize) -> bool {
         if self.place.is_some() {
             return true;
         }
@@ -3735,8 +3992,13 @@ impl Shadow {
         if self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|&(a, e)| a < to && e > from) {
             return false;
         }
+        let stamps = crate::watch::stamps_armed();
         let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to));
+        let same = crate::watch::nothing_new(from, to, start / PAGE, &copied, self.ranged(from, to), stamps.then_some((&self.stamp, start)));
+        drop(copied);
+        if same && stamps && !self.stamp.registered() {
+            crate::watch::stamp_register(&self.stamp, start, end);
+        }
         #[cfg(feature = "diagnostics")]
         if same {
             use crate::copystat::{C, add};
@@ -3744,6 +4006,197 @@ impl Shadow {
             add(C::Unchanged, (to - from) as u64);
         }
         same
+    }
+
+    /// Whether a refresh of `[address, address + len)` is known to copy
+    /// nothing by the copy's stamp alone (`VICTORY_REFRESH_STAMPS`): the
+    /// stamp holds the range, so no note of the journal came for it since a
+    /// look found nothing new there; and the journal is whole for the range
+    /// now, by the submission's standing asking (`standing`, write-watched
+    /// memory) or by the blocks' bits (view memory), as that look asks.
+    /// No lock is taken and nothing is asked.
+    pub(crate) fn fresh(self: &Arc<Self>, address: usize, len: usize, standing: &crate::watch::Standing) -> bool {
+        if self.place.is_some() {
+            return true;
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), (address + len).min(end));
+        if from >= to {
+            return true;
+        }
+        if !self.stamp.covers(from - start, to - start) {
+            return false;
+        }
+        let known = match self.watched.load(Ordering::Relaxed) {
+            1 => standing.holds(from, to),
+            GUARDED => crate::watch::published_now(from, to),
+            _ => false,
+        };
+        if known {
+            crate::watch::STAMPS[0].fetch_add(1, Ordering::Relaxed);
+            if refresh_checking() {
+                // Whether the journal says so too, as without stamps.
+                let journal = self.looks_same(address, len);
+                self.skip_check(address, len, if journal { Skip::StampAndJournal } else { Skip::StampAlone });
+            }
+        }
+        known
+    }
+
+    /// Whether the copy's stamp holds offsets `[from, to)`.
+    #[cfg(test)]
+    pub(crate) fn stamped(&self, from: usize, to: usize) -> bool {
+        self.stamp.covers(from, to)
+    }
+
+    /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): a refresh of
+    /// `[address, address + len)` is left out as known to copy nothing (by
+    /// the journal, [`Shadow::nothing_new`], or by the copy's stamp,
+    /// [`Shadow::fresh`], `kind`). The copy's bytes there, but for ranges
+    /// shaders may be writing, are compared with title memory (a megabyte at
+    /// most, a part that moves on each time beyond that; of a window the CPU
+    /// maps in the card's memory, a sample; of the skips the journal would
+    /// make as well, one in [`Skip::SAMPLE`]). A 64 KiB block of the copy
+    /// that differs at three such looks with none between that found it the
+    /// same was changed with nothing to tell of it: said. One that differs
+    /// once is a write of the title's after the submission's asking, which
+    /// the next one finds.
+    fn skip_check(&self, address: usize, len: usize, kind: Skip) {
+        use std::collections::HashMap;
+        if !refresh_checking() {
+            return;
+        }
+        const MOST: usize = 1 << 20;
+        static TURN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SAMPLED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // Per copy, its blocks found differing: at how many looks in a row.
+        static DIFFERING: Mutex<Option<HashMap<u64, HashMap<usize, u32>>>> = Mutex::new(None);
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        thread_local! {
+            static TITLE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let start = self.start as usize;
+        let (from, to) = (address.max(start), (address + len).min(start + self.len as usize));
+        if from >= to || self.place.is_some() {
+            return;
+        }
+        if kind == Skip::StampAlone {
+            SKIP_CHECKED[4].fetch_add(1, Ordering::Relaxed);
+        } else if !SAMPLED.fetch_add(1, Ordering::Relaxed).is_multiple_of(Skip::SAMPLE) {
+            return;
+        }
+        let (from, to) = if to - from > MOST {
+            let at = from + TURN.fetch_add(MOST, Ordering::Relaxed) % (to - from - MOST + 1);
+            (at, at + MOST)
+        } else {
+            (from, to)
+        };
+        let mut busy: Vec<(usize, usize)> =
+            self.pending.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().filter(|&(a, e)| a < to && e > from).collect();
+        busy.sort_unstable();
+        let runs_pending = !busy.is_empty();
+        // The runs outside shader writes.
+        let mut runs = Vec::new();
+        let mut at = from;
+        for (a, e) in busy {
+            if a > at {
+                runs.push((at, a));
+            }
+            at = at.max(e);
+        }
+        if at < to {
+            runs.push((at, to));
+        }
+        // A window in the card's memory that the CPU maps (resizable BAR) is
+        // read over the bus, uncached: of it the first 64 bytes of each 4 KiB.
+        let (step, sample) = if self.mapped { (4096, 64) } else { (PAGE, PAGE) };
+        let (mut same, mut differ) = (Vec::new(), Vec::new());
+        TITLE.with_borrow_mut(|title| {
+            for (a, e) in runs {
+                let mut at = a;
+                while at < e {
+                    let next = ((at / step + 1) * step).min(e);
+                    let n = (next - at).min(sample);
+                    title.resize(n, 0);
+                    if crate::host::read_into(at as *const u8, &mut title[..n]) {
+                        // SAFETY: `[at, next)` lies in the copy, inside its
+                        // mapping; no shader's range holds it.
+                        let held = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                        SKIP_CHECKED[1].fetch_add(n as u64, Ordering::Relaxed);
+                        if held == &title[..n] { same.push(at / PAGE) } else { differ.push((at / PAGE, at, first_difference(held, &title[..n]))) }
+                    }
+                    at = next;
+                }
+            }
+        });
+        SKIP_CHECKED[0].fetch_add(1, Ordering::Relaxed);
+        // (A sampled block once, differing if any sample of it differs.)
+        differ.dedup_by_key(|d| d.0);
+        same.dedup();
+        same.retain(|block| !differ.iter().any(|d| d.0 == *block));
+        if same.is_empty() && differ.is_empty() {
+            return;
+        }
+        let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(Default::default);
+        let blocks = map.entry(self.id).or_default();
+        for block in same {
+            blocks.remove(&block);
+        }
+        if kind == Skip::StampAlone && !differ.is_empty() {
+            SKIP_CHECKED[5].fetch_add(1, Ordering::Relaxed);
+            // Whether the journal knew of a write the copy had not taken
+            // (then the stamp was wrong) or not (the title wrote after the
+            // submission's asking, which the next one finds).
+            static TOLD: AtomicU64 = AtomicU64::new(0);
+            if TOLD.fetch_add(1, Ordering::Relaxed) < 32 {
+                let (block, at, first) = differ[0];
+                let taken = self.copied.lock().unwrap_or_else(|e| e.into_inner()).get(block - start / PAGE).copied();
+                tracing::info!(
+                    copy = self.id,
+                    copy_start = format_args!("{start:#x}"),
+                    copy_bytes = self.len,
+                    refreshed = format_args!("{from:#x}..{to:#x}"),
+                    address = format_args!("{at:#x}"),
+                    first_difference = ?first.map(|d| format!("{:#x}", at + d)),
+                    journal = crate::watch::last_write(block),
+                    taken,
+                    ranged = self.ranged(from, to),
+                    shader_writes = runs_pending,
+                    "a refresh left out by its stamp alone differed from title memory (VICTORY_REFRESH_CHECK=1)"
+                );
+            }
+        }
+        for (block, at, first) in differ {
+            let times = blocks.entry(block).or_insert(0);
+            *times += 1;
+            if *times == 1 {
+                SKIP_CHECKED[2].fetch_add(1, Ordering::Relaxed);
+            }
+            if *times == 3 {
+                SKIP_CHECKED[3].fetch_add(1, Ordering::Relaxed);
+                let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+                if said <= 64 || said.is_power_of_two() {
+                    tracing::warn!(
+                        said,
+                        skipped_by = ?kind,
+                        copy = self.id,
+                        copy_start = format_args!("{start:#x}"),
+                        copy_bytes = self.len,
+                        address = format_args!("{at:#x}"),
+                        first_difference = ?first.map(|d| format!("{:#x}", at + d)),
+                        stamped = self.stamp.registered(),
+                        watched = self.watched.load(Ordering::Relaxed),
+                        on_the_card = self.card.is_some(),
+                        window = self.window,
+                        "a refresh left out as copying nothing left a host copy stale, three times in a row (VICTORY_REFRESH_CHECK=1)"
+                    );
+                }
+            }
+        }
+        if blocks.is_empty() {
+            map.remove(&self.id);
+        }
     }
 
     /// The latest asking after which a range that holds `[from, to)` was
@@ -4130,7 +4583,11 @@ impl Shadow {
             }
         }
         // (Under the lock: what takes the list sees it or finds it set.)
-        card.touched.store(true, Ordering::Release);
+        if !card.touched.swap(true, Ordering::AcqRel)
+            && let Some(me) = card.me.get()
+        {
+            TOUCHED.lock().unwrap_or_else(|e| e.into_inner()).push(me.clone());
+        }
     }
 
     /// Whether shaders were ever declared to write it.
@@ -4427,6 +4884,7 @@ impl Shadow {
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: Default::default(),
                 size: len.next_multiple_of(PIECE as u64),
             });
         }
@@ -4583,6 +5041,7 @@ mod land_tests {
             dirty: Mutex::default(),
             sent: Mutex::default(),
                 touched: Default::default(),
+            me: Default::default(),
             size: len as u64,
         });
         Some(shadow)
@@ -4998,6 +5457,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                 touched: Default::default(),
+                    me: Default::default(),
                     size,
                 };
                 (on_card, Some(card))
@@ -5023,7 +5483,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
-            CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+            note_carded(&shadow);
         }
         entry.shadow = Some(shadow);
     }
@@ -5226,10 +5686,11 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         dirty: Mutex::default(),
         sent: Mutex::default(),
         touched: Default::default(),
+        me: Default::default(),
         size: len,
     });
     let shadow = Arc::new(shadow);
-    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+    note_carded(&shadow);
     Some(shadow)
 }
 
@@ -5315,6 +5776,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 touched: Default::default(),
+                me: Default::default(),
                 size: len,
             };
             (on_card, Some(card))
@@ -5333,7 +5795,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {
-        CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+        note_carded(&shadow);
     }
     note(&shadow);
     map.insert((start, len), shadow.clone());

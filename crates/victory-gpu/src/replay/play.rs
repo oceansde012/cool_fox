@@ -548,6 +548,8 @@ pub struct Player {
     /// States as the last run left them (`diverge`).
     at: States,
     notes: Vec<String>,
+    /// `--breadcrumbs`: resources and lists are named for [`lost`].
+    dred: bool,
 }
 
 /// What a command of a list is timed as.
@@ -623,6 +625,7 @@ impl Player {
                 .map(|n| format!("recorder: {n}"))
                 .collect(),
             frame,
+            dred: options.breadcrumbs,
         };
         player.check()?;
         let mut steps: Vec<(&str, std::time::Duration)> = Vec::new();
@@ -637,9 +640,13 @@ impl Player {
         step("pipelines", &mut at);
         player.make_descriptors()?;
         step("descriptors", &mut at);
-        player.load_contents()?;
+        if let Err(e) = player.load_contents() {
+            return Err(e.context(format!("loading the contents{}", lost(&player.device))));
+        }
         step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
+        if let Err(e) = player.make_masters(options.buffers, options.restore) {
+            return Err(e.context(format!("making copies to restore from{}", lost(&player.device))));
+        }
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -747,8 +754,10 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed, made
+        // not resident (the host makes such memory resident itself; here
+        // nothing would, and the first copy into it faults).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -788,7 +797,10 @@ impl Player {
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
-            let desc = gpu::to_desc(&r.desc);
+            let mut desc = gpu::to_desc(&r.desc);
+            // Heaps lose their cross-adapter sharing above (a heap opened from
+            // existing memory has it), so their resources lose theirs.
+            desc.Flags &= !D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
             let mut made: Option<ID3D12Resource> = None;
             let clear: Option<D3D12_CLEAR_VALUE> = r.clear.map(|c| {
                 // SAFETY: 20 bytes that were a clear value.
@@ -843,6 +855,10 @@ impl Player {
             };
             match (result, made) {
                 (Ok(()), Some(res)) => {
+                    if self.dred {
+                        // SAFETY: a live resource; for `lost`.
+                        let _ = unsafe { res.SetName(&windows::core::HSTRING::from(format!("resource {} {:?}", r.id, r.place))) };
+                    }
                     // SAFETY: a live resource.
                     let va = if is_buffer {
                         unsafe { res.GetGPUVirtualAddress() }
@@ -2279,6 +2295,12 @@ impl Player {
             let mut built = Vec::new();
             for cmds in lists {
                 let open = self.open(&heap, &mut next)?;
+                if self.dred {
+                    // For `lost`: the list's place in the frame.
+                    let n = submits[..i].iter().map(Vec::len).sum::<usize>() + built.len();
+                    // SAFETY: a live list.
+                    let _ = unsafe { open.1.SetName(&windows::core::HSTRING::from(format!("list {n} (submission {i})"))) };
+                }
                 let stamps = self.translate(
                     &open.1,
                     cmds,
@@ -3050,9 +3072,9 @@ impl Player {
                 .queue
                 .ExecuteCommandLists(&[cast(&s.resolve.1)?]);
         }
-        self.worker
-            .idle()
-            .context("the card was lost running the frame")?;
+        if let Err(e) = self.worker.idle() {
+            return Err(anyhow::Error::from(e).context(format!("the card was lost running the frame{}", lost(&self.device))));
+        }
         // SAFETY: the mapping of `count` resolved timestamps.
         Ok(unsafe { std::slice::from_raw_parts(s.data as *const u64, s.count as usize) }.to_vec())
     }
@@ -3086,7 +3108,9 @@ impl Player {
 
     /// One run of the frame, noted in the report; its timestamps.
     fn once(&mut self, o: &Options, (built, report): &mut (Sends, Report)) -> Result<Vec<u64>> {
-        self.restore(o.restore)?;
+        if let Err(e) = self.restore(o.restore) {
+            return Err(e.context(format!("putting back what a run changed{}", lost(&self.device))));
+        }
         self.fresh = false;
         let stamps = self.send(built, o)?;
         if let Some((db, _, hash, _)) = self.picture_now()? {
@@ -3463,6 +3487,51 @@ fn make_device(frame: &Frame, debug: bool, breadcrumbs: bool) -> Result<(ID3D12D
         let info = device.cast::<ID3D12InfoQueue>().ok();
         Ok((device, info))
     }
+}
+
+/// With `--breadcrumbs`, after the device was lost: the lists that stopped
+/// (by the names `build` gives them), the command each stopped at, and the
+/// page fault's address.
+fn lost(device: &ID3D12Device) -> String {
+    let mut text = String::new();
+    // SAFETY: the system's own report, walked as it links it.
+    unsafe {
+        let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData>() else {
+            return text;
+        };
+        if let Ok(fault) = dred.GetPageFaultAllocationOutput() {
+            let _ = write!(text, "; page fault at {:#x}", fault.PageFaultVA);
+            for (what, mut node) in [("alive", fault.pHeadExistingAllocationNode), ("freed", fault.pHeadRecentFreedAllocationNode)] {
+                let mut names = Vec::new();
+                while let Some(n) = node.as_ref()
+                    && names.len() < 8
+                {
+                    names.push(if n.ObjectNameW.is_null() { "unnamed".to_owned() } else { n.ObjectNameW.to_string().unwrap_or_default() });
+                    node = n.pNext;
+                }
+                let _ = write!(text, "; {what} there: {names:?}");
+            }
+        }
+        let Ok(crumbs) = dred.GetAutoBreadcrumbsOutput() else {
+            return text;
+        };
+        let mut node = crumbs.pHeadAutoBreadcrumbNode;
+        while let Some(p) = node.as_ref() {
+            let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+            if done < p.BreadcrumbCount && !p.pCommandListDebugNameW.is_null() {
+                let history = std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
+                let _ = write!(
+                    text,
+                    "; {} stopped at breadcrumb {done} of {} (op {})",
+                    p.pCommandListDebugNameW.to_string().unwrap_or_default(),
+                    p.BreadcrumbCount,
+                    history[done as usize].0
+                );
+            }
+            node = p.pNext;
+        }
+    }
+    text
 }
 
 /// The debug layer's errors: how many of each kind, and its first text.

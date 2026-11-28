@@ -469,6 +469,7 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const CLEAR_UAV: u64 = after(17);
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -645,6 +646,50 @@ extern "system" fn clear_dsv(
         &[bytes_of(view.as_ptr(), RECORD), bytes_of(rects, count as usize)],
     );
 }
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, gpu, cpu, resource, values, false, count, rects);
+}
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [f32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, gpu, cpu, resource, values.cast(), true, count, rects);
+}
+#[allow(clippy::too_many_arguments)] // the method's own arguments
+fn clear_uav(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    float: bool,
+    count: u32,
+    rects: *const Rect,
+) {
+    if cpu == 0 || values.is_null() {
+        return;
+    }
+    let count = if rects.is_null() { 0 } else { count };
+    let view = record(cpu);
+    front(this).put_with(
+        CLEAR_UAV,
+        &[u64::from(count) | u64::from(float) << 32, gpu, resource as u64],
+        &[bytes_of(view.as_ptr(), RECORD), bytes_of(values, 1), bytes_of(rects, count as usize)],
+    );
+}
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -766,6 +811,16 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
                     at(w, 3 + RECORD, n),
                 );
             }
+            CLEAR_UAV => {
+                let (count, float) = (w[0] as u32, w[0] >> 32 != 0);
+                let (view, values, rects) =
+                    (w[3..].as_ptr() as u64, at_or::<[u32; 4]>(w, 3 + RECORD), at(w, 3 + RECORD + 2, count as usize));
+                if float {
+                    super::clear_uav_float(list, w[1], view, w[2] as This, values.cast(), count, rects);
+                } else {
+                    super::clear_uav_uint(list, w[1], view, w[2] as This, values, count, rects);
+                }
+            }
             COPY_TEXTURE => {
                 let step = size_of::<CopyLocation>().div_ceil(8);
                 let boxed = (w[1] >> 32) as usize;
@@ -802,7 +857,7 @@ pub(super) const fn table(newer: bool) -> [*const (); 160] {
     f
 }
 
-const MINE: [(usize, *const ()); 50] = [
+const MINE: [(usize, *const ()); 52] = [
     (9, list_close as *const ()),
     (10, list_reset as *const ()),
     (12, draw as *const ()),
@@ -838,6 +893,8 @@ const MINE: [(usize, *const ()); 50] = [
     (50, targets as *const ()),
     (51, clear_dsv as *const ()),
     (52, clear_rtv as *const ()),
+    (53, clear_uav_uint as *const ()),
+    (54, clear_uav_float as *const ()),
     (59, execute_indirect as *const ()),
     (60, copy_memory as *const ()),
     (68, depth_bounds as *const ()),

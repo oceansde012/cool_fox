@@ -252,6 +252,26 @@ const ALLOC_32BIT: u64 = 1 << 33;
 /// pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
 
+/// Blocks of [`XMemAllocDefault`] from this size on (with their header) are a
+/// write-watched reservation each, not host heap memory
+/// (`VICTORY_XMEM_WATCHED=0`: all from the heap, as before).
+///
+/// The heap's memory is not watched, so every refresh of a host copy of it
+/// copies it whole. In the Series S cell one 21 MB block that shaders write
+/// was copied whole twice a frame (42 MB, 4.4 ms of copies, both on the
+/// frame's critical path in a timeline) and sent up whole to its copy in
+/// the card's memory as often, though the landing had put the card's bytes
+/// there. Watched, it is fetched and landed only, and the submitting
+/// thread's refreshes took 13.0 ms a frame instead of 16.7.
+const WATCHED_FROM: usize = 1 << 20;
+/// In a block's header size: the block is a reservation of its own.
+const WATCHED: usize = 1 << (usize::BITS - 1);
+
+fn watched_blocks() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_XMEM_WATCHED").is_some_and(|v| v == "1"));
+    *ON
+}
+
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
     let align = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f).max(4);
@@ -330,6 +350,26 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
+    // (A reservation starts on 64 KiB: a block aligned to more stays in the heap.)
+    if layout.size() >= WATCHED_FROM && layout.align() <= 64 << 10 && watched_blocks() {
+        // SAFETY: a reservation of our own, committed whole.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), layout.size(), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) };
+        if !base.is_null() {
+            // What the GPU side kept of an earlier allocation at this address
+            // is not this memory.
+            victory_gpu::title_memory_remapped(base as usize, layout.size());
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 16 {
+                tracing::info!(at = format_args!("{base:p}"), size, "XMemAllocDefault: a write-watched block (VICTORY_XMEM_WATCHED=0: from the heap)");
+            }
+            // SAFETY: as below: the block holds the alignment and `size` bytes.
+            unsafe {
+                let user = base.cast::<u8>().add(layout.align());
+                user.sub(HEADER).cast::<[usize; 2]>().write([layout.size() | WATCHED, layout.align()]);
+                return user.cast();
+            }
+        }
+    }
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
     // (the title uses its GPU heap). Sub-allocate from a
@@ -365,6 +405,12 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if size & WATCHED != 0 {
+            // As for the 32-bit allocations above.
+            victory_gpu::title_memory_freed(user.sub(align) as usize, 0);
+            VirtualFree(user.sub(align).cast(), 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),
@@ -1914,6 +1960,31 @@ mod tests {
         let process = unsafe { GetCurrentProcess() };
         assert_eq!(XMemVirtualQuery(process, address, &mut info), 1);
         info
+    }
+
+    #[test]
+    fn big_default_blocks_are_watched_and_aligned() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_FREE};
+        for (field, align) in [(0, 16), (0x10, 64 * 1024), (0x15, 2 * MIB)] {
+            let attributes = field << ALIGNMENT_SHIFT | 1 << 29;
+            let size = 4 * MIB;
+            let p = XMemAllocDefault(size, attributes);
+            assert!(!p.is_null());
+            assert_eq!(p as usize % align, 0, "field {field:#x}");
+            // SAFETY: `size` bytes were allocated.
+            unsafe { p.cast::<u8>().write_bytes(0xab, size) };
+            let (mut found, mut count, mut granularity) = (vec![0usize; 2048], 2048usize, 0u32);
+            // SAFETY: a buffer of `count` entries; the range lies in the block.
+            let watched = unsafe { GetWriteWatch(0, p, size, found.as_mut_ptr().cast(), &mut count, &mut granularity) } == 0;
+            // Up to 64 KiB alignment a reservation of its own, watched; above
+            // it the heap's, which is not.
+            assert_eq!(watched, align <= 64 * 1024, "field {field:#x}");
+            assert!(!watched || count >= size / 4096);
+            XMemFreeDefault(p, attributes);
+            if watched {
+                assert_eq!(query(p).host.State, MEM_FREE);
+            }
+        }
     }
 
     #[test]

@@ -33,8 +33,10 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 /// the guards, blocks they did so in, blocks they opened instead; stores done
 /// beside the guards, faulting stores not understood, and blocks opened
 /// because too many came; stores and parts of copies that left the memory as
-/// it was, and were not made; descriptors copied onto themselves.
-pub(crate) static DONE: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// it was, and were not made; descriptors copied onto themselves; stores that
+/// opened their block because their place fills blocks, or because there was
+/// no other way to the page.
+pub(crate) static DONE: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 fn add(what: usize) {
     DONE[what].fetch_add(1, Relaxed);
@@ -370,6 +372,7 @@ pub(crate) fn store(context: &mut windows_sys::Win32::System::Diagnostics::Debug
         if site.fetch_add(1 << 32, Relaxed) >> 32 > 4096 {
             site.store(0, Relaxed);
         }
+        add(9);
         return false;
     }
     let mut done = false;
@@ -381,6 +384,8 @@ pub(crate) fn store(context: &mut windows_sys::Win32::System::Diagnostics::Debug
         if put == Beside::Full {
             site.fetch_add(1 << 32, Relaxed);
             add(5);
+        } else {
+            add(10);
         }
         return false;
     }

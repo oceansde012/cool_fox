@@ -359,17 +359,21 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         let writes = w.0 < w.1;
         let mut level = 0;
         // Behind what writes what this reads or writes, and, if this
-        // writes, behind what reads it.
-        let ahead: Box<dyn Iterator<Item = usize>> =
-            if writes { Box::new(0..out.len()) } else { Box::new(copies.iter().copied()) };
-        for k in ahead {
+        // writes, behind what reads it. (Not a boxed iterator: an
+        // allocation for each of a frame's 2,800 fills.)
+        let mut behind_of = |k: usize| {
             let (j, at): (usize, u32) = out[k];
-            let Some((jr, jw)) = reads_writes(&does[j]) else {
-                continue;
-            };
-            if at >= level && (meet(jw, r) || meet(jw, w) || meet(jr, w)) {
+            if let Some((jr, jw)) = reads_writes(&does[j])
+                && at >= level
+                && (meet(jw, r) || meet(jw, w) || meet(jr, w))
+            {
                 level = at + 1;
             }
+        };
+        if writes {
+            (0..out.len()).for_each(&mut behind_of);
+        } else {
+            copies.iter().copied().for_each(&mut behind_of);
         }
         if writes {
             copies.push(out.len());
@@ -414,10 +418,12 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
 fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
-    let mut does = Vec::new();
+    // (Thousands of steps: room for all of them at once.)
+    let all = runs.iter().map(|l| l.deferred().copies.len()).sum();
+    let mut does = Vec::with_capacity(all);
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
-    let mut steps = Vec::new();
+    let mut steps = Vec::with_capacity(all);
     for list in runs {
         for (i, step) in list.deferred().copies.iter().enumerate() {
             does.push(match step {
@@ -479,13 +485,79 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     blocked_by(&written, runs, false)?;
     let (does, steps) = does_of(&written, runs);
     let mut behind = None;
-    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
+    let chosen = plan(&does, stage(), true, &mut behind);
+    if chosen != Err(BEHIND_PLACED) {
+        // Not cut: the submission's steps on the card ([`plan_of`]).
+        if plan_once() {
+            let kept = Planned { lists: lists_of(runs), written, by_order: true, does, steps, chosen };
+            *PLANNED.lock().unwrap_or_else(|e| e.into_inner()) = Some(kept);
+        }
         return None;
     }
     let (placed, reader) = behind?;
     let place = |i: usize| runs.iter().position(|l| std::ptr::from_ref::<HostList>(l) as usize == steps[i].0);
     let cut = place(placed)? + 1;
     (place(reader)? >= cut).then_some(cut)
+}
+
+/// Whether the plan [`cut_for`] makes for a submission it does not cut is
+/// kept for that submission's steps on the card, which made it again
+/// (`VICTORY_PLAN_ONCE=0`: made twice, as before). Of the line's thread's
+/// 3.3 ms a frame in the steps' choice and list, 1.2 ms were [`cut_for`]'s
+/// [`does_of`] and [`plan`] and 0.95 ms the same again in
+/// [`Host::card_steps`] moments later (profile land-c3a6-prof1).
+///
+/// The same: the lists (by address, their steps' counts and their epochs,
+/// which every reset and change of a list's moves on: a list given back and
+/// recorded anew is not the same), what flights may write, and whether
+/// copies at their place keep their order. Nothing records into a
+/// submission's lists between the two, and the plan is made of nothing
+/// else; a plan that is not of the same is let go.
+fn plan_once() -> bool {
+    crate::toggled!("VICTORY_PLAN_ONCE")
+}
+
+/// A plan of [`cut_for`]'s, kept ([`plan_once`]): what it was made of, and
+/// what [`does_of`] and [`plan`] found.
+struct Planned {
+    lists: Vec<(usize, usize, u64)>,
+    written: Vec<(usize, usize)>,
+    by_order: bool,
+    does: Vec<Does>,
+    steps: Vec<(usize, usize)>,
+    chosen: Result<Vec<(usize, u32)>, &'static str>,
+}
+
+static PLANNED: Mutex<Option<Planned>> = Mutex::new(None);
+
+/// The lists of `runs` by address, with their steps' counts and epochs.
+fn lists_of(runs: &[&HostList]) -> Vec<(usize, usize, u64)> {
+    runs.iter()
+        .map(|l| (std::ptr::from_ref::<HostList>(l) as usize, l.deferred().copies.len(), l.epoch()))
+        .collect()
+}
+
+/// What [`does_of`] and [`plan`] say of `runs`: the plan [`cut_for`] kept if
+/// it is of the same ([`plan_once`]), else made now. The kept one is let go
+/// either way.
+fn plan_of(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    by_order: bool,
+) -> (Vec<Does>, Vec<(usize, usize)>, Result<Vec<(usize, u32)>, &'static str>) {
+    let kept = PLANNED.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(p) = kept
+        && plan_once()
+        && p.by_order == by_order
+        && p.written == written
+        && p.lists == lists_of(runs)
+    {
+        DONE[4].fetch_add(1, Ordering::Relaxed);
+        return (p.does, p.steps, p.chosen);
+    }
+    let (does, steps) = does_of(written, runs);
+    let chosen = plan(&does, stage(), by_order, &mut None);
+    (does, steps, chosen)
 }
 
 /// Whether every page of `[from, to)` can be read (through the kernel:
@@ -612,8 +684,9 @@ unsafe impl Send for Own {}
 static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 
 /// Since the last frame-rate line: fills and copies done on the card, their
-/// bytes, and submissions that waited instead, refused by a check.
-static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// bytes, and submissions that waited instead, refused by a check; plans
+/// kept from [`cut_for`] and taken ([`plan_once`]).
+static DONE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
@@ -688,8 +761,8 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
+        let (does, steps, chosen) = plan_of(written, runs, placed_order());
+        let chosen = chosen?;
         if chosen.is_empty() {
             return Ok(None);
         }
@@ -906,12 +979,13 @@ pub(super) fn log(frames: f64) {
     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
-         copies, {:.1} KB; {:.2} submissions refused and waited",
+         copies, {:.1} KB; {:.2} submissions refused and waited; {:.2} plans made for the cut taken again (VICTORY_PLAN_ONCE)",
         stage(),
         d[0],
         d[1],
         d[2] / 1024.0,
         d[3],
+        d[4],
     );
     #[cfg(feature = "diagnostics")]
     {
@@ -1151,6 +1225,53 @@ mod tests {
     fn what_no_host_copy_holds_is_refused() {
         let writers = [Writer { shadow: None, from: 100, to: 108, copy: false }];
         assert!(holder(&writers, 104, 120).is_err());
+    }
+
+    /// A plan the cut kept is taken by the steps on the card of the same
+    /// submission, and by nothing else: not with other flights in the air,
+    /// another order, a list changed or a step more; it is let go either way.
+    #[test]
+    fn a_kept_plan_is_taken_for_the_same_submission_only() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let (a, b) = (host.new_list().unwrap(), host.new_list().unwrap());
+        a.deferred().copies.push(Step::Copy(0x1000, 0x2000, 64));
+        b.deferred().copies.push(Step::Copy(0x3000, 0x1000, 64));
+        let runs = [&a, &b];
+        let written = vec![(0x2000, 0x2100)];
+        let keep = || {
+            let kept = Planned {
+                lists: lists_of(&runs),
+                written: written.clone(),
+                by_order: true,
+                does: Vec::new(),
+                steps: Vec::new(),
+                chosen: Err("kept"),
+            };
+            *PLANNED.lock().unwrap() = Some(kept);
+        };
+        let gone = || PLANNED.lock().unwrap().is_none();
+        keep();
+        assert_eq!(plan_of(&written, &runs, true).2, Err("kept"));
+        assert!(gone());
+        keep();
+        assert_ne!(plan_of(&[(0x2000, 0x2200)], &runs, true).2, Err("kept"), "other flights");
+        assert!(gone());
+        keep();
+        assert_ne!(plan_of(&written, &runs, false).2, Err("kept"), "another order");
+        keep();
+        assert_ne!(plan_of(&written, &[&a], true).2, Err("kept"), "other lists");
+        keep();
+        b.changed_something();
+        assert_ne!(plan_of(&written, &runs, true).2, Err("kept"), "a list changed (or reset)");
+        keep();
+        a.deferred().copies.push(Step::Copy(0x5000, 0x6000, 8));
+        assert_ne!(plan_of(&written, &runs, true).2, Err("kept"), "a step more");
+        assert!(gone());
+        // Made now, it is what the two make.
+        let (does, _) = does_of(&written, &runs);
+        assert_eq!(plan_of(&written, &runs, true).2, plan(&does, stage(), true, &mut None));
     }
 
     /// Reads are all before writes, between two buffers and within one, and

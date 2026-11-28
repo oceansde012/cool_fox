@@ -1214,11 +1214,12 @@ pub(crate) fn log(frames: f64) {
         "waits for the write trackers' locks per frame, all threads (number, time): {}",
         crate::watch::lock_waits(frames as f64)
     );
-    let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records] =
-        [0, 1, 2, 3, 4, 5, 6, 7, 8].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
+    let [copies, blocks, opened, stores, unknown, full, stayed, copied_same, records, fills, cannot] =
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map(|n| crate::titlewrite::DONE[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
         "the title's writes beside the guards, since the start: {copies} copies (VICTORY_COPY_BESIDE=1), {blocks} blocks, {opened} opened; \
          {stores} stores (VICTORY_STORE_BESIDE=1), {unknown} not understood, {full} blocks opened for too many; left out for changing nothing: {stayed} stores, {copied_same} parts of copies, {records} copies of descriptors; \
+         stores that opened their block instead: {fills} at places that fill blocks, {cannot} with no other way to the page; \
          the busiest stores (left out/changed): {}",
         crate::titlewrite::busiest()
     );
