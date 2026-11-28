@@ -1011,6 +1011,8 @@ extern "system" fn present(
             Shown { frame, resource },
         );
         called.end();
+        #[cfg(windows)]
+        crate::draw::bvh_input_report();
         #[cfg(feature = "diagnostics")]
         frame_ends();
         return S_OK;
@@ -1055,6 +1057,8 @@ extern "system" fn present(
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
     called.end();
+    #[cfg(windows)]
+    crate::draw::bvh_input_report();
     #[cfg(all(windows, feature = "diagnostics"))]
     frame_ends();
     S_OK
