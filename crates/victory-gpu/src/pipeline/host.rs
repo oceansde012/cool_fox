@@ -1284,9 +1284,8 @@ mod tests {
         let loaded = super::super::library::LOADED.load(Ordering::Relaxed);
         graphics_depth_bounds_pipeline(&host.device, &root, &desc, g.depth1(), &name)
             .expect("depth-bounds PSO made again");
-        // (Not on a card the library is not loaded on: VICTORY_LIBRARY_LOAD=1.)
         assert!(
-            !super::super::library::loads() || super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
+            super::super::library::LOADED.load(Ordering::Relaxed) > loaded,
             "the depth-bounds pipeline was compiled again instead of loaded from the library"
         );
 
