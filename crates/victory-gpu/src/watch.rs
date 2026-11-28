@@ -353,9 +353,10 @@ pub(crate) fn stamp_unregister(stamp: &Stamp, start: usize, end: usize) {
     stamp.registered.store(false, std::sync::atomic::Ordering::Release);
 }
 
-/// Whether copies keep stamps (`VICTORY_REFRESH_STAMPS=1`, or the switch
-/// named in `VICTORY_AB`: kept in both phases, so that they hold when the
-/// switch comes on). Needs the light refreshes.
+/// Whether copies keep stamps: on by default (`VICTORY_REFRESH_STAMPS=0`:
+/// none is registered or stamped, as before), and with the switch named in
+/// `VICTORY_AB` (kept in both phases, so that they hold when the switch
+/// comes on). Needs the light refreshes.
 pub(crate) fn stamps_armed() -> bool {
     #[cfg(test)]
     if STAMPS_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -367,7 +368,7 @@ pub(crate) fn stamps_armed() -> bool {
         let named = crate::ab::bit("VICTORY_REFRESH_STAMPS").is_some();
         #[cfg(not(feature = "diagnostics"))]
         let named = false;
-        light() && (named || crate::switch::on("VICTORY_REFRESH_STAMPS"))
+        light() && (named || std::env::var_os("VICTORY_REFRESH_STAMPS").is_none_or(|v| v != "0"))
     })
 }
 
@@ -382,7 +383,8 @@ pub(crate) static STAMPS_FORCED: std::sync::atomic::AtomicBool = std::sync::atom
 pub(crate) static SUBMITTING: Mutex<()> = Mutex::new(());
 
 /// Whether a submission's refreshes that their copies' stamps say are
-/// fresh are skipped now ([`Stamp`]; off unless armed, [`stamps_armed`]).
+/// fresh are skipped now ([`Stamp`]; whenever stamps are kept,
+/// [`stamps_armed`], but in the off phases of `VICTORY_AB`).
 ///
 /// Of some 10,500 refreshes a frame in the Series S cell, 9,000-9,500 copy
 /// nothing; finding that out was some 2.3 ms a frame of the submitting
