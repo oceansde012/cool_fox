@@ -2113,6 +2113,12 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 
 /// [`dword_runs`] with no gap, the fast way where it can be: a frame compares
 /// 12 MB this way and finds 80,000 runs.
+/// `VICTORY_WORD_RUNS=1`: word_runs; off: dword_runs, as before.
+fn word_runs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WORD_RUNS"))
+}
+
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
     if at % 4 == 0 && title.len() % 4 == 0 && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
@@ -2215,7 +2221,7 @@ fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
         }
         return merged.len();
     }
-    let mut runs = word_runs(at, title, merged);
+    let mut runs = if word_runs_on() { word_runs(at, title, merged) } else { dword_runs(at, title, merged, 0) };
     if runs.len() > 64 {
         runs = dword_runs(at, title, merged, 32);
         PUT[3].fetch_add(1, Ordering::Relaxed);
@@ -4047,7 +4053,7 @@ impl Shadow {
                 // refresh lie apart.
                 let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at - start), n) };
                 let was = crate::host::upcheck::on().then(|| held.to_vec());
-                let runs = if whole { vec![(0, n)] } else { word_runs(at, held, title) };
+                let runs = if whole { vec![(0, n)] } else if word_runs_on() { word_runs(at, held, title) } else { dword_runs(at, held, title, 0) };
                 for &(a, len) in &runs {
                     held[a..a + len].copy_from_slice(&title[a..a + len]);
                     self.changed(at - start + a, at - start + a + len);

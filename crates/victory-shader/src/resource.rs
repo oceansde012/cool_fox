@@ -195,6 +195,12 @@ pub struct Waterfall {
     pub loads: Vec<Site>,
 }
 
+/// `VICTORY_WATERFALL_SHAPE=1`: waterfall_shape; off: waterfall, as before.
+pub fn waterfall_shape_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WATERFALL_SHAPE").is_some_and(|v| v != "0"))
+}
+
 /// Traces every descriptor and scalar address of `p`, which runs as
 /// `stage`, to the root parameters in `layout`. Fails on the first one it
 /// cannot trace. `lanes`, `p` as one lane runs it, tells which paths the
@@ -368,7 +374,7 @@ pub fn track(
         let proof = t
             .waterfall(block, &accesses, &reads)
             .ok()
-            .or_else(|| t.waterfall_shape(block, &accesses, &reads, &loads));
+            .or_else(|| if waterfall_shape_on() { t.waterfall_shape(block, &accesses, &reads, &loads) } else { None });
         if let Some(proof) = proof {
             out.waterfall.compares.extend(proof.compares);
             out.waterfall.reads.extend(proof.reads);

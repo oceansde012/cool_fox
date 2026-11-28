@@ -90,6 +90,11 @@ const RETIRED_QUEUES: usize = 32;
 
 /// This thread's queue of [`RETIRED`].
 fn retired() -> &'static Mutex<std::collections::VecDeque<(u64, Retired)>> {
+    // `VICTORY_RETIRED_QUEUES=1`: a queue to each thread; off: one queue, as before.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_RETIRED_QUEUES")) {
+        return &RETIRED[0];
+    }
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     thread_local! {
         static MINE: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_QUEUES;

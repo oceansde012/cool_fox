@@ -2990,7 +2990,9 @@ pub(crate) fn install() {
 fn page_protection(at: usize) -> Option<u32> {
     use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    if !crate::toggled!("VICTORY_PAGE_ASK") {
+    /// `VICTORY_PAGE_ASK=1`: ask about the one page; off: the region, as before.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_PAGE_ASK")) {
         return None;
     }
     // SAFETY: plain data, the address asked about in it.
