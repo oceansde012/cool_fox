@@ -1673,14 +1673,40 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
 /// which ended runs 20 and 24.
 #[cfg(windows)]
+fn texture_budget_bytes() -> Option<u64> {
+    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
+        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
+    })
+}
+
+/// Returns true when `VICTORY_TEXTURE_BUDGET_EVICT` is exactly `"1"`.
+///
+/// Off by default; the texture budget only stops new host texture copies unless
+/// this is enabled.
+#[cfg(windows)]
+fn budget_evict() -> bool {
+    static EVICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EVICT.get_or_init(|| std::env::var("VICTORY_TEXTURE_BUDGET_EVICT").as_deref() == Ok("1"))
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tighter_keep(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+    if b.1 == u64::MAX {
+        return a;
+    }
+    if a.1 == u64::MAX {
+        return b;
+    }
+    (a.0.min(b.0), a.1.max(b.1))
+}
+
+#[cfg(windows)]
 pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
     const WITHOUT_BUDGET: u64 = 4 << 30;
-    static LIMIT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        let mb = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok()?;
-        mb.trim().parse::<u64>().ok().map(|mb| mb << 20)
-    });
+    let limit = texture_budget_bytes();
     // (With the tiles of the copies made level by level, whose own bytes
     // count as none: `crate::tiles`.)
     let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
@@ -2035,7 +2061,7 @@ pub(crate) fn let_go_idle() {
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
-    let (idle_ms, most) = match memory {
+    let mut policy = match memory {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
@@ -2044,6 +2070,11 @@ pub(crate) fn let_go_idle() {
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
+    if budget_evict() && let Some(limit) = texture_budget_bytes() {
+        let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+        policy = tighter_keep(policy, crate::host::vram_keep(limit, filled));
+    }
+    let (idle_ms, most) = policy;
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
@@ -4576,5 +4607,17 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod budget_evict_tests {
+    use super::tighter_keep;
+
+    #[test]
+    fn tighter_keep_prefers_pressure() {
+        assert_eq!(tighter_keep((600_000, u64::MAX), (5_000, u64::MAX)), (600_000, u64::MAX));
+        assert_eq!(tighter_keep((600_000, u64::MAX), (5_000, 123)), (5_000, 123));
+        assert_eq!(tighter_keep((1_500, 789), (5_000, 123)), (1_500, 789));
     }
 }
