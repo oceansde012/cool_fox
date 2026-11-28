@@ -3256,6 +3256,46 @@ fn land() {
     }
 }
 
+/// Off by default; behaviour unchanged when off.
+fn fence_strict() -> bool {
+    static STRICT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STRICT.get_or_init(|| std::env::var("VICTORY_FENCE_STRICT").as_deref() == Ok("1"))
+}
+
+fn fence_reached(completed: u64, target: u64) -> bool {
+    completed != u64::MAX && completed >= target
+}
+
+/// Waits for `fence` to reach `target`; ends the run (`fail`) if the wait fails or the fence reports device removal (u64::MAX). Used with `VICTORY_FENCE_STRICT=1`.
+///
+/// # Safety
+///
+/// The caller must keep `fence` and `event` alive for the whole wait. `event` must be private to the calling thread.
+unsafe fn wait_strict(fence: &ID3D12Fence, target: u64, event: HANDLE, who: &str) {
+    // SAFETY: caller keeps fence and event alive for the whole wait; event is private to the calling thread.
+    if unsafe { fence.SetEventOnCompletion(target, event) }.is_err() {
+        fail(format_args!("{who}: SetEventOnCompletion failed for target {target}"));
+    }
+    // SAFETY: caller keeps fence and event alive for the whole wait; event is private to the calling thread.
+    if unsafe { WaitForSingleObject(event, INFINITE) } != windows::Win32::Foundation::WAIT_OBJECT_0 {
+        fail(format_args!("{who}: wait failed for target {target}"));
+    }
+    // SAFETY: caller keeps fence and event alive for the whole wait; event is private to the calling thread.
+    let completed = unsafe { fence.GetCompletedValue() };
+    if !fence_reached(completed, target) {
+        fail(format_args!("{who}: fence not reached: completed {completed}, target {target}"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fence_reached_rejects_removed_device() {
+    assert!(!fence_reached(u64::MAX, 1));
+    assert!(!fence_reached(6, 7));
+    assert!(fence_reached(7, 7));
+    assert!(fence_reached(8, 7));
+}
+
 /// The thread that settles the flights once the card has run them all
 /// ([`late`]): without it a bottom-of-pipe write would reach the title only
 /// at the next call that settles, and a title thread that polls such a
@@ -3297,7 +3337,11 @@ fn late_helper() {
         // thread prepares and sends meanwhile.
         // SAFETY: our fence and event.
         unsafe {
-            if host.fence.SetEventOnCompletion(target, event).is_ok() {
+            if fence_strict() {
+                #[cfg(feature = "diagnostics")]
+                let _card = crate::timeline::card_wait(Some(target));
+                wait_strict(&host.fence, target, event, "late helper");
+            } else if host.fence.SetEventOnCompletion(target, event).is_ok() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 WaitForSingleObject(event, INFINITE);
@@ -3433,6 +3477,10 @@ fn relay_worker() {
                     .collect();
                 // SAFETY: a plain query.
                 let completed = unsafe { host.fence.GetCompletedValue() };
+                if fence_strict() && completed == u64::MAX {
+                    drop(line);
+                    fail(format_args!("relay: fence reports device removal"));
+                }
                 let n = landable(&fences, completed);
                 if n == 0 {
                     // The first thing is a flight the card has not run.
@@ -3459,14 +3507,19 @@ fn relay_worker() {
                 let waiting = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
-                // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
-                if waited.is_err() {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                if fence_strict() {
+                    // SAFETY: the host's fence and this thread's event.
+                    unsafe { wait_strict(&host.fence, target, event, "relay") };
+                } else {
+                    // SAFETY: the host's fence and this thread's event.
+                    let waited = unsafe {
+                        host.fence.SetEventOnCompletion(target, event).map(|()| {
+                            WaitForSingleObject(event, INFINITE);
+                        })
+                    };
+                    if waited.is_err() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
                 }
                 RELAY_STATS[2].fetch_add(waiting.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
