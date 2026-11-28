@@ -1423,11 +1423,16 @@ mod relay_tests {
 /// Snapshot memory kept for reuse (already touched, so no page faults).
 static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
+/// When a snapshot buffer was last taken from or given back to [`POOL`]
+/// ([`crate::host::moment`]), for [`let_go_idle_snapshots`].
+static POOL_USED: AtomicU64 = AtomicU64::new(0);
+
 /// An empty buffer with room for `n` bytes, from the pool if it has one
 /// of about that size: a small copy's snapshot took the 174 MB buffer kept
 /// for the big heap's, which then got another, until eight of them were
 /// reserved (1.4 GB in run 24).
 fn pooled(n: usize) -> Vec<u8> {
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     let most = n.saturating_mul(4).max(1 << 20);
     let fit = pool
@@ -1463,6 +1468,7 @@ fn snapshots_kept() -> usize {
 /// bytes in all.
 fn give_back(v: Vec<u8>) {
     const KEPT: usize = 512 << 20;
+    POOL_USED.store(crate::host::moment(), Ordering::Relaxed);
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
@@ -1478,6 +1484,164 @@ fn give_back(v: Vec<u8>) {
     let gone = pool.split_off(kept);
     drop(pool);
     drop(gone);
+}
+
+/// What [`POOL`] keeps while the host is short of memory
+/// ([`crate::residency::pressured`]): the smallest buffers, up to this many
+/// bytes in all. They are the ones asked for most (most of a frame's 330
+/// ranges are small), and the large ones are what fills the 512 MiB.
+const POOL_PRESSURED_KEPT: usize = 32 << 20;
+
+/// Lets go of the snapshot buffers [`POOL`] keeps when nobody wants them.
+/// Only [`give_back`] ever trimmed the pool, and only when another buffer
+/// came back, so once snapshots stopped the last 512 MiB stayed for the
+/// rest of the run, low memory or not (a load test: 524,123 KiB kept after
+/// five idle seconds; 13 MiB private once emptied by hand). Now
+/// - idle for the time the other host caches wait ([`crate::host::ram_idle_ms`])
+///   and four frames, all of it goes;
+/// - while the host is short of memory, all but [`POOL_PRESSURED_KEPT`]
+///   goes, the largest first, whatever the size of the largest.
+///
+/// The next snapshot is then memory fresh from the kernel, as it was for
+/// every snapshot past the pool before. Called by the once-a-second sweep.
+fn let_go_idle_snapshots() {
+    if !snapshot_pool_trim() {
+        return;
+    }
+    const IDLE_FRAMES: u64 = 4;
+    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES);
+    let Some(most) = snapshots_to_keep(idle, crate::residency::pressured()) else {
+        return;
+    };
+    let gone = {
+        let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+        trim_pool(&mut pool, most)
+    };
+    // (Given back to the kernel without the lock.)
+    drop(gone);
+}
+
+/// Vice-Tay bd27027 idle snapshot pool release (`VICTORY_SNAPSHOT_POOL_TRIM=1`);
+/// off keeps the pool as before.
+fn snapshot_pool_trim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL_TRIM").ok().as_deref() == Some("1"))
+}
+
+/// How many bytes of snapshot buffers [`POOL`] may keep: none once idle,
+/// [`POOL_PRESSURED_KEPT`] while the host is short of memory, otherwise
+/// what [`give_back`] keeps (`None`: nothing to do).
+fn snapshots_to_keep(idle: bool, pressured: bool) -> Option<usize> {
+    if idle {
+        Some(0)
+    } else if pressured {
+        Some(POOL_PRESSURED_KEPT)
+    } else {
+        None
+    }
+}
+
+/// Keeps the smallest buffers of `pool`, up to `most` bytes of capacity in
+/// all, and returns the others (largest first) for the caller to free.
+fn trim_pool(pool: &mut Vec<Vec<u8>>, most: usize) -> Vec<Vec<u8>> {
+    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
+    let mut total = 0usize;
+    let mut keep = 0;
+    for v in pool.iter().rev() {
+        total = total.saturating_add(v.capacity());
+        if total > most {
+            break;
+        }
+        keep += 1;
+    }
+    let first_kept = pool.len() - keep;
+    let kept = pool.split_off(first_kept);
+    std::mem::replace(pool, kept)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn sizes(pool: &[Vec<u8>]) -> Vec<usize> {
+        pool.iter().map(Vec::capacity).collect()
+    }
+
+    #[test]
+    fn trimming_keeps_the_smallest_up_to_the_limit() {
+        let mut pool: Vec<Vec<u8>> = [8usize, 1, 4, 2].iter().map(|&n| Vec::with_capacity(n << 20)).collect();
+        let gone = trim_pool(&mut pool, 7 << 20);
+        assert_eq!(sizes(&pool), [4 << 20, 2 << 20, 1 << 20]);
+        assert_eq!(sizes(&gone), [8 << 20]);
+    }
+
+    #[test]
+    fn trimming_to_nothing_empties_the_pool() {
+        let mut pool: Vec<Vec<u8>> = [3usize, 1].iter().map(|&n| Vec::with_capacity(n << 20)).collect();
+        let gone = trim_pool(&mut pool, 0);
+        assert!(pool.is_empty());
+        assert_eq!(sizes(&gone), [3 << 20, 1 << 20]);
+    }
+
+    #[test]
+    fn a_buffer_past_the_limit_goes_even_alone() {
+        // `give_back` always keeps its largest buffer; under pressure that
+        // one goes too.
+        let mut pool = vec![Vec::<u8>::with_capacity(600 << 20)];
+        let gone = trim_pool(&mut pool, POOL_PRESSURED_KEPT);
+        assert!(pool.is_empty());
+        assert_eq!(gone.len(), 1);
+    }
+
+    #[test]
+    fn an_idle_pool_goes_and_a_pressed_one_shrinks() {
+        assert_eq!(snapshots_to_keep(true, false), Some(0));
+        assert_eq!(snapshots_to_keep(true, true), Some(0));
+        assert_eq!(snapshots_to_keep(false, true), Some(POOL_PRESSURED_KEPT));
+        assert_eq!(snapshots_to_keep(false, false), None);
+    }
+
+    /// The pool after snapshots stop, in a process's private bytes: before,
+    /// 512 MiB stayed however long nothing asked. Run alone (the pool is
+    /// global): `cargo test -p victory-gpu --lib
+    /// shadow::pool_tests::pool_memory_load -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore]
+    fn pool_memory_load() {
+        fn private_kib() -> usize {
+            use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            // SAFETY: plain data the call fills in, for this process.
+            let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+            c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), (&raw mut c).cast(), c.cb) };
+            c.PrivateUsage >> 10
+        }
+        let start = private_kib();
+        for i in 0..256usize {
+            let mut v = pooled((1 + i % 32) << 20);
+            v.resize(v.capacity(), 1);
+            give_back(v);
+        }
+        let kept: usize = POOL.lock().unwrap().iter().map(Vec::capacity).sum();
+        let full = private_kib();
+        let gone = trim_pool(&mut POOL.lock().unwrap(), POOL_PRESSURED_KEPT);
+        drop(gone);
+        let pressed = private_kib();
+        let gone = trim_pool(&mut POOL.lock().unwrap(), 0);
+        drop(gone);
+        let idle = private_kib();
+        eprintln!(
+            "pool kept {} KiB; private KiB over the start: full {}, pressed {}, idle {}",
+            kept >> 10,
+            full.saturating_sub(start),
+            pressed.saturating_sub(start),
+            idle.saturating_sub(start)
+        );
+        assert!(pressed.saturating_sub(start) <= (POOL_PRESSURED_KEPT >> 10) + 8 * 1024);
+        assert!(POOL.lock().unwrap().is_empty());
+    }
 }
 
 const NOT_WATCHED: u8 = 2;
@@ -3342,6 +3506,8 @@ pub(crate) fn window_use() -> [u64; 8] {
 /// again. Called before a submission starts, by the thread that submits.
 pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
+    // Before the windows: their table may be empty while the pool is not.
+    let_go_idle_snapshots();
     let gone: Vec<Arc<Shadow>> = {
         // Held from the look to the removal: `loose` hands a copy out
         // under the same lock, so none is handed out in between.

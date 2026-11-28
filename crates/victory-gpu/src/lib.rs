@@ -51,6 +51,8 @@ mod port_cbv;
 mod port_journal;
 #[cfg(windows)]
 mod land;
+#[cfg(all(test, windows))]
+mod loadprobe;
 pub mod list;
 pub mod object;
 pub mod pipeline;
