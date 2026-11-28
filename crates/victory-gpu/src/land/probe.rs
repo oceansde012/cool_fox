@@ -1,6 +1,6 @@
 //! Diagnostics: whether anything reads or writes the title memory whose
 //! copy in the card's memory is not landed (`VICTORY_LAND_NOT_PROBE=1`, with
-//! `VICTORY_LAND_NOT`). At each landing that leaves a piece on the card, the
+//! `VICTORY_LAND_NOT_SHADERS`). At each landing that leaves a piece on the card, the
 //! piece's title memory is made no-access (if it is read-write, or read-only
 //! as the guards leave a block). The first access to it comes here: the
 //! protection it had is given back, the access is noted (address, read or

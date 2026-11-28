@@ -1393,7 +1393,7 @@ thread_local! {
     static WRITER_LANDS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-/// [`Shadow::writers`]: written by a pipeline `VICTORY_LAND_NOT` names, by
+/// [`Shadow::writers`]: written by a pipeline `VICTORY_LAND_NOT_SHADERS` names, by
 /// another.
 const BY_UNLANDED: u8 = 1;
 const BY_OTHERS: u8 = 2;
@@ -1611,7 +1611,7 @@ fn spin(there: impl Fn() -> bool) {
 }
 
 /// Whether [`wide`] wakes one kept thread for each job it can share, not
-/// all of them for any (`VICTORY_WIDE_WAKE=0`: all, as before; switched by
+/// all of them for any (off by default: all, as before; `VICTORY_WIDE_WAKE=1` turns it on; switched by
 /// `VICTORY_AB` too). Vice-Tay d60fc84f (readmet3xt-lab).
 fn wake_few() -> bool {
     #[cfg(feature = "diagnostics")]
@@ -1619,7 +1619,7 @@ fn wake_few() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_WAKE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_WAKE").is_some_and(|v| v == "1"))
 }
 
 /// How many threads are kept for [`wide`].
@@ -3240,7 +3240,7 @@ impl Shadow {
 
     /// [`Shadow::gpu_writes`] of a clear of a view of the copy: landed as any
     /// write, but no writer of its own for [`Shadow::not_landed`]. Scratch
-    /// that only shaders `VICTORY_LAND_NOT` names write (FSR4's 21 MB block,
+    /// that only shaders `VICTORY_LAND_NOT_SHADERS` names write (FSR4's 21 MB block,
     /// cleared once when the world begins) stays on the card after it.
     pub(crate) fn cleared(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
         if self.place.is_some() {
@@ -3253,7 +3253,7 @@ impl Shadow {
 
     /// Whether what shaders wrote to this copy in the card's memory stays
     /// there, not fetched nor put into title memory (`crate::land::not_on`):
-    /// only pipelines `VICTORY_LAND_NOT` names were ever declared to write
+    /// only pipelines `VICTORY_LAND_NOT_SHADERS` names were ever declared to write
     /// it; it is scratch-sized (1 MiB or more: a small buffer of the same
     /// shaders may be one the title reads, and costs nothing to land); and
     /// its memory is watched, so that no refresh takes title memory that the

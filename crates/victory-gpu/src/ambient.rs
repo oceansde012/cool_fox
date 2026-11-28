@@ -83,8 +83,8 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 
 /// Whether the resolve's passes read the title's depth: the depth plane of a
 /// depth texture the resolve's program reads, of the light's size, at
-/// [`DEPTH`] or else where the program has one (`VICTORY_AMBIENT_DEPTH`, on;
-/// 0: the view at [`STENCIL`], as before; A/B-able). With none found, the
+/// [`DEPTH`] or else where the program has one (`VICTORY_AMBIENT_DEPTH=1`;
+/// off by default: the view at [`STENCIL`], as before; A/B-able). With none found, the
 /// view at [`STENCIL`] too: the light is raised all the same, and the
 /// magenta of the probes' memory taken out.
 pub(crate) fn title_depth() -> bool {
@@ -93,7 +93,7 @@ pub(crate) fn title_depth() -> bool {
         return on;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_DEPTH").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_DEPTH").is_some_and(|v| v == "1"))
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

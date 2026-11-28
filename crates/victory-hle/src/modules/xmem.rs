@@ -268,7 +268,7 @@ const WATCHED_FROM: usize = 1 << 20;
 const WATCHED: usize = 1 << (usize::BITS - 1);
 
 fn watched_blocks() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_XMEM_WATCHED").is_none_or(|v| v != "0"));
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("VICTORY_XMEM_WATCHED").is_some_and(|v| v == "1"));
     *ON
 }
 

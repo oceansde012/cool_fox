@@ -368,7 +368,7 @@ pub(crate) fn stamps_armed() -> bool {
         let named = crate::ab::bit("VICTORY_REFRESH_STAMPS").is_some();
         #[cfg(not(feature = "diagnostics"))]
         let named = false;
-        light() && (named || std::env::var_os("VICTORY_REFRESH_STAMPS").is_none_or(|v| v != "0"))
+        light() && (named || std::env::var_os("VICTORY_REFRESH_STAMPS").is_some_and(|v| v == "1"))
     })
 }
 
@@ -1980,7 +1980,7 @@ fn fast_faults() -> bool {
 
 fn fast_asked() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_FAST").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FAULT_FAST").is_some_and(|v| v == "1"))
 }
 
 #[cfg(test)]

@@ -1648,7 +1648,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             // What its views, root views and title memory by address declare
-            // written goes into title memory, unless `VICTORY_LAND_NOT`
+            // written goes into title memory, unless `VICTORY_LAND_NOT_SHADERS`
             // names the shader.
             let _lands = crate::shadow::writer_lands(crate::land::lands(&stage.shader.hash));
             STORES.set(t.stores);

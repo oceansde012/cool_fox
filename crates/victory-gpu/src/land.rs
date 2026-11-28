@@ -70,7 +70,7 @@ pub(crate) fn skip_on() -> bool {
 }
 
 /// The title's pipelines whose shaders' writes are not landed
-/// (`VICTORY_LAND_NOT`: shader hashes, or their beginnings, separated by
+/// (`VICTORY_LAND_NOT_SHADERS`: shader hashes, or their beginnings, separated by
 /// commas; none by default): what they write to copies in the card's memory
 /// stays there, unfetched, and title memory keeps what it had
 /// (`crate::shadow::Shadow::not_landed`, which says for which copies).
@@ -81,7 +81,7 @@ pub(crate) fn skip_on() -> bool {
 fn not_listed() -> &'static [String] {
     static LIST: OnceLock<Vec<String>> = OnceLock::new();
     LIST.get_or_init(|| {
-        std::env::var("VICTORY_LAND_NOT")
+        std::env::var("VICTORY_LAND_NOT_SHADERS")
             .unwrap_or_default()
             .split(',')
             .map(|s| s.trim().to_ascii_lowercase())
@@ -101,13 +101,13 @@ fn lands_by(list: &[String], hash: &str) -> bool {
 }
 
 /// Whether [`not_listed`]'s writes are left on the card now (a list is given,
-/// and it is not its off phase of `VICTORY_AB=<s>,VICTORY_LAND_NOT`).
+/// and it is not its off phase of `VICTORY_AB=<s>,VICTORY_LAND_NOT_SHADERS`).
 pub(crate) fn not_on() -> bool {
     if not_listed().is_empty() {
         return false;
     }
     #[cfg(feature = "diagnostics")]
-    if let Some(on) = crate::ab::pick("VICTORY_LAND_NOT") {
+    if let Some(on) = crate::ab::pick("VICTORY_LAND_NOT_SHADERS") {
         return on;
     }
     true
@@ -159,7 +159,7 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    /// Pieces left on the card, and their bytes (`VICTORY_LAND_NOT`).
+    /// Pieces left on the card, and their bytes (`VICTORY_LAND_NOT_SHADERS`).
     pub(crate) const NOT: usize = 26;
     pub(crate) const NOT_BYTES: usize = 27;
     pub(crate) const COUNT: usize = 28;
@@ -193,7 +193,7 @@ pub(crate) fn log(frames: f64) {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     if s[stat::NOT] > 0.0 || not_on() {
         tracing::info!(
-            "left on the card per frame (VICTORY_LAND_NOT, {} shaders): {:.0} pieces, {:.1} MB not fetched nor landed",
+            "left on the card per frame (VICTORY_LAND_NOT_SHADERS, {} shaders): {:.0} pieces, {:.1} MB not fetched nor landed",
             not_listed().len(),
             s[stat::NOT],
             s[stat::NOT_BYTES] / (1 << 20) as f64

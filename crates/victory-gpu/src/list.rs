@@ -1658,14 +1658,15 @@ enum ClearMode {
     Poison(u8, u8),
 }
 
-/// What a clear of an unordered access view does: clears (default); nothing,
-/// as before (`VICTORY_CLEAR_UAV=0`); or, to see what the title clears,
+/// What a clear of an unordered access view does: nothing, as before
+/// (default); clears (`VICTORY_CLEAR_UAV=1`); or, to see what the title clears,
 /// fills it with bytes 0x3f instead (`VICTORY_CLEAR_UAV=poison`, or
 /// `poison:<byte in hex>[:buffer|:texture]`).
 #[cfg(windows)]
 fn clear_mode() -> ClearMode {
     static MODE: std::sync::OnceLock<ClearMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_CLEAR_UAV").as_deref() {
+        Ok("1") => ClearMode::Clear,
         Ok("0") => ClearMode::Off,
         Ok("poison") => ClearMode::Poison(0x3f, 3),
         Ok(v) if v.starts_with("poison:") => {
@@ -1678,7 +1679,7 @@ fn clear_mode() -> ClearMode {
             };
             ClearMode::Poison(byte, kinds)
         }
-        _ => ClearMode::Clear,
+        _ => ClearMode::Off,
     })
 }
 
