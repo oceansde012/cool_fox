@@ -5704,7 +5704,7 @@ impl Host {
         if late {
             *submitted += 1;
             #[cfg(feature = "diagnostics")]
-            if let Some([front, behind]) = self.span_lists(*submitted) {
+            if let Some([front, behind]) = self.span_lists() {
                 lists.insert(0, Some(front));
                 lists.push(Some(behind));
                 firsts.iter_mut().for_each(|first| *first += 1);
