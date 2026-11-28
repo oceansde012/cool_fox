@@ -8655,6 +8655,48 @@ struct Presenter {
     composer: Option<crate::compose::Composer>,
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
+    /// The swap chain was made with the tearing flag, kept for ResizeBuffers.
+    tearing: bool,
+    /// Presents ask for tearing; off for the rest of the run once one is refused.
+    presents_tearing: bool,
+    /// A refused present was logged.
+    present_refused: bool,
+}
+
+/// Whether the swap chain lets a frame be shown as soon as presented instead of at the next
+/// refresh (DXGI_FEATURE_PRESENT_ALLOW_TEARING); OFF by default, VICTORY_TEARING=1 turns it on;
+/// pure present-mode change, no frame generation. From trustno1-coder/VIctory-NVIDIA 8fc2254.
+fn tearing(factory: &IDXGIFactory2) -> bool {
+    let Ok(value) = std::env::var("VICTORY_TEARING") else {
+        return false;
+    };
+    if value.trim() != "1" {
+        return false;
+    }
+
+    let Ok(factory) = factory.cast::<IDXGIFactory5>() else {
+        return false;
+    };
+    let mut allowed = windows::core::BOOL(0);
+    let asked = unsafe {
+        // SAFETY: `allowed` is a valid BOOL for CheckFeatureSupport to write into and
+        // `size_of_val(&allowed)` matches the feature data size for this query.
+        factory.CheckFeatureSupport(
+            DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+            (&raw mut allowed).cast(),
+            size_of_val(&allowed) as u32,
+        )
+    };
+    asked.is_ok() && allowed.as_bool()
+}
+
+/// Returns DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING when tearing else DXGI_SWAP_CHAIN_FLAG(0).
+fn chain_flags(tearing: bool) -> DXGI_SWAP_CHAIN_FLAG {
+    if tearing {
+        DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+    } else {
+        DXGI_SWAP_CHAIN_FLAG(0)
+    }
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9042,7 +9084,7 @@ impl Host {
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                    .ResizeBuffers(BUFFERS, width, height, format, chain_flags(p.tearing))
             };
             match resized {
                 Ok(()) => {
@@ -9258,7 +9300,15 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let shown = p.swap_chain.Present(0, if p.presents_tearing { DXGI_PRESENT_ALLOW_TEARING } else { DXGI_PRESENT(0) });
+            if shown.is_err() && p.presents_tearing {
+                tracing::warn!(code = %shown, "a present shown at once was refused; presenting at the next refresh for the rest of the run");
+                p.presents_tearing = false;
+                let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            } else if shown.is_err() && !p.present_refused {
+                p.present_refused = true;
+                tracing::warn!(code = %shown, "a present was refused (logged once)");
+            }
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -9285,6 +9335,8 @@ impl Host {
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let tearing = tearing(&factory);
+            tracing::info!(tearing, "swap chain: frames shown as soon as presented (VICTORY_TEARING=1)");
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
@@ -9296,6 +9348,7 @@ impl Host {
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: BUFFERS,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                Flags: chain_flags(tearing).0 as u32,
                 ..Default::default()
             };
             let swap_chain = factory
@@ -9317,6 +9370,9 @@ impl Host {
                 composer: None,
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
+                tearing,
+                presents_tearing: tearing,
+                present_refused: false,
             })
         }
     }
