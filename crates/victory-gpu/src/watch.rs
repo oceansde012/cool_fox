@@ -4333,6 +4333,7 @@ mod tests {
         assert_ne!(p, 0);
         // One range: `ask_ahead` leaves it.
         let ranges = [(p, p + 4 * PAGE)];
+        let _one = SUBMITTING.lock().unwrap_or_else(|e| e.into_inner());
         ask_ahead(&ranges);
         let (copied, _) = writes(p, p + 4 * PAGE, false).expect("watched");
         // SAFETY: committed pages of ours.

@@ -10536,6 +10536,7 @@ mod refresh_tests {
             let look = |expected: bool, what: &str| {
                 // The submission's one asking, which takes two ranges. (Again
                 // if a submission of another test ended it.)
+                let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
                 let mut known = false;
                 for _ in 0..100 {
                     crate::watch::ask_once(&[(at, at + len), (region + 7 * PAGE, region + 8 * PAGE)]);
