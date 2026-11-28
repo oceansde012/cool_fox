@@ -36,6 +36,9 @@ pub(crate) struct Pending {
     queue_state: AtomicU8,
     /// Taken by a worker from [`Queue::slow`].
     was_slow: AtomicBool,
+    /// Timed out waiting on a previous frame; skip repeating per-frame waits
+    /// for slow non-screen pipelines while a worker finishes compiling them.
+    waited_out: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
@@ -127,6 +130,7 @@ impl Pending {
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             was_slow: AtomicBool::new(false),
+            waited_out: AtomicBool::new(false),
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
@@ -140,7 +144,22 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
-            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            let made = if crate::vl_fixes() {
+                // A build that panics (a translation) must still finish this
+                // entry and wake its waiters, and leave the worker running
+                // (fxceless/victory-fork#1353).
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    HostPipeline::new(&self.shaders, self.graphics.as_deref())
+                })) {
+                    Ok(made) => made,
+                    Err(_) => {
+                        tracing::warn!(key = self.key, "host pipeline build panicked: refused");
+                        None
+                    }
+                }
+            } else {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            };
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
         });
@@ -231,9 +250,93 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        // A compute pipeline with `compute_waits`: made here, or waited for
+        // while a worker makes it. The first 600 frames (loading) make
+        // theirs whatever it costs; later frames only while under `compute_cap`.
+        let frame = crate::frame::current();
+        let early = frame < 600;
+        if p.graphics.is_none() && compute_waits() && (early || compute_room(frame)) {
+            let began = std::time::Instant::now();
+            p.make();
+            if !early {
+                compute_spent(frame, began.elapsed());
+            }
+        } else {
+            wait(p, frame);
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget ([`wait_budget`]); a draw still waits within
+/// the budget and is dropped while its pipeline is not there.
+///
+/// A dropped draw is drawn again in the next frame. A dropped dispatch may
+/// not be: the title runs some compute passes once, when a scene changes
+/// (a buffer reset or cleared), and what they leave is read for as long as
+/// the scene lasts. In the prison corridor a compute program met for the
+/// first time took 4.4 s to make on a 16 GB machine; its one dispatch was
+/// dropped after the half second of budget, and the windows of the room
+/// before stayed blended over the whole picture for minutes (run 195).
+/// A wait of seconds once (the pipeline library has it on the next run)
+/// against a picture wrong until the scene ends.
+/// Off by default; `VICTORY_PIPELINE_COMPUTE_WAIT=1` turns it on.
+fn compute_waits() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
+}
+
+/// The most a frame waits for compute pipelines made at their dispatch
+/// ([`compute_waits`]), over all threads, before its later dispatches go
+/// back to the frame's budget ([`wait`]). With a new cache the first
+/// cutscene met 457 compute programs in one frame at about a second each:
+/// the frame did not end for over 30 s and the title's own hang watchdog
+/// stored to address 0. Capped, the frame ends and the rest are made by
+/// the workers and waited for within the budget, as before
+/// [`compute_waits`]. The check comes before a make, so a frame can run
+/// over by the makes already started on other threads (seconds each):
+/// `VICTORY_PIPELINE_COMPUTE_WAIT_MS`, 8,000 by default, leaves room for
+/// that under the watchdog's 30 s.
+fn compute_cap() -> std::time::Duration {
+    static MS: OnceLock<u64> = OnceLock::new();
+    std::time::Duration::from_millis(*MS.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_COMPUTE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(8_000)
+    }))
+}
+
+/// The frame whose compute waits are counted, and the microseconds counted.
+static COMPUTE_WAITED: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
+
+/// Whether frame `frame` may still wait for a compute pipeline ([`compute_cap`]).
+fn compute_room(frame: u64) -> bool {
+    let mut w = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    if w.0 != frame {
+        *w = (frame, 0);
+    }
+    let room = u128::from(w.1) < compute_cap().as_micros();
+    if !room {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                frame,
+                cap_ms = u64::try_from(compute_cap().as_millis()).unwrap_or(u64::MAX),
+                "a frame waited its cap for compute pipelines; the rest wait within its budget (said once)"
+            );
+        }
+    }
+    room
+}
+
+/// Counts a compute wait to `frame`, if that is still the frame counted.
+fn compute_spent(frame: u64, took: std::time::Duration) {
+    let mut w = COMPUTE_WAITED.lock().unwrap_or_else(|e| e.into_inner());
+    if w.0 == frame {
+        w.1 = w.1.saturating_add(u64::try_from(took.as_micros()).unwrap_or(u64::MAX));
+    }
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -272,10 +375,29 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether a slow non-screen pipeline that timed out waiting once stops
+/// repeating per-frame waits on subsequent frames while its worker finishes
+/// Off by default; `VICTORY_PIPELINE_WAIT_ONCE=1` turns it on.
+fn wait_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_some_and(|v| v == "1"))
+}
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    wait_skipping(p, frame, wait_once())
+}
+
+fn wait_skipping(p: &Pending, frame: u64, once: bool) {
     let screen = p.screen && screens_first();
+    if !screen && once && p.waited_out.load(Ordering::Relaxed) {
+        return;
+    }
     let budget = if screen { screen_budget() } else { wait_budget() };
+    wait_with_budget(p, frame, screen, budget);
+}
+
+fn wait_with_budget(p: &Pending, frame: u64, screen: bool, budget: Duration) {
     if budget.is_zero() {
         return;
     }
@@ -309,6 +431,9 @@ fn wait(p: &Pending, frame: u64) {
         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
     }
     drop(held);
+    if !screen && p.made.get().is_none() {
+        p.waited_out.store(true, Ordering::Relaxed);
+    }
     let waited = started.elapsed().min(left);
     if screen && waited > Duration::from_millis(500) {
         tracing::info!(
@@ -659,5 +784,23 @@ mod tests {
         assert!(Arc::ptr_eq(&queue.pop(true, 1).unwrap(), &screen));
         assert!(queue.pop(true, 1).is_none());
         assert!(Arc::ptr_eq(&queue.pop(false, 1).unwrap(), &world));
+    }
+
+    #[test]
+    fn slow_non_screen_pipeline_does_not_repeat_frame_waits() {
+        let p = Pending::new(Vec::new(), None);
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        let p = Arc::new(p);
+        // First wait on frame 1000 times out and marks `waited_out`.
+        wait_with_budget(&p, 1000, false, Duration::from_millis(10));
+        assert!(p.waited_out.load(Ordering::Relaxed));
+        // Second call on a later frame returns immediately without spending another budget.
+        let started = Instant::now();
+        wait_skipping(&p, 1001, true);
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "repeated wait stalled for {:?}",
+            started.elapsed()
+        );
     }
 }

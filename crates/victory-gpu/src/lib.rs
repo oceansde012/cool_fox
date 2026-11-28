@@ -117,3 +117,9 @@ pub use watch::{
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// Stability fixes picked from victory-linux/victory-nvidia (fxceless #1407, avatarmanz #351, Belobug 40b8b9b, fxceless #1353, Marvisak #2449, Belobug #460). Off by default; VICTORY_VL_FIXES=1 turns them on.
+pub(crate) fn vl_fixes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VL_FIXES").is_some_and(|v| v == "1"))
+}

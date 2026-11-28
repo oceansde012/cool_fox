@@ -1710,13 +1710,9 @@ fn find_pieces(scans: Vec<(usize, usize, usize, usize, usize)>) -> Vec<Vec<(usiz
                     // (which holds the copy's bytes at the copy's offsets);
                     // nothing writes either while a submission's results
                     // are compared.
-                    let (now, old) = unsafe {
-                        (
-                            std::slice::from_raw_parts((data + at) as *const u8, n),
-                            std::slice::from_raw_parts((before + at) as *const u8, n),
-                        )
-                    };
-                    if now != old {
+                    // Not `!=`: that is the C runtime's memcmp, a scalar
+                    // loop under Wine (3 % of the process's time there).
+                    if unsafe { crate::safecopy::differ((data + at) as *const u8, (before + at) as *const u8, n) } {
                         pieces.push((at, n));
                     }
                     at += n;
@@ -3290,11 +3286,18 @@ impl Shadow {
         if !crate::host::read_into((start + at) as *const u8, title) {
             return 0;
         }
-        let was = title.clone();
-        if !merge_piece(now, held, title) {
-            return 0;
+        thread_local! {
+            static MERGE_WAS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        put_changed(start + at, &was, title)
+        MERGE_WAS.with(|cell| {
+            let mut was = cell.borrow_mut();
+            was.clear();
+            was.extend_from_slice(title);
+            if !merge_piece(now, held, title) {
+                return 0;
+            }
+            put_changed(start + at, &was, title)
+        })
     }
 
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
@@ -3329,7 +3332,13 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            (at - (start + at) % PIECE).max(from)
+            if crate::vl_fixes() {
+                // (saturating: near the copy's start, the piece `at` lies in may
+                // begin before the copy does)
+                at.saturating_sub((start + at) % PIECE).max(from)
+            } else {
+                (at - (start + at) % PIECE).max(from)
+            }
         };
         let scan = &scan;
         std::thread::scope(|s| {
@@ -4824,18 +4833,32 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let before = buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
             shadow: None,
         },
     );
+    // A buffer made again at the same place and address: its old copy may
+    // still be named by lists and descriptors, as one the title released.
+    if crate::vl_fixes() {
+        if let Some(shadow) = before.and_then(|e| e.shadow) {
+            crate::host::retire(shadow);
+        }
+    }
 }
 
-/// The title released it; lists that still hold its copy keep it alive.
+/// The title released it; lists that still hold its copy keep it alive,
+/// and the copy itself is retired, not dropped at once: descriptors the
+/// title left in a heap and submissions in flight may still name it.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let gone = buffers().remove(&(start, resource));
+    if crate::vl_fixes() {
+        if let Some(shadow) = gone.and_then(|e| e.shadow) {
+            crate::host::retire(shadow);
+        }
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
