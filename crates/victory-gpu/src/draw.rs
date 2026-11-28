@@ -3837,7 +3837,7 @@ impl State {
                 }
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
-                    Some(View::Constant(0, _)) => {
+                    Some(View::Constant(0, _)) if crate::vl_fixes() => {
                         // A null constant buffer view (upstream VIctory #2449).
                         host.make_null(index);
                     }

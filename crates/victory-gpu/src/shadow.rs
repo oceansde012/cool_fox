@@ -3332,9 +3332,13 @@ impl Shadow {
                 return to;
             }
             let at = from + (to - from) / threads * i;
-            // (saturating: near the copy's start, the piece `at` lies in may
-            // begin before the copy does)
-            at.saturating_sub((start + at) % PIECE).max(from)
+            if crate::vl_fixes() {
+                // (saturating: near the copy's start, the piece `at` lies in may
+                // begin before the copy does)
+                at.saturating_sub((start + at) % PIECE).max(from)
+            } else {
+                (at - (start + at) % PIECE).max(from)
+            }
         };
         let scan = &scan;
         std::thread::scope(|s| {
@@ -4838,8 +4842,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
     );
     // A buffer made again at the same place and address: its old copy may
     // still be named by lists and descriptors, as one the title released.
-    if let Some(shadow) = before.and_then(|e| e.shadow) {
-        crate::host::retire(shadow);
+    if crate::vl_fixes() {
+        if let Some(shadow) = before.and_then(|e| e.shadow) {
+            crate::host::retire(shadow);
+        }
     }
 }
 
@@ -4848,8 +4854,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// title left in a heap and submissions in flight may still name it.
 pub(crate) fn unregister(resource: usize, start: u64) {
     let gone = buffers().remove(&(start, resource));
-    if let Some(shadow) = gone.and_then(|e| e.shadow) {
-        crate::host::retire(shadow);
+    if crate::vl_fixes() {
+        if let Some(shadow) = gone.and_then(|e| e.shadow) {
+            crate::host::retire(shadow);
+        }
     }
 }
 

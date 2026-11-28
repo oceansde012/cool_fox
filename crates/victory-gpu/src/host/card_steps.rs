@@ -571,8 +571,8 @@ fn record(
         }
         ok
     };
-    let reads: Vec<_> = reads.iter().filter(fits).copied().collect();
-    let writes: Vec<_> = writes.iter().filter(fits).copied().collect();
+    let reads: Vec<_> = reads.iter().filter(|r| !crate::vl_fixes() || fits(r)).copied().collect();
+    let writes: Vec<_> = writes.iter().filter(|r| !crate::vl_fixes() || fits(r)).copied().collect();
     let (reads, writes) = (&reads[..], &writes[..]);
     let common = D3D12_RESOURCE_STATE_COMMON;
     let (source, dest) = (D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COPY_DEST);

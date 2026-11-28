@@ -522,11 +522,11 @@ fn bury(finished: u64) {
 /// D3D12 object is a call into the driver (under Wine and vkd3d-proton a
 /// Vulkan free each), and `bury` runs on the submitting thread
 /// (upstream VIctory 3e10052c: ~5 % of that thread in releases).
-/// `VICTORY_RELEASE_THREAD=0` drops them where they are buried, as before.
+/// Off by default (dropped where they are buried, as before); `VICTORY_RELEASE_THREAD=1` turns it on.
 fn release_later(done: Vec<(u64, Retired)>) {
     static SEND: OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<(u64, Retired)>>>>> = OnceLock::new();
     let send = SEND.get_or_init(|| {
-        if std::env::var_os("VICTORY_RELEASE_THREAD").is_some_and(|v| v == "0") {
+        if !std::env::var_os("VICTORY_RELEASE_THREAD").is_some_and(|v| v == "1") {
             return None;
         }
         let (tx, rx) = std::sync::mpsc::channel::<Vec<(u64, Retired)>>();

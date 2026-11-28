@@ -144,17 +144,21 @@ impl Pending {
     fn make(&self) {
         self.made.get_or_init(|| {
             let began = Instant::now();
-            // A build that panics (a translation) must still finish this
-            // entry and wake its waiters, and leave the worker running
-            // (fxceless/victory-fork#1353).
-            let made = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                HostPipeline::new(&self.shaders, self.graphics.as_deref())
-            })) {
-                Ok(made) => made,
-                Err(_) => {
-                    tracing::warn!(key = self.key, "host pipeline build panicked: refused");
-                    None
+            let made = if crate::vl_fixes() {
+                // A build that panics (a translation) must still finish this
+                // entry and wake its waiters, and leave the worker running
+                // (fxceless/victory-fork#1353).
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    HostPipeline::new(&self.shaders, self.graphics.as_deref())
+                })) {
+                    Ok(made) => made,
+                    Err(_) => {
+                        tracing::warn!(key = self.key, "host pipeline build panicked: refused");
+                        None
+                    }
                 }
+            } else {
+                HostPipeline::new(&self.shaders, self.graphics.as_deref())
             };
             super::library::note_time(&self.key, began.elapsed().as_millis() as u64);
             made
@@ -277,11 +281,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// before stayed blended over the whole picture for minutes (run 195).
 /// A wait of seconds once (the pipeline library has it on the next run)
 /// against a picture wrong until the scene ends.
-/// On by default; `VICTORY_PIPELINE_COMPUTE_WAIT=0`: within the budget, as
-/// before.
+/// Off by default; `VICTORY_PIPELINE_COMPUTE_WAIT=1` turns it on.
 fn compute_waits() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_COMPUTE_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// The most a frame waits for compute pipelines made at their dispatch
@@ -374,16 +377,20 @@ fn shared_budget() -> bool {
 
 /// Whether a slow non-screen pipeline that timed out waiting once stops
 /// repeating per-frame waits on subsequent frames while its worker finishes
-/// (`VICTORY_PIPELINE_WAIT_ONCE=0`: wait on every frame, as before).
+/// Off by default; `VICTORY_PIPELINE_WAIT_ONCE=1` turns it on.
 fn wait_once() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_ONCE").is_some_and(|v| v == "1"))
 }
 
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
+    wait_skipping(p, frame, wait_once())
+}
+
+fn wait_skipping(p: &Pending, frame: u64, once: bool) {
     let screen = p.screen && screens_first();
-    if !screen && wait_once() && p.waited_out.load(Ordering::Relaxed) {
+    if !screen && once && p.waited_out.load(Ordering::Relaxed) {
         return;
     }
     let budget = if screen { screen_budget() } else { wait_budget() };
@@ -789,7 +796,7 @@ mod tests {
         assert!(p.waited_out.load(Ordering::Relaxed));
         // Second call on a later frame returns immediately without spending another budget.
         let started = Instant::now();
-        wait(&p, 1001);
+        wait_skipping(&p, 1001, true);
         assert!(
             started.elapsed() < Duration::from_millis(50),
             "repeated wait stalled for {:?}",

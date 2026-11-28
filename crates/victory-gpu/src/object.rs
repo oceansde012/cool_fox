@@ -230,6 +230,11 @@ const MAX_NAME_UNITS: usize = 1024;
 pub(crate) extern "system" fn set_name(this: This, name: *const u16) -> HRESULT {
     let name = if name.is_null() {
         String::new()
+    } else if !crate::vl_fixes() {
+        // SAFETY: a non-null name is NUL-terminated UTF-16.
+        let len = (0..).take_while(|&i| unsafe { *name.add(i) } != 0).count();
+        // SAFETY: `len` units were just read.
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(name, len) })
     } else {
         // The title passes a NUL-terminated UTF-16 string, but the pointer
         // may have gone stale by now. `read_there` touches only mapped
