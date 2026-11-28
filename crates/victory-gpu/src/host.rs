@@ -5594,23 +5594,31 @@ impl Host {
         // wait for the card and the copy-back have their own places on the
         // frame line (run 92 showed them twice, "preparing" 250 ms for 135).
         let mut settled = std::time::Duration::ZERO;
+        // What the submission asks about and refreshes in front of its
+        // steps, in one walk over them ([`one_walk`]).
+        let walked = (refresh_front() && one_walk()).then(|| batch.gather(runs, &parts));
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
-            let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
-            for list in runs {
-                for step in &list.deferred().copies {
-                    if let Step::Refresh(shadow, address, len) = step
-                        && shadow.asked_ahead()
-                    {
-                        let span = spans
-                            .entry(std::sync::Arc::as_ptr(shadow) as usize)
-                            .or_insert((*address, *address + *len));
-                        *span = (span.0.min(*address), span.1.max(*address + *len));
+            let ranges: Vec<(usize, usize)> = match &walked {
+                Some(walked) => walked.asked(),
+                None => {
+                    let mut spans: ByCopy<(usize, usize)> = ByCopy::default();
+                    for list in runs {
+                        for step in &list.deferred().copies {
+                            if let Step::Refresh(shadow, address, len) = step
+                                && shadow.asked_ahead()
+                            {
+                                let span = spans
+                                    .entry(std::sync::Arc::as_ptr(shadow) as usize)
+                                    .or_insert((*address, *address + *len));
+                                *span = (span.0.min(*address), span.1.max(*address + *len));
+                            }
+                        }
                     }
+                    spans.into_values().collect()
                 }
-            }
-            let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            };
             #[cfg(feature = "diagnostics")]
             SPLIT[8].fetch_add(split.so_far(), Ordering::Relaxed);
             stage.next("submit: asking the write watch");
@@ -5644,7 +5652,9 @@ impl Host {
         // What flights in the air may write.
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
-        if refresh_front() {
+        if let Some(walked) = walked {
+            batch.refresh_walked(walked);
+        } else if refresh_front() {
             batch.refresh_front(runs, &parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
@@ -7716,6 +7726,89 @@ struct Batch {
     /// asking, by which a refresh its copy's stamp holds is left out
     /// ([`crate::shadow::Shadow::fresh`]).
     fresh: Option<crate::watch::Standing>,
+    /// With [`one_walk`], after [`Batch::refresh_walked`]: per copy, what was
+    /// refreshed in front of the steps or found fresh there, which the steps
+    /// need not refresh again until title memory is written.
+    walked: Option<Walked>,
+}
+
+/// Whether a submission's steps are walked once for what it asks about and
+/// what it refreshes in front of them, and its copies' stamps looked at once
+/// a copy (`VICTORY_ONE_WALK=0`: walked for each, and the stamps looked at
+/// for each refresh step, in front and again in the lists' steps).
+///
+/// In a timeline of the Series S cell (noop-m64-tl) the walk in front of the
+/// refreshes was 1.06 ms a frame of the lane and the walk for the asking 0.40;
+/// in a sampled profile (noop-m64-prof) the stamps' looks, some 44,000 a
+/// frame for some 10,500 copies, were 3.3 % of the lane's samples.
+fn one_walk() -> bool {
+    crate::toggled!("VICTORY_ONE_WALK")
+}
+
+/// What a submission's steps refresh, per copy, gathered in one walk over
+/// them ([`Batch::gather`]).
+#[derive(Default)]
+struct Walked {
+    /// Where each copy (by address) is in `copies`.
+    index: ByCopy<usize>,
+    copies: Vec<Walk>,
+    /// Textures to bring up to date in front of the steps ([`wide_textures`]).
+    due: Vec<std::sync::Arc<crate::texture::Staging>>,
+}
+
+/// A copy as a submission's steps refresh it.
+struct Walk {
+    shadow: std::sync::Arc<crate::shadow::Shadow>,
+    /// The span of all its refreshes, if the submission's asking asks about
+    /// it ([`crate::shadow::Shadow::asked_ahead`]); empty for none yet.
+    asked: Option<(usize, usize)>,
+    /// What is refreshed in front of the steps, as [`front_spans`] has it:
+    /// its refreshes up to its first write by shaders in each part.
+    front: (usize, usize),
+    /// The part that last gave it to shaders (0: none).
+    given: u32,
+}
+
+impl Walked {
+    /// Where `shadow` is in `copies`, put there if it was not.
+    fn place(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>) -> usize {
+        let copies = &mut self.copies;
+        *self.index.entry(std::sync::Arc::as_ptr(shadow) as usize).or_insert_with(|| {
+            copies.push(Walk {
+                shadow: shadow.clone(),
+                asked: shadow.asked_ahead().then_some((usize::MAX, 0)),
+                front: (usize::MAX, 0),
+                given: 0,
+            });
+            copies.len() - 1
+        })
+    }
+
+    /// A refresh of `[from, to)` of the copy at `i`, in part `part`: as the
+    /// asking takes it, and as [`front_spans`] takes it.
+    fn refreshed(&mut self, i: usize, from: usize, to: usize, part: u32) {
+        let c = &mut self.copies[i];
+        if let Some(asked) = &mut c.asked {
+            *asked = (asked.0.min(from), asked.1.max(to));
+        }
+        if c.given != part {
+            c.front = (c.front.0.min(from), c.front.1.max(to));
+        }
+    }
+
+    /// The ranges the submission's asking asks about, a copy each.
+    fn asked(&self) -> Vec<(usize, usize)> {
+        self.copies.iter().filter_map(|c| c.asked.filter(|a| a.0 < a.1)).collect()
+    }
+
+    /// Whether `[from, to)` of the copy at `key` lies in what is done in
+    /// front of the steps.
+    fn holds(&self, key: usize, from: usize, to: usize) -> bool {
+        self.index.get(&key).is_some_and(|&i| {
+            let (a, b) = self.copies[i].front;
+            a <= from && to <= b
+        })
+    }
 }
 
 /// Whether the copies that a submission's shaders write are brought up to
@@ -7866,6 +7959,65 @@ mod written_spans_tests {
         assert_eq!(found, [(1, 10, 40), (2, 0, 5), (4, 7, 9)]);
     }
 
+    /// The one walk ([`super::Walked`]) takes from the same steps what
+    /// `front_spans` takes, a copy each, and for the asking the span of all
+    /// of a copy's refreshes.
+    #[test]
+    fn one_walk_takes_what_front_spans_and_the_asking_take() {
+        use super::Walked;
+        use Touch::{Nothing, Part, Refresh, Title, Write};
+        let steps = || {
+            [
+                Refresh(1, 10, 20),
+                Refresh(1, 12, 25),
+                Refresh(2, 0, 5),
+                Nothing,
+                Write(1),
+                Refresh(1, 0, 100),
+                Write(3),
+                Refresh(3, 1, 2),
+                Title,
+                Refresh(4, 7, 9),
+                Part,
+                Refresh(1, 30, 40),
+                Write(4),
+                Refresh(4, 0, 9),
+            ]
+        };
+        // Copies 1 to 4 (never read: nothing is refreshed here).
+        let copies: Vec<_> = (0..5).map(|k| crate::shadow::Shadow::unbacked(0x1000_0000 * (k + 1), std::ptr::null_mut(), 0x1000, false)).collect();
+        let mut walked = Walked::default();
+        let mut part = 1;
+        for step in steps() {
+            match step {
+                Refresh(k, from, to) => {
+                    let i = walked.place(&copies[k]);
+                    walked.refreshed(i, from, to, part);
+                }
+                Write(k) => {
+                    let i = walked.place(&copies[k]);
+                    walked.copies[i].given = part;
+                }
+                Part => part += 1,
+                Title | Nothing => {}
+            }
+        }
+        let key = |k: usize| std::sync::Arc::as_ptr(&copies[k]) as usize;
+        let mut front: Vec<_> = walked
+            .copies
+            .iter()
+            .filter(|c| c.front.0 < c.front.1)
+            .map(|c| ((1..5).find(|&k| std::sync::Arc::ptr_eq(&c.shadow, &copies[k])).unwrap(), c.front.0, c.front.1))
+            .collect();
+        front.sort_unstable();
+        assert_eq!(front, front_spans(steps().into_iter()));
+        let mut asked = walked.asked();
+        asked.sort_unstable();
+        assert_eq!(asked, [(0, 5), (0, 9), (0, 100), (1, 2)]);
+        // What is done in front holds the ranges inside it, and no other.
+        assert!(walked.holds(key(1), 12, 40) && !walked.holds(key(1), 0, 100) && !walked.holds(key(3), 1, 2));
+    }
+
     #[test]
     fn a_submission_is_cut_between_its_lists() {
         // Lists c and e are in neither half's order: they go with the first.
@@ -7939,6 +8091,12 @@ fn wide_textures() -> bool {
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
+        // Done in front, or found fresh there ([`one_walk`]).
+        if let Some(walked) = &self.walked
+            && walked.holds(std::sync::Arc::as_ptr(shadow) as usize, address, end)
+        {
+            return;
+        }
         // (Ahead of the table: with stamps nearly all of them are fresh.)
         if let Some(standing) = &self.fresh
             && shadow.fresh(address, len, standing)
@@ -8014,7 +8172,72 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.ahead.clear();
+        self.walked = None;
         self.textures.clear();
+    }
+
+    /// The one walk over the steps of `runs` ([`one_walk`]), a new part of
+    /// the submission beginning at each of `parts`, made before the
+    /// submission's asking: per copy, the span its refreshes ask about and
+    /// what is refreshed in front of the steps; and the textures due.
+    fn gather(&mut self, runs: &[&HostList], parts: &[usize]) -> Walked {
+        let mut walked = Walked::default();
+        let mut part = 1;
+        for (n, list) in runs.iter().enumerate() {
+            if parts.contains(&n) {
+                part += 1;
+            }
+            // The copy of the refresh before (most come several times on end).
+            let mut last = usize::MAX;
+            for step in &list.deferred().copies {
+                match step {
+                    Step::Refresh(shadow, at, len) => {
+                        let i = match walked.copies.get(last) {
+                            Some(c) if std::sync::Arc::ptr_eq(&c.shadow, shadow) => last,
+                            _ => walked.place(shadow),
+                        };
+                        last = i;
+                        walked.refreshed(i, *at, *at + *len, part);
+                    }
+                    Step::GpuWrite(shadow, ..) => {
+                        let i = walked.place(shadow);
+                        walked.copies[i].given = part;
+                    }
+                    Step::Texture(staging) if wide_textures() => {
+                        if self.texture_due(staging) {
+                            walked.due.push(staging.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        walked
+    }
+
+    /// [`Batch::refresh_front`] from the one walk ([`Batch::gather`]): each
+    /// copy's stamp is looked at once, for all it refreshes in front, and
+    /// what the steps would refresh of it there is known done.
+    fn refresh_walked(&mut self, mut walked: Walked) {
+        let fresh = crate::watch::stamps_on().then(crate::watch::standing);
+        let due = std::mem::take(&mut walked.due);
+        let mut spans = Vec::new();
+        for c in &walked.copies {
+            let (from, to) = c.front;
+            if from >= to {
+                continue;
+            }
+            if let Some(standing) = &fresh
+                && c.shadow.fresh(from, to - from, standing)
+            {
+                continue;
+            }
+            spans.push((c.shadow.clone(), from, to));
+        }
+        self.front = true;
+        self.fresh = fresh;
+        self.walked = Some(walked);
+        self.refresh_spans(spans, due);
     }
 
     /// Before the steps of `runs` ([`refresh_front`]), a new part of the
@@ -8065,6 +8288,16 @@ impl Batch {
         for (shadow, from, to) in &spans {
             self.ahead.insert(std::sync::Arc::as_ptr(shadow) as usize, (*from, *to));
         }
+        self.refresh_spans(spans, due);
+    }
+
+    /// Of [`Batch::refresh_front`]: `spans` (copy, from, to) and the textures
+    /// `due` are brought up to date, on several threads.
+    fn refresh_spans(
+        &mut self,
+        spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        due: Vec<std::sync::Arc<crate::texture::Staging>>,
+    ) {
         #[cfg(feature = "diagnostics")]
         {
             FLUSHES[0].fetch_add(1, Ordering::Relaxed);
