@@ -523,7 +523,7 @@ fn look(host: &Host) -> Option<u64> {
     // (Before anything that can fail. Nothing declares or fetches meanwhile:
     // what is known of copies that are gone is let go, or `KNOWN` would keep
     // an entry per copy ever written.)
-    {
+    if crate::nv_lifetime_fixes() {
         let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
         forget_gone(&mut known, copies.iter().map(|s| s.id()));
     }

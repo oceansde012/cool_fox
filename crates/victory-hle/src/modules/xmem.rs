@@ -537,11 +537,28 @@ const FIRST_PAGE: usize = 0x10_0000;
 /// ([`FRAMES`]).
 const PAGE_LIMIT: usize = 1 << 25;
 
+#[cfg_attr(test, allow(unreachable_code))]
+/// Page numbers reused before the title's 21 bits (VICTORY_NV_LIFETIME_FIXES=1; off by default).
+fn nv_lifetime_fixes() -> bool {
+    #[cfg(test)]
+    return true;
+
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NV_LIFETIME_FIXES").is_some_and(|v| v == "1")
+    })
+}
+
 impl Pages {
     /// The first of `n` numbers, [`FRAMES`] apart, for new pages: after the
     /// last given while they fit the title's 21 bits (as before), then the
     /// lowest run of `n` freed ones. `None` if there is no such run.
     fn take(&mut self, n: usize) -> Option<usize> {
+        if !nv_lifetime_fixes() {
+            let first = self.next_page;
+            self.next_page += n * FRAMES;
+            return Some(first);
+        }
         let len = n.checked_mul(FRAMES)?;
         let end = self.next_page.checked_add(len);
         if let Some(end) = end.filter(|&end| end <= PAGE_LIMIT) {

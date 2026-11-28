@@ -117,3 +117,11 @@ pub use watch::{
     title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };
+
+/// Lifetime fixes picked from trustno1-coder/VIctory-NVIDIA: split submissions give their table slots back, the up-copy check forgets copies that are gone. Off by default; VICTORY_NV_LIFETIME_FIXES=1 turns them on.
+pub(crate) fn nv_lifetime_fixes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_NV_LIFETIME_FIXES").is_some_and(|v| v == "1")
+    })
+}
