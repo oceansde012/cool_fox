@@ -3061,6 +3061,47 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
             }
         }
     }
+    stale_of(spans)
+}
+
+/// Whether [`stale_under_flights`] takes its copies from the submission's
+/// one walk ([`one_walk`], [`Walked`]) and does not walk the steps again
+/// (`VICTORY_STALE_WALKED=0`: walks them, as before).
+///
+/// That walk, with a look in a table at each refresh step, was 1.5 % of the
+/// lane's samples in the Series S cell (noop-m64-prof).
+fn stale_walked_on() -> bool {
+    crate::toggled!("VICTORY_STALE_WALKED")
+}
+
+/// [`stale_under_flights`] of the copies the one walk found ([`Walked`]):
+/// the same copies, in the same order, with the same spans.
+fn stale_walked(walked: &Walked) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    let spans = walked
+        .order
+        .iter()
+        .map(|&i| &walked.copies[i])
+        .filter(|c| c.shadow.writes_pending())
+        .filter_map(|c| c.all.map(|(from, to)| (c.shadow.clone(), from, to)))
+        .collect();
+    stale_of(spans)
+}
+
+/// [`stale_under_flights`] or, with [`stale_walked_on`] and the one walk,
+/// [`stale_walked`].
+fn stale_of_runs(runs: &[&HostList], walked: Option<&Walked>) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
+    match walked {
+        Some(walked) if stale_walked_on() => stale_walked(walked),
+        _ => stale_under_flights(runs),
+    }
+}
+
+/// Of [`stale_under_flights`]: of `spans` (a copy shaders may be writing,
+/// and the span of what is refreshed of it), those whose title bytes could
+/// not be put in under the flights' writes, or that are stale under them.
+fn stale_of(
+    mut spans: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+) -> Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> {
     if late_exact() {
         // The title's bytes are put in beside the flights' writes; a
         // settle is still due where that could not be done. At most this
@@ -5466,6 +5507,7 @@ impl Host {
         &self,
         submitted: &mut u64,
         runs: &[&HostList],
+        walked: Option<&Walked>,
         mut stale: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
         ranges: &[(usize, usize)],
     ) {
@@ -5475,7 +5517,7 @@ impl Host {
                 blame_stale(&stale);
                 relay_wait(WHY_STALE, |_| stale.iter().all(|(shadow, from, to)| !shadow.writes_pending_in(*from, *to)));
                 crate::watch::ask_once(ranges);
-                stale = stale_under_flights(runs);
+                stale = stale_of_runs(runs, walked);
                 if stale.is_empty() {
                     return;
                 }
@@ -5636,10 +5678,10 @@ impl Host {
                     upcheck::reads(runs);
                 }
             }
-            let stale = if behind { stale_under_flights(runs) } else { Vec::new() };
+            let stale = if behind { stale_of_runs(runs, walked.as_ref()) } else { Vec::new() };
             if !stale.is_empty() {
                 let settling = std::time::Instant::now();
-                self.settle_stale(&mut submitted, runs, stale, &ranges);
+                self.settle_stale(&mut submitted, runs, walked.as_ref(), stale, &ranges);
                 settled += settling.elapsed();
             }
         } else if behind && !stale_under_flights(runs).is_empty() {
@@ -7752,6 +7794,8 @@ struct Walked {
     /// Where each copy (by address) is in `copies`.
     index: ByCopy<usize>,
     copies: Vec<Walk>,
+    /// The copies refreshed, in the order of their first refresh.
+    order: Vec<usize>,
     /// Textures to bring up to date in front of the steps ([`wide_textures`]).
     due: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
@@ -7767,6 +7811,9 @@ struct Walk {
     front: (usize, usize),
     /// The part that last gave it to shaders (0: none).
     given: u32,
+    /// The span of all its refreshes ([`stale_walked`]); `None` before its
+    /// first.
+    all: Option<(usize, usize)>,
 }
 
 impl Walked {
@@ -7779,6 +7826,7 @@ impl Walked {
                 asked: shadow.asked_ahead().then_some((usize::MAX, 0)),
                 front: (usize::MAX, 0),
                 given: 0,
+                all: None,
             });
             copies.len() - 1
         })
@@ -7793,6 +7841,13 @@ impl Walked {
         }
         if c.given != part {
             c.front = (c.front.0.min(from), c.front.1.max(to));
+        }
+        match &mut c.all {
+            Some(all) => *all = (all.0.min(from), all.1.max(to)),
+            None => {
+                c.all = Some((from, to));
+                self.order.push(i);
+            }
         }
     }
 
@@ -7968,6 +8023,8 @@ mod written_spans_tests {
         use Touch::{Nothing, Part, Refresh, Title, Write};
         let steps = || {
             [
+                // Given to shaders before it is first refreshed.
+                Write(5),
                 Refresh(1, 10, 20),
                 Refresh(1, 12, 25),
                 Refresh(2, 0, 5),
@@ -7982,10 +8039,11 @@ mod written_spans_tests {
                 Refresh(1, 30, 40),
                 Write(4),
                 Refresh(4, 0, 9),
+                Refresh(5, 3, 4),
             ]
         };
-        // Copies 1 to 4 (never read: nothing is refreshed here).
-        let copies: Vec<_> = (0..5).map(|k| crate::shadow::Shadow::unbacked(0x1000_0000 * (k + 1), std::ptr::null_mut(), 0x1000, false)).collect();
+        // Copies 1 to 5 (never read: nothing is refreshed here).
+        let copies: Vec<_> = (0..6).map(|k| crate::shadow::Shadow::unbacked(0x1000_0000 * (k + 1), std::ptr::null_mut(), 0x1000, false)).collect();
         let mut walked = Walked::default();
         let mut part = 1;
         for step in steps() {
@@ -8007,13 +8065,24 @@ mod written_spans_tests {
             .copies
             .iter()
             .filter(|c| c.front.0 < c.front.1)
-            .map(|c| ((1..5).find(|&k| std::sync::Arc::ptr_eq(&c.shadow, &copies[k])).unwrap(), c.front.0, c.front.1))
+            .map(|c| ((1..6).find(|&k| std::sync::Arc::ptr_eq(&c.shadow, &copies[k])).unwrap(), c.front.0, c.front.1))
             .collect();
         front.sort_unstable();
-        assert_eq!(front, front_spans(steps().into_iter()));
+        let mut want = front_spans(steps().into_iter());
+        want.sort_unstable();
+        assert_eq!(front, want);
         let mut asked = walked.asked();
         asked.sort_unstable();
-        assert_eq!(asked, [(0, 5), (0, 9), (0, 100), (1, 2)]);
+        assert_eq!(asked, [(0, 5), (0, 9), (0, 100), (1, 2), (3, 4)]);
+        // For `stale_walked`, as `stale_under_flights` takes them: in the
+        // order of their first refresh, each with all it refreshes.
+        let all: Vec<_> = walked
+            .order
+            .iter()
+            .map(|&i| &walked.copies[i])
+            .map(|c| ((1..6).find(|&k| std::sync::Arc::ptr_eq(&c.shadow, &copies[k])).unwrap(), c.all))
+            .collect();
+        assert_eq!(all, [(1, Some((0, 100))), (2, Some((0, 5))), (3, Some((1, 2))), (4, Some((0, 9))), (5, Some((3, 4)))]);
         // What is done in front holds the ranges inside it, and no other.
         assert!(walked.holds(key(1), 12, 40) && !walked.holds(key(1), 0, 100) && !walked.holds(key(3), 1, 2));
     }
