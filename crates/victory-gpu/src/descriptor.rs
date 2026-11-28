@@ -889,14 +889,14 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
 /// minutes and the frame rate fell by half. A descriptor names the view it
 /// was written with for a frame or a few, so the oldest of a million are
 /// long out of use; one naming a freed entry reads as stale (no view).
-/// `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (0: all, as before).
+/// `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (default 0: all, as before; Vice-Tay uses 1048576).
 fn ownerless_cap() -> usize {
     static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
         std::env::var("VICTORY_OWNERLESS_VIEWS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1 << 20)
+            .unwrap_or(0)
     })
 }
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
@@ -1458,9 +1458,20 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
+    if placed_shape_clean() {
+        if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, false)) {
+            record(handle, View::Placed(false, resource, desc));
+        }
+    } else if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(false, resource, desc));
     }
+}
+
+/// Placed views key on cleaned words (Vice-Tay #27 placed-view leak fix,
+/// `VICTORY_PLACED_SHAPE_CLEAN=1`); off keeps every word as before.
+fn placed_shape_clean() -> bool {
+    static CLEAN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CLEAN.get_or_init(|| std::env::var("VICTORY_PLACED_SHAPE_CLEAN").as_deref() == Ok("1"))
 }
 
 pub(crate) extern "system" fn create_placed_uav(
@@ -1469,7 +1480,11 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
+    if placed_shape_clean() {
+        if let (Some(resource), Some(desc)) = (placed_resource_words(resource), placed_view_words(desc, true)) {
+            record(handle, View::Placed(true, resource, desc));
+        }
+    } else if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
         record(handle, View::Placed(true, resource, desc));
     }
 }
