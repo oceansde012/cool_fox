@@ -3248,6 +3248,17 @@ pub(crate) fn settle_for_fence() {
 /// flights after they landed. The dynamic descriptor slots of their tables
 /// go back as soon as they land ([`past_lag`]).
 fn land() {
+    if !slots_on_land() {
+        let landed: Vec<_> = {
+            let mut line = line();
+            let n = line.landed.len().saturating_sub(bury_lag() as usize);
+            line.landed.drain(..n).collect()
+        };
+        for (lists, order) in landed {
+            crate::list::recycle(lists, &order);
+        }
+        return;
+    }
     // One at a time, so that the flights kept go back in front of the ones
     // that landed meanwhile. A thread that finds another landing leaves it
     // to that one (the submitting thread lands after every flight it sends).
@@ -3270,6 +3281,13 @@ fn land() {
     for (lists, order) in old {
         crate::list::recycle(lists, &order);
     }
+}
+
+/// Give dynamic descriptor slots back when a flight lands (Vice-Tay 31e8d23,
+/// `VICTORY_SLOTS_ON_LAND=1`); off: only at the [`bury_lag`] reset, as before.
+fn slots_on_land() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SLOTS_ON_LAND").ok().as_deref() == Some("1"))
 }
 
 /// Of `landed`, the lists of flights that landed, oldest first: `ran` on

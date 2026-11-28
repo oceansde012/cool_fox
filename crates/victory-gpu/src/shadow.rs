@@ -1341,6 +1341,9 @@ const POOL_PRESSURED_KEPT: usize = 32 << 20;
 /// The next snapshot is then memory fresh from the kernel, as it was for
 /// every snapshot past the pool before. Called by the once-a-second sweep.
 fn let_go_idle_snapshots() {
+    if !snapshot_pool_trim() {
+        return;
+    }
     const IDLE_FRAMES: u64 = 4;
     let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
     let idle = crate::host::long_ago(POOL_USED.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES);
@@ -1353,6 +1356,13 @@ fn let_go_idle_snapshots() {
     };
     // (Given back to the kernel without the lock.)
     drop(gone);
+}
+
+/// Vice-Tay bd27027 idle snapshot pool release (`VICTORY_SNAPSHOT_POOL_TRIM=1`);
+/// off keeps the pool as before.
+fn snapshot_pool_trim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL_TRIM").ok().as_deref() == Some("1"))
 }
 
 /// How many bytes of snapshot buffers [`POOL`] may keep: none once idle,
