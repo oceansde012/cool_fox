@@ -1331,6 +1331,7 @@ pub(crate) extern "system" fn create_placed_srv(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = normal_placed(false, resource, desc);
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1342,7 +1343,160 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = normal_placed(true, resource, desc);
         record(handle, View::Placed(true, resource, desc));
+    }
+}
+
+/// A placed view as the title gives it carries bytes no view reads: the
+/// padding of the resource description (words 1 and 13), of a shader
+/// resource view's description (word 3), and the union's words past the
+/// member of the view's dimension. The title leaves them as its stack held
+/// them, so nearly every view of placed memory was a shape of its own: run
+/// leak1 filled the 4,194,304 shapes the records can name in 20 minutes on
+/// the water, then made 5.6 million table entries that nothing lets go
+/// (3.3 GB), and the frame time doubled; the reported slow-down, white
+/// picture and stuttering sound after long play. Those bytes are cleared.
+/// A buffer view's first element is folded into its address and its
+/// buffer's width made the view's own length (the bytes it reads), so
+/// views of one ring of buffers at many offsets are one shape.
+/// `VICTORY_PLACED_NORMAL=0`: kept as the title gave them, as before.
+/// Ported from readmet3xt-lab/foxhound 3d52ac8 (GPL-3.0-or-later).
+fn normalize_placed_words(
+    unordered: bool,
+    mut resource: [u32; 14],
+    mut desc: [u32; 16],
+) -> ([u32; 14], [u32; 16]) {
+    resource[1] = 0;
+    resource[13] = 0;
+    let (start, used) = if unordered {
+        (2, match desc[1] { 1 => 7, 2 => 1, 3 => 3, 4 => 2, 5 => 4, 6 => 1, 7 => 2, 8 => 3, _ => 8 })
+    } else {
+        desc[3] = 0;
+        (4, match desc[1] { 1 => 5, 2 => 3, 3 => 5, 4 => 4, 5 => 6, 6 => 1, 7 => 2, 8 => 3, 9 => 3, 10 => 5, 11 => 2, _ => 6 })
+    };
+    for w in &mut desc[(start + used).min(10)..10] { *w = 0; }
+    // A buffer view of a buffer: its first element into its address.
+    if resource[0] == 1 && desc[1] == 1 {
+        let (count, stride, flags) = if unordered { (desc[4], desc[5], desc[8]) } else { (desc[6], desc[7], desc[8]) };
+        // (Raw: a flag of 1 in both kinds of view.)
+        let element = if stride > 0 { u64::from(stride) } else if flags & 1 != 0 { 4 } else { crate::resource::element(desc[0]).map_or(0, |(bytes, _)| bytes) };
+        if element > 0 {
+            let first = u64::from(desc[start]) | u64::from(desc[start + 1]) << 32;
+            let address = (u64::from(desc[10]) | u64::from(desc[11]) << 32).wrapping_add(first.wrapping_mul(element));
+            let len = u64::from(count) * element;
+            (desc[start], desc[start + 1]) = (0, 0);
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            (resource[4], resource[5]) = (len as u32, (len >> 32) as u32);
+        }
+    }
+    (resource, desc)
+}
+
+/// `VICTORY_PLACED_NORMAL=1` turns it on; off: kept as the title gave them
+/// (as at f4b48ad).
+fn normal_placed(
+    unordered: bool,
+    resource: [u32; 14],
+    desc: [u32; 16],
+) -> ([u32; 14], [u32; 16]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_PLACED_NORMAL").is_some_and(|v| v == "1")) {
+        return (resource, desc);
+    }
+    normalize_placed_words(unordered, resource, desc)
+}
+
+#[cfg(test)]
+mod placed_normal_tests {
+    use super::*;
+
+    #[test]
+    fn srv_texture2d_desc_words_are_canonical() {
+        let r1: [u32; 14] = [2, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 22];
+        let r2: [u32; 14] = [2, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 77];
+        let mut d1 = [0u32; 16];
+        d1[0] = 28;
+        d1[1] = 4;
+        d1[3] = 123;
+        d1[8] = 0xdead;
+        d1[9] = 0xbeef;
+        let mut d2 = [0u32; 16];
+        d2[0] = 28;
+        d2[1] = 4;
+        d2[3] = 456;
+        d2[8] = 0x1111;
+        d2[9] = 0x2222;
+        let a = normalize_placed_words(false, r1, d1);
+        let b = normalize_placed_words(false, r2, d2);
+        assert_eq!(a, b);
+        assert_eq!(a.0[1], 0);
+        assert_eq!(a.0[13], 0);
+        assert_eq!(a.1[3], 0);
+        assert_eq!(a.1[8], 0);
+        assert_eq!(a.1[9], 0);
+    }
+
+    #[test]
+    fn srv_buffer_folds_first_element_into_address() {
+        let r: [u32; 14] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut d = [0u32; 16];
+        d[1] = 1;
+        d[4] = 3;
+        d[5] = 0;
+        d[6] = 4;
+        d[7] = 16;
+        d[10] = 0x1000;
+        d[11] = 0;
+        let out = normalize_placed_words(false, r, d);
+        assert_eq!(out.0[4], 64);
+        assert_eq!(out.0[5], 0);
+        assert_eq!(out.1[4], 0);
+        assert_eq!(out.1[5], 0);
+        assert_eq!(out.1[10], 0x1030);
+        assert_eq!(out.1[11], 0);
+    }
+
+    #[test]
+    fn uav_buffer_folds_first_element_into_address() {
+        let r: [u32; 14] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let mut d = [0u32; 16];
+        d[1] = 1;
+        d[2] = 3;
+        d[3] = 0;
+        d[4] = 4;
+        d[5] = 16;
+        d[10] = 0x1000;
+        d[11] = 0;
+        let out = normalize_placed_words(true, r, d);
+        assert_eq!(out.0[4], 64);
+        assert_eq!(out.0[5], 0);
+        assert_eq!(out.1[2], 0);
+        assert_eq!(out.1[3], 0);
+        assert_eq!(out.1[10], 0x1030);
+        assert_eq!(out.1[11], 0);
+    }
+
+    #[test]
+    fn unknown_srv_dimension_keeps_union_words() {
+        let r: [u32; 14] = [0; 14];
+        let mut d = [0u32; 16];
+        d[1] = 99;
+        d[3] = 0xabc;
+        d[4] = 10;
+        d[5] = 11;
+        d[6] = 12;
+        d[7] = 13;
+        d[8] = 14;
+        d[9] = 15;
+        let out = normalize_placed_words(false, r, d);
+        assert_eq!(out.1[3], 0);
+        assert_eq!(out.1[4], 10);
+        assert_eq!(out.1[5], 11);
+        assert_eq!(out.1[6], 12);
+        assert_eq!(out.1[7], 13);
+        assert_eq!(out.1[8], 14);
+        assert_eq!(out.1[9], 15);
     }
 }
 
