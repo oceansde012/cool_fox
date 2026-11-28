@@ -75,7 +75,33 @@ unsafe impl Sync for Host {}
 /// releases reach the host at once, from its own threads, while the host
 /// runs a submission: freeing there is a GPU page fault on the freed
 /// texture (a device hang).
-static RETIRED: Mutex<std::collections::VecDeque<(u64, Retired)>> = Mutex::new(std::collections::VecDeque::new());
+///
+/// A queue to each thread that retires, of [`RETIRED_QUEUES`] taken in turn
+/// ([`retired`]), each in the order its thread retired. One queue under one
+/// lock was what the threads that record the title's lists waited for: eight
+/// of them let go of some 20,000 slots' resources a frame, each a push of a
+/// few nanoseconds, but a thread that finds the lock taken sleeps and is
+/// woken 50 microseconds later or more. 3.3 of the 22 ms a frame each of
+/// them was at work, and 0.7 ms of the submitting thread's frame (a profile
+/// of the prologue's cell, RTX 3090 Ti, Ryzen 9 9950X3D, Series S profile).
+static RETIRED: [Mutex<std::collections::VecDeque<(u64, Retired)>>; RETIRED_QUEUES] =
+    [const { Mutex::new(std::collections::VecDeque::new()) }; RETIRED_QUEUES];
+const RETIRED_QUEUES: usize = 32;
+
+/// This thread's queue of [`RETIRED`].
+fn retired() -> &'static Mutex<std::collections::VecDeque<(u64, Retired)>> {
+    // `VICTORY_RETIRED_QUEUES=1`: a queue to each thread; off: one queue, as before.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_RETIRED_QUEUES")) {
+        return &RETIRED[0];
+    }
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    thread_local! {
+        static MINE: usize = NEXT.fetch_add(1, Ordering::Relaxed) % RETIRED_QUEUES;
+    }
+    // (A thread that is ending has none any more: the first.)
+    &RETIRED[MINE.try_with(|mine| *mine).unwrap_or(0)]
+}
 /// Submissions started and finished (waited for).
 static STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -469,7 +495,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
+    retired()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push_back((started, Retired::Any(Box::new(object))));
@@ -485,7 +511,7 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
+    retired().lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
 /// How many submissions later than it could (the last one that may use it
@@ -503,18 +529,20 @@ fn bury_lag() -> u64 {
 }
 
 /// Drops what waited for submissions up to `finished` ([`bury_lag`]). The
-/// numbers come in order, but for threads that overtake each other: one of
-/// those is dropped a little later than it could be.
+/// numbers of a queue come in order, but for a submission begun between a
+/// thread's two looks ([`retire`]): what follows such a one is dropped a
+/// little later than it could be.
 fn bury(finished: u64) {
     let finished = finished.saturating_sub(bury_lag());
-    let done: Vec<(u64, Retired)> = {
-        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut done: Vec<(u64, Retired)> = Vec::new();
+    for queue in &RETIRED {
+        let mut retired = queue.lock().unwrap_or_else(|e| e.into_inner());
         let n = retired.iter().take_while(|(at, _)| *at <= finished).count();
-        if n == 0 {
-            return;
+        if n != 0 {
+            done.extend(retired.drain(..n));
         }
-        retired.drain(..n).collect()
-    };
+    }
+    // (Dropped with no queue's lock held: a release each.)
     drop(done);
 }
 

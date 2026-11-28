@@ -75,6 +75,7 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_WATERFALL_SHAPE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
